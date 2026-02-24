@@ -4,9 +4,6 @@
 .DS_Store
 Thumbs.db
 desktop.ini
-
-results/Behavioral/Pub_Output_Final/
-
 .vscode/
 .idea/
 *.swp
@@ -51,7 +48,6 @@ node_modules/
 
 ############################################
 # 2) Global "outputs / artifacts" to ignore
-# (You can add/remove extensions as needed)
 ############################################
 # Figures / images
 *.png
@@ -72,7 +68,9 @@ node_modules/
 *.pptx
 *.html
 
-# Spreadsheets
+# Spreadsheets & Data
+*.csv
+*.tsv
 *.xlsx
 *.xls
 *.xlsm
@@ -85,8 +83,7 @@ node_modules/
 *.gz
 
 ############################################
-# 3) Data / raw / processed directories (common)
-# (Keep raw data out of git)
+# 3) Data / raw / processed directories
 ############################################
 data/
 Data/
@@ -96,7 +93,7 @@ processed/
 Processed/
 
 ############################################
-# 4) EEG / neuro specific (keep raw/processed files out of git)
+# 4) EEG / neuro specific
 ############################################
 # EEGLAB / BrainVision / common EEG formats
 *.set
@@ -112,11 +109,11 @@ Processed/
 *.ds
 *.xdf
 
-# MATLAB data (often huge)
+# MATLAB data
 *.mat
 
 ############################################
-# 5) Your local-only folders (important for your repo)
+# 5) Local-only folders
 ############################################
 Problematic_data/
 _LOCAL_ONLY_BACKUP/
@@ -124,13 +121,14 @@ _LOCAL_ONLY_BACKUP/
 ############################################
 # 6) results/: ignore outputs but keep scripts
 ############################################
-# Ignore everything under results by default...
-results/**
+# 忽略 results 下的所有文件
+results/*
+results/**/*
 
-# ...then re-allow directories so the "un-ignore" rules can match files inside them
+# 重新放行 results 下的所有“文件夹目录”（让 Git 可以遍历进去）
 !results/**/
 
-# Re-allow scripts + configs inside results
+# 重新放行脚本与配置文件
 !results/**/*.py
 !results/**/*.R
 !results/**/*.r
@@ -152,11 +150,9 @@ results/**
 !results/**/*.cfg
 !results/**/*.txt
 !results/**/*.md
-
-# (Optional) allow notebooks if you consider them "scripts"
 !results/**/*.ipynb
 
-# But still ignore typical outputs/data under results (even if above rules exist elsewhere)
+# 再次明确屏蔽 results 内的产出文件（防止上面某条规则误伤）
 results/**/*.png
 results/**/*.jpg
 results/**/*.jpeg
@@ -170,8 +166,6 @@ results/**/*.xls
 results/**/*.xlsm
 results/**/*.csv
 results/**/*.tsv
-
-# Also ignore EEG/raw data formats under results (just in case)
 results/**/*.set
 results/**/*.fdt
 results/**/*.edf
@@ -186,11 +180,11 @@ results/**/*.ds
 results/**/*.xdf
 results/**/*.mat
 
-# Explicitly ignore your publication output folder (safe guard)
+# 明确屏蔽特定出版物文件夹
 results/Behavioral/Pub_Output_Final/
 
 ############################################
-# 7) Typical output folders elsewhere (optional)
+# 7) Typical output folders elsewhere
 ############################################
 Results/
 Output/
@@ -202,20 +196,16 @@ logs/
 log/
 
 ############################################
-# 8) Keep small templates/examples (if you use them)
+# 8) Keep small templates/examples
 ############################################
 !data_example/
 !data_example/**
 
 ############################################
-# 9) Keep key project files (usually tracked anyway)
+# 9) Keep key project files
 ############################################
 !README.md
 !LICENSE
 !requirements.txt
 !environment.yml
 !.gitignore
-############################################
-*.csv
-*.fdt
-*.set
