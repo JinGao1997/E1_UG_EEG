@@ -1,0 +1,578 @@
+---
+title: "Face Phase Analysis (Universal) - Alday (2019) Covariate Method"
+author: "Project Research Team"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+---
+
+``` {r setup, include=FALSE}
+# ==============================================================================
+# 0. Global Setup & Libraries
+# ==============================================================================
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+options(scipen = 999, digits = 6)
+
+# Install/Load required packages
+if(!require("pacman")) install.packages("pacman")
+if(!require("here")) install.packages("here") 
+
+pacman::p_load(
+  here,          # Path management
+  lme4, lmerTest,# Mixed models
+  emmeans,       # Marginal means
+  DHARMa,        # Residual checks
+  ggplot2, dplyr, performance, tibble, broom.mixed, readxl, stringr,
+  openxlsx, pwr, effectsize, tidyr, car, scales,
+  gridExtra, ggpubr, knitr, buildmer
+)
+
+# Contrast coding settings
+options(contrasts = c("contr.sum", "contr.poly"))
+adjust_method <- "fdr"
+```
+
+# 1\. Data Import & Preprocessing
+
+``` {r data-import}
+cat("========================================\n")
+cat("    FACE PHASE DATA LOADING            \n")
+cat("========================================\n")
+
+# [Modified] Use Universal Path from Preprocessing
+path_input_face <- here("data", "face_phase", "trials.csv")
+
+if(file.exists(path_input_face)) {
+  data_face <- read.csv(path_input_face, stringsAsFactors = FALSE)
+  cat("Raw Face Data: ", nrow(data_face), "trials\n")
+} else {
+  stop("Input file not found at: ", path_input_face)
+}
+
+data_face$expressor <- stringr::str_extract(data_face$stim, "(Fema\\d+|Male\\d+)")
+
+# Fix ID format
+if(all(grepl("^\\d+$", data_face$participant_id))) {
+  data_face$participant_id <- sprintf("Vp%04d", as.numeric(data_face$participant_id))
+}
+
+cat("\n========== Loading Baseline Data ==========\n")
+# [Modified] Use ROI-specific baseline for Face Phase (LPP_face)
+baseline_path <- here("data", "baseline", "LPP_face", "trials.csv")
+
+if(file.exists(baseline_path)) {
+  baseline_data <- read.csv(baseline_path, stringsAsFactors = FALSE)
+  cat("Baseline Data: ", nrow(baseline_data), "trials\n")
+  
+  if(all(grepl("^\\d+$", baseline_data$participant_id))) {
+    baseline_data$participant_id <- sprintf("Vp%04d", as.numeric(baseline_data$participant_id))
+  }
+  
+  data_face$index <- as.integer(data_face$index)
+  baseline_data$index <- as.integer(baseline_data$index)
+
+  # Check columns
+  cat("Baseline cols:", paste(head(colnames(baseline_data), 5), collapse = ", "), "...\n")
+  
+  # Try to match 'LPPfacebaseline' or generic 'CPPbaseline'
+  baseline_col <- intersect(names(baseline_data), c("LPPfacebaseline", "CPPbaseline"))[1]
+  
+  if(is.na(baseline_col)) stop("Baseline column not found in baseline file.")
+  cat("Using baseline column:", baseline_col, "\n")
+  
+  data_face <- merge(
+    data_face,
+    baseline_data[, c("participant_id", "index", baseline_col)],
+    by = c("participant_id", "index"),
+    all.x = TRUE
+  )
+  
+  # Rename to generic 'Baseline' for model consistency
+  data_face$Baseline <- data_face[[baseline_col]]
+  
+  cat("Merge success rate:", round(mean(!is.na(data_face$Baseline))*100, 2), "%\n")
+} else {
+  stop("Baseline file not found: ", baseline_path)
+}
+
+cat("\n========== Grand Mean Centering (Alday 2019) ==========\n")
+# [Modified] NO CWC. Just Grand Mean Centering for convergence.
+data_face$Baseline <- as.numeric(scale(data_face$Baseline, center = TRUE, scale = FALSE))
+cat("Baseline centered (Mean = 0). No state/trait splitting.\n\n")
+
+# Load Covariates
+covariate_path <- here("data", "covariates", "SVO_PID5BF_PostRating.xlsx")
+if(file.exists(covariate_path)) {
+  covariates <- readxl::read_excel(covariate_path)
+  if(all(grepl("^\\d+$", covariates$participant_id))) {
+    covariates$participant_id <- sprintf("Vp%04d", as.numeric(covariates$participant_id))
+  }
+  data_face <- merge(data_face, covariates, by = "participant_id", all.x = TRUE)
+}
+
+# Factors
+data_face$participant_id <- factor(data_face$participant_id)
+data_face$emotion <- factor(data_face$emotion, levels = c("neu", "aff", "dis", "dom", "enj"))
+data_face$reaction_label <- factor(
+  data_face$reaction, levels = c(0,1,2), labels = c("Miss","Accept","Reject")
+)
+data_face <- subset(data_face, reaction_label %in% c("Accept","Reject"))
+
+n_subjects <- length(unique(data_face$participant_id))
+cat("\nData Ready: ", n_subjects, "subjects,", nrow(data_face), "trials\n")
+```
+
+# 2\) Statistical Helper Functions
+
+``` {r analysis-functions}
+format_p_apa <- function(p) {
+  if (is.na(p)) return("")
+  if (p < 0.001) return("< .001")
+  sprintf("= %.3f", p)
+}
+
+# ★★★ Simple Slope Analysis (Using 'Baseline') ★★★
+perform_simple_slope_analysis <- function(model, data, erp_name, alpha = 0.05) {
+  cat("\n  === Simple Slope Analysis ===\n")
+  results <- list()
+  report_text <- character()
+  
+  # [Modified] var = "Baseline"
+  slopes <- emtrends(model, ~ emotion, var = "Baseline")
+  slopes_df <- as.data.frame(slopes)
+  results[["Simple_Slopes"]] <- slopes_df
+  
+  report_text <- c(report_text, "\n=== SIMPLE SLOPES OF BASELINE ===\n")
+  
+  slopes_test <- test(slopes, adjust = "none")
+  slopes_test_df <- as.data.frame(slopes_test)
+  results[["Simple_Slopes_Tests"]] <- slopes_test_df
+  
+  for(i in 1:nrow(slopes_test_df)) {
+    sig_flag <- ifelse(slopes_test_df$p.value[i] < alpha, "***", "n.s.")
+    report_text <- c(report_text,
+      sprintf("  %s: slope = %.4f, SE = %.4f, t = %.2f, p %s %s",
+              slopes_test_df$emotion[i],
+              slopes_test_df$Baseline.trend[i],
+              slopes_test_df$SE[i],
+              slopes_test_df$t.ratio[i],
+              format_p_apa(slopes_test_df$p.value[i]),
+              sig_flag))
+  }
+  
+  report_text <- c(report_text, "\n--- Pairwise Slope Comparisons ---")
+  slope_contrasts <- contrast(slopes, method = "pairwise", adjust = adjust_method)
+  slope_contrasts_df <- as.data.frame(slope_contrasts)
+  results[["Slope_Contrasts"]] <- slope_contrasts_df
+  
+  sig_contrasts <- subset(slope_contrasts_df, p.value < 0.05)
+  if(nrow(sig_contrasts) > 0) {
+    report_text <- c(report_text, "  Significant Slope Diffs (FDR):")
+    for(j in 1:nrow(sig_contrasts)) {
+      report_text <- c(report_text,
+        sprintf("    %s: Δslope = %.4f, t = %.2f, p %s",
+                sig_contrasts$contrast[j],
+                sig_contrasts$estimate[j],
+                sig_contrasts$t.ratio[j],
+                format_p_apa(sig_contrasts$p.value[j])))
+    }
+  } else {
+    report_text <- c(report_text, "  No significant slope differences")
+  }
+  
+  list(results = results, report = paste(report_text, collapse = "\n"))
+}
+
+# ★★★ Interaction Decomposition (Emotion x Baseline) ★★★
+perform_interaction_decomposition <- function(model, data, erp_name, anova_result, model_type) {
+  results <- list()
+  report_text <- character()
+
+  model_terms <- attr(terms(model), "term.labels")
+  # [Modified] Check for 'Baseline' interactions
+  has_interaction <- "emotion:Baseline" %in% model_terms
+  has_baseline <- "Baseline" %in% model_terms
+
+  p_intx <- if(has_interaction) anova_result["emotion:Baseline", "Pr(>F)"] else NA_real_
+
+  if(has_interaction && !is.na(p_intx)) {
+    report_text <- c(report_text, "\n=== EMOTION × BASELINE INTERACTION ===")
+    if(p_intx < 0.05) {
+      cat("\n  *** Interaction Significant (p", format_p_apa(p_intx), ") ***\n")
+      report_text <- c(
+        report_text,
+        sprintf("\nEmotion × Baseline significant: F(%d, %.0f) = %.2f, p %s",
+          anova_result["emotion:Baseline", "NumDF"],
+          anova_result["emotion:Baseline", "DenDF"],
+          anova_result["emotion:Baseline", "F value"],
+          format_p_apa(p_intx)
+        )
+      )
+
+      slope_analysis <- perform_simple_slope_analysis(model, data, erp_name)
+      results <- c(results, slope_analysis$results)
+      report_text <- c(report_text, slope_analysis$report)
+
+      report_text <- c(report_text, "\n\n=== PROBING AT ±0.5SD ===")
+      
+      # [Modified] Use Baseline statistics
+      baseline_sd <- sd(data$Baseline, na.rm = TRUE)
+      baseline_levels <- c(-0.5 * baseline_sd, 0, 0.5 * baseline_sd)
+      baseline_labels <- c("Low_BL_05SD", "Mean_BL", "High_BL_05SD")
+
+      cat("\n  Probing at:", round(baseline_levels, 2), "μV\n")
+
+      probe_results <- list()
+      for(i in seq_along(baseline_levels)) {
+        bl_val <- baseline_levels[i]; bl_label <- baseline_labels[i]
+        
+        emm_at_baseline <- emmeans(model, ~ emotion, at = list(Baseline = bl_val))
+        probe_results[[bl_label]] <- as.data.frame(emm_at_baseline)
+        
+        simple_main <- joint_tests(emm_at_baseline)
+        if(nrow(simple_main) > 0) {
+          p_simple <- simple_main$p.value[1]
+          report_text <- c(report_text,
+            sprintf("\n%s (%.2f μV): Emotion effect F = %.2f, p %s",
+                    bl_label, bl_val, simple_main$F.ratio[1],
+                    format_p_apa(p_simple)))
+                    
+          if(p_simple < 0.05) {
+            pairs_simple <- pairs(emm_at_baseline, adjust = adjust_method)
+            results[[paste0("Emotion_pairs_at_", bl_label)]] <- as.data.frame(pairs_simple)
+          }
+        }
+      }
+      
+      results[["Probe_Results"]] <- probe_results
+
+      return(list(results = results, report = paste(report_text, collapse = "\n"),
+                  type = "interaction_significant", 
+                  baseline_levels = baseline_levels,
+                  baseline_labels = baseline_labels))
+    } else {
+      cat("\n  Interaction not significant (p", format_p_apa(p_intx), ")\n")
+      report_text <- c(report_text, sprintf("\nInteraction ns: p %s", format_p_apa(p_intx)))
+    }
+  }
+
+  cat("\n  Analyzing Main Effects...\n")
+  report_text <- c(report_text, "\n=== MAIN EFFECTS ===")
+
+  if("emotion" %in% rownames(anova_result)) {
+    p_emotion <- anova_result["emotion", "Pr(>F)"]
+    if(!is.na(p_emotion) && p_emotion < 0.05) {
+      context <- if(has_baseline) "(controlling for baseline)" else ""
+      report_text <- c(report_text,
+        sprintf("\nMain effect of emotion %s: F(%d, %.0f) = %.2f, p %s",
+                context,
+                anova_result["emotion", "NumDF"],
+                anova_result["emotion", "DenDF"],
+                anova_result["emotion", "F value"],
+                format_p_apa(p_emotion)))
+      
+      emm_emotion <- emmeans(model, ~ emotion)
+      results[["Emotion_EMMs"]] <- as.data.frame(emm_emotion)
+      pairs_emotion <- pairs(emm_emotion, adjust = adjust_method)
+      results[["Emotion_Pairwise"]] <- as.data.frame(pairs_emotion)
+    }
+  }
+
+  list(results = results, report = paste(report_text, collapse = "\n"), type = "main_effects")
+}
+
+# ★★★ Visualization Function ★★★
+create_publication_plots <- function(model, data, erp_name, model_name, output_dir, decomposition) {
+  cat("    Generating plots...\n")
+  emotion_colors <- c('neu'='#999999', 'aff'='#56B4E9', 'dis'='#E69F00',
+                      'dom'='#CC79A7', 'enj'='#009E73')
+  emotion_labels <- c('neu'='Neutral', 'aff'='Affiliative', 'dis'='Disgust',
+                      'dom'='Dominance', 'enj'='Enjoyment')
+
+  subtitle_text <- "Face Phase Analysis"
+
+  # Main Effect Plot
+  emm <- emmeans(model, ~ emotion)
+  emm_df <- as.data.frame(emm)
+  if("emmean" %in% names(emm_df)) {
+    emm_df$mean <- emm_df$emmean
+    emm_df$se   <- emm_df$SE
+  }
+  emm_df$ci_lower <- emm_df$mean - 1.96 * emm_df$se
+  emm_df$ci_upper <- emm_df$mean + 1.96 * emm_df$se
+
+  p_main <- ggplot(emm_df, aes(x = emotion, y = mean, fill = emotion)) +
+    geom_col(width = 0.7, color = "black", size = 0.3) +
+    geom_errorbar(aes(ymin = ci_lower, ymax = ci_upper), width = 0.2, size = 0.7) +
+    scale_fill_manual(values = emotion_colors, labels = emotion_labels, guide = "none") +
+    scale_x_discrete(labels = emotion_labels) +
+    labs(title = paste0(erp_name, " - ", model_name),
+         subtitle = subtitle_text,
+         x = "Facial Expression", y = paste0(erp_name, " Amplitude (μV)")) +
+    theme_classic(base_size = 11) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1),
+          panel.grid.major.y = element_line(color = "gray90", size = 0.3))
+
+  ggsave(file.path(output_dir, paste0(erp_name, "_", model_name, "_main.png")),
+         plot = p_main, width = 7, height = 5, dpi = 300)
+
+  if (decomposition$type == "interaction_significant") {
+    
+    # ★★★ 3-Panel Probe Plot ★★★
+    probe_data_list <- decomposition$results$Probe_Results
+    baseline_labels <- decomposition$baseline_labels
+    baseline_levels <- decomposition$baseline_levels
+    
+    probe_df_all <- data.frame()
+    for(i in seq_along(baseline_labels)) {
+      probe_df <- probe_data_list[[baseline_labels[i]]]
+      if("emmean" %in% names(probe_df)) {
+        probe_df$mean <- probe_df$emmean
+        probe_df$se <- probe_df$SE
+      }
+      probe_df$baseline_level <- baseline_labels[i]
+      probe_df$baseline_value <- baseline_levels[i]
+      probe_df_all <- rbind(probe_df_all, probe_df)
+    }
+    
+    probe_df_all$ci_lower <- probe_df_all$mean - 1.96 * probe_df_all$se
+    probe_df_all$ci_upper <- probe_df_all$mean + 1.96 * probe_df_all$se
+    
+    probe_df_all$baseline_label <- factor(
+      probe_df_all$baseline_level,
+      levels = baseline_labels,
+      labels = c(
+        sprintf("Low Baseline\n(-0.5SD, %.1fμV)", baseline_levels[1]),
+        sprintf("Mean Baseline\n(0μV)"),
+        sprintf("High Baseline\n(+0.5SD, %.1fμV)", baseline_levels[3])
+      )
+    )
+    
+    p_three_panel <- ggplot(probe_df_all, aes(x = emotion, y = mean, fill = emotion)) +
+      geom_col(width = 0.75, color = "black", size = 0.3) +
+      geom_errorbar(aes(ymin = ci_lower, ymax = ci_upper), width = 0.25, size = 0.6) +
+      facet_wrap(~ baseline_label, nrow = 1) +
+      scale_fill_manual(values = emotion_colors, labels = emotion_labels) +
+      scale_x_discrete(labels = emotion_labels) +
+      labs(title = paste0(erp_name, " - Baseline-Dependent Emotion Effects"),
+           x = "Facial Expression", 
+           y = paste0(erp_name, " Amplitude (μV)"),
+           fill = "Emotion") +
+      theme_classic(base_size = 10) +
+      theme(legend.position = "bottom",
+            axis.text.x = element_text(angle = 45, hjust = 1, size = 8))
+    
+    ggsave(file.path(output_dir, paste0(erp_name, "_", model_name, "_three_panel.png")),
+           plot = p_three_panel, width = 12, height = 4.5, dpi = 300)
+    
+    # ★★★ Continuous Plot ★★★
+    # [Modified] Use 'Baseline' variable range
+    baseline_seq <- seq(quantile(data$Baseline, 0.05, na.rm = TRUE),
+                       quantile(data$Baseline, 0.95, na.rm = TRUE),
+                       length.out = 100)
+    
+    pred_list <- list()
+    for(emo in levels(data$emotion)) {
+      # Create prediction grid using 'Baseline'
+      pred_data <- data.frame(
+        emotion = factor(emo, levels = levels(data$emotion)),
+        Baseline = baseline_seq,
+        participant_id = factor(data$participant_id[1], levels = levels(data$participant_id))
+      )
+      pred_data$predicted <- predict(model, newdata = pred_data, re.form = NA)
+      
+      mm <- model.matrix(delete.response(terms(model)), pred_data)
+      pred_data$se <- sqrt(diag(mm %*% vcov(model) %*% t(mm)))
+      pred_data$ci_lower <- pred_data$predicted - 1.96 * pred_data$se
+      pred_data$ci_upper <- pred_data$predicted + 1.96 * pred_data$se
+      
+      pred_list[[emo]] <- pred_data
+    }
+    pred_all <- do.call(rbind, pred_list)
+    
+    p_continuous <- ggplot(pred_all, aes(x = Baseline, y = predicted,
+                                         color = emotion, fill = emotion)) +
+      geom_ribbon(aes(ymin = ci_lower, ymax = ci_upper), alpha = 0.2, color = NA) +
+      geom_line(size = 1) +
+      geom_vline(xintercept = 0, linetype = "dashed", color = "gray50", size = 0.5) +
+      scale_color_manual(values = emotion_colors, labels = emotion_labels) +
+      scale_fill_manual(values = emotion_colors, labels = emotion_labels) +
+      labs(title = paste0(erp_name, " - Continuous Baseline Moderation"),
+           x = "Baseline Amplitude (μV)",
+           y = paste0(erp_name, " Amplitude (μV)"),
+           color = "Emotion", fill = "Emotion") +
+      theme_classic(base_size = 11) +
+      theme(legend.position = "bottom")
+    
+    ggsave(file.path(output_dir, paste0(erp_name, "_", model_name, "_continuous.png")),
+           plot = p_continuous, width = 8, height = 5, dpi = 300)
+    
+    # ★★★ Slopes Plot ★★★
+    if("Simple_Slopes" %in% names(decomposition$results)) {
+      slopes_df <- decomposition$results$Simple_Slopes
+      slopes_df$ci_lower <- slopes_df$Baseline.trend - 1.96 * slopes_df$SE
+      slopes_df$ci_upper <- slopes_df$Baseline.trend + 1.96 * slopes_df$SE
+      
+      p_slopes <- ggplot(slopes_df, aes(x = emotion, y = Baseline.trend, fill = emotion)) +
+        geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+        geom_col(width = 0.7, color = "black", size = 0.3) +
+        geom_errorbar(aes(ymin = ci_lower, ymax = ci_upper), width = 0.2, size = 0.7) +
+        scale_fill_manual(values = emotion_colors, labels = emotion_labels, guide = "none") +
+        scale_x_discrete(labels = emotion_labels) +
+        labs(title = paste0(erp_name, " - Simple Slopes of Baseline"),
+             x = "Facial Expression",
+             y = "Baseline Slope (beta)") +
+        theme_classic(base_size = 11) +
+        theme(axis.text.x = element_text(angle = 45, hjust = 1))
+      
+      ggsave(file.path(output_dir, paste0(erp_name, "_", model_name, "_slopes.png")),
+             plot = p_slopes, width = 7, height = 5, dpi = 300)
+    }
+  }
+}
+```
+
+# 3\) Main Analysis Loop
+
+``` {r main-analysis}
+get_final_mermod <- function(bm_obj) {
+  if (inherits(bm_obj, "buildmer")) {
+    if (!is.null(bm_obj@model)) return(bm_obj@model)
+    if (!is.null(bm_obj@mer))   return(bm_obj@mer)
+  }
+  bm_obj
+}
+
+analyze_erp_component <- function(data, erp_name) {
+  cat("\n================================================\n")
+  cat("  Analyzing Component:", erp_name, "\n")
+  cat("================================================\n")
+
+  # [Modified] Universal Path
+  base_dir <- here("results", "Face_Phase")
+  output_dir <- file.path(base_dir, "Results_Alday", erp_name)
+  dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+
+  df_analysis <- data[!is.na(data[[erp_name]]) & !is.na(data$Baseline), ]
+
+  cat("\nData Points: ", nrow(df_analysis), "trials, ",
+      length(unique(df_analysis$participant_id)), "subjects\n")
+
+  # [Modified] Alday (2019) Models (using 'Baseline' variable)
+  models <- list(
+    No_Baseline          = paste0(erp_name, " ~ emotion + (1 | participant_id)"),
+    Baseline_Additive    = paste0(erp_name, " ~ emotion + Baseline + (1 | participant_id)"),
+    Full_Interaction     = paste0(erp_name, " ~ emotion * Baseline + (1 | participant_id)")
+  )
+
+  cat("\n========== Model Fitting ==========\n")
+  
+  fitted_models <- list()
+  for(model_name in names(models)) {
+    cat("\nFitting:", model_name, "... ")
+    form_str <- models[[model_name]]
+    tryCatch({
+      model <- lmer(as.formula(form_str), data = df_analysis, REML = FALSE)
+      fitted_models[[model_name]] <- model
+      cat("OK")
+    }, error = function(e) cat("Error:", e$message))
+  }
+  if(length(fitted_models) == 0) stop("No models converged.")
+
+  # M4 Buildmer (Maximal Random Effects)
+  cat("\nFitting Model_4_buildmer... ")
+  form_bm <- as.formula(paste0(erp_name, " ~ emotion * Baseline + (emotion | participant_id)")) 
+  tryCatch({
+    bm_res <- buildmer::buildmer(form_bm, data = df_analysis, 
+                                 buildmerControl = buildmerControl(direction = c("order","backward"), elim = LRTalpha(0.2)))
+    fitted_models[["Model_4_buildmer_final"]] <- get_final_mermod(bm_res)
+    cat("OK\n")
+  }, error = function(e) cat("Error"))
+
+  cat("\n\n========== Detailed Analysis ==========\n")
+  all_results <- list()
+
+  for(model_name in names(fitted_models)) {
+    model <- fitted_models[[model_name]]
+    cat("\n--- Processing Model:", model_name, "---\n")
+    model_dir <- file.path(output_dir, model_name)
+    dir.create(model_dir, recursive = TRUE, showWarnings = FALSE)
+
+    anova_result <- anova(model)
+    write.csv(anova_result, file.path(model_dir, "ANOVA.csv"))
+    
+    anova_type3 <- car::Anova(model, type = 3)
+    write.csv(anova_type3, file.path(model_dir, "ANOVA_TypeIII.csv"))
+    
+    try({
+      eta_tab <- effectsize::eta_squared(anova_type3, partial = TRUE, ci = 0.90)
+      write.csv(eta_tab, file.path(model_dir, "EffectSizes.csv"), row.names = FALSE)
+    }, silent = TRUE)
+    
+    decomposition <- perform_interaction_decomposition(
+      model, df_analysis, erp_name, anova_result, model_type = model_name
+    )
+
+    for(result_name in names(decomposition$results)) {
+      result_data <- decomposition$results[[result_name]]
+      if(is.data.frame(result_data)) {
+        write.csv(result_data, file.path(model_dir, paste0(result_name, ".csv")), row.names = FALSE)
+      }
+    }
+
+    create_publication_plots(model, df_analysis, erp_name, model_name, model_dir, decomposition)
+
+    sink(file.path(model_dir, "model_summary.txt"))
+    cat("Model:", model_name, "\n")
+    print(summary(model))
+    cat("\n--- Decomposition ---\n")
+    cat(decomposition$report)
+    sink()
+
+    all_results[[model_name]] <- decomposition
+  }
+
+  # Excel
+  cat("\n\n========== Excel Report ==========\n")
+  wb <- createWorkbook()
+  
+  comp_df <- data.frame(Model=names(fitted_models), AIC=sapply(fitted_models, AIC), BIC=sapply(fitted_models, BIC))
+  comp_df <- comp_df[order(comp_df$AIC),]
+  comp_df$deltaAIC <- comp_df$AIC - min(comp_df$AIC)
+  addWorksheet(wb, "Comparison"); writeData(wb, "Comparison", comp_df)
+
+  excel_file <- file.path(output_dir, paste0(erp_name, "_Results.xlsx"))
+  saveWorkbook(wb, excel_file, overwrite = TRUE)
+  cat("Saved:", excel_file, "\n")
+}
+```
+
+# 4\) Execution
+
+``` {r run-analysis}
+cat("\n############################################\n")
+cat("      Face Phase ERP Analysis              \n")
+cat("############################################\n")
+
+# P1
+p1_results <- analyze_erp_component(data = data_face, erp_name = "P1")
+
+# N170
+n170_results <- analyze_erp_component(data = data_face, erp_name = "N170")
+
+# EPN
+epn_results <- analyze_erp_component(data = data_face, erp_name = "EPN")
+
+# LPP
+lpp_face_results <- analyze_erp_component(data = data_face, erp_name = "LPP_face")
+```
+
+# 5\) Final Summary
+
+``` {r final-report}
+cat("\n\nAnalysis Complete. Results in 'results/Face_Phase/Results_Alday'\n")
+```
+

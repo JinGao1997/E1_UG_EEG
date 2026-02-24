@@ -1,0 +1,542 @@
+---
+title: "Master Preprocessing Pipeline: E1 UG EEG"
+subtitle: "Optimized: Single-Pass Stimulus-Locked Extraction with Cluster-Based Permutation Tests"
+author: "Project Maintainer"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    code_folding: show
+    theme: flatly
+---
+
+``` {r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+# ==============================================================================
+# 1. Environment and Global Configuration
+# ==============================================================================
+
+# Ensure required packages are installed and loaded
+if(!require("pacman")) install.packages("pacman")
+if(!require("here")) install.packages("here")
+pacman::p_load(tidyverse, reticulate, readr, stringr, here, fs)
+
+# -----------------------------------------------------------
+# Method Configuration
+# -----------------------------------------------------------
+# Defines the preprocessing strategy for statistical analysis.
+# TRUE  = Standard Method: Subtracts baseline mean from the epoch (traditional ERP).
+# FALSE = Regression Method: No baseline subtraction. Pre-stimulus baseline 
+#          activity is extracted as a covariate for LMMs (Recommended).
+use_baseline_correction <- FALSE  
+
+# -----------------------------------------------------------
+# Baseline Parameters (Stimulus-Locked Only)
+# -----------------------------------------------------------
+use_full_prestim_baseline <- FALSE
+
+# Construct the baseline argument for MNE-Python.
+# NOTE: 'reticulate' handling of R lists vs. vectors is critical here.
+# - R: list(NULL, 0) -> Python: [None, 0] -> MNE: (None, 0) [Correct]
+# - R: c(NULL, 0)    -> Python: 0.0        -> MNE: Error       [Incorrect]
+baseline_arg <- NULL
+
+if (use_baseline_correction) {
+  if (use_full_prestim_baseline) {
+    # Baseline: Start of epoch to 0ms
+    baseline_arg <- list(NULL, 0.0) 
+  } else {
+    # Baseline: -200ms to 0ms
+    baseline_arg <- c(-0.2, 0.0)    
+  }
+} else {
+  # Baseline: None (No correction applied)
+  baseline_arg <- NULL 
+}
+
+# -----------------------------------------------------------
+# Phase Control (Pipeline Stages)
+# -----------------------------------------------------------
+# Set to TRUE to execute the respective analysis phase.
+run_offer_phase <- TRUE   # Stimulus-Locked (FRN, N400, LPP)
+run_cpp_phase   <- FALSE  # Response-Locked (CPP) - Set to FALSE to skip
+
+# -----------------------------------------------------------
+# Path Definitions (Hierarchical & Dynamic)
+# -----------------------------------------------------------
+
+# A. Source Directories (Input)
+path_py_pipeline_src <- here("python_modules", "hu-neuro-pipeline")
+path_raw_eeg         <- here("data", "00_Raw_Input", "raw_all_cropped")
+path_raw_log         <- here("data", "00_Raw_Input", "csv_all")
+
+# B. Intermediate Processing Logs (Output)
+path_csv_filtered    <- here("data", "01_Preprocessing_Logs", "csv_filtered")
+path_csv_summary     <- here("data", "01_Preprocessing_Logs", "csv_summary")
+
+# C. Pipeline Output Root
+path_output_root     <- here("data", "02_Pipeline_Output")
+
+# D. Dynamic Directory Naming based on Method
+if (use_baseline_correction) {
+  path_suffix <- "Standard_Baseline"
+  method_folder <- "Method_Standard"
+} else {
+  path_suffix <- "No_Baseline"
+  method_folder <- "Method_Regression"
+}
+
+# Sub-directory names
+dir_stim_name  <- "Stimulus_Locked"    
+dir_cpp_name   <- "Response_Locked"
+
+# E. Destination Paths (Absolute)
+path_dest_stim       <- file.path(path_output_root, method_folder, dir_stim_name)
+path_dest_cpp        <- file.path(path_output_root, method_folder, dir_cpp_name)
+path_dest_covariates <- file.path(path_output_root, "Covariates")
+path_dest_baseline   <- file.path(path_output_root, "Baseline_Raw") 
+
+# Report Paths
+path_dest_report_stim <- file.path(path_dest_stim, "report")
+path_dest_report_cpp  <- file.path(path_dest_cpp, "report")
+
+# F. Directory Initialization
+dirs_to_create <- c(
+  path_csv_filtered, 
+  path_csv_summary, 
+  path_output_root,
+  path_dest_stim, 
+  path_dest_cpp, 
+  path_dest_covariates,
+  path_dest_baseline,
+  path_dest_report_stim,
+  path_dest_report_cpp
+)
+purrr::walk(dirs_to_create, ~dir.create(., showWarnings = FALSE, recursive = TRUE))
+
+
+```
+
+# 2. Python Environment Initialization
+
+```{r Environment, include=FALSE}
+# Initialize the conda environment for reticulate
+use_condaenv("r-reticulate", required = TRUE)
+
+# Pass the local pipeline source path from R to Python
+py_pipeline_path <- path_py_pipeline_src
+
+py_run_string("
+import sys
+import os
+import importlib
+
+# Logic to handle pipeline module reloading for development/updates
+pipeline_modules = [key for key in list(sys.modules.keys()) if 'pipeline' in key]
+
+# Inject local pipeline source into sys.path
+local_path = r.py_pipeline_path
+if os.path.exists(local_path):
+    if local_path not in sys.path:
+        sys.path.insert(0, local_path)
+    print(f'Info: Using LOCAL pipeline source at: {local_path}')
+else:
+    print(f'Warning: Local path not found. Using system pipeline.')
+
+try:
+    import pipeline
+    importlib.reload(pipeline) # Force reload to ensure latest code is used
+    print(f'Info: Pipeline loaded from: {pipeline.__file__}')
+except ImportError as e:
+    print(f'Error: Could not import pipeline. Check path configuration. {e}')
+")
+
+# Import the pipeline module into R
+pipeline_mod <- import("pipeline")
+
+
+```
+
+# 3. Log Preprocessing (Trial-Level and Summary Extraction)
+
+```{r log-preprocessing}
+orig_logs <- list.files(path_raw_log, pattern = "\\.txt$", full.names = TRUE)
+
+cat("Processing", length(orig_logs), "log files...\n")
+
+for (fpath in orig_logs) {
+  # 1) Detect file encoding (UTF-16LE vs UTF-8) using Byte Order Mark (BOM)
+  fb  <- file(fpath, "rb")
+  bom <- readBin(fb, "raw", n = 2)
+  close(fb)
+  encoding <- if (length(bom) == 2 && identical(bom, as.raw(c(0xFF, 0xFE)))) "UTF-16LE" else "UTF-8"
+
+  # 2) Read data with detected encoding
+  df <- read_delim(
+    fpath,
+    delim = "\t",
+    col_types = cols(),
+    show_col_types = FALSE,
+    locale = locale(encoding = encoding)
+  )
+
+  n <- nrow(df)
+
+  # 3) Extract trial-level data 
+  # Removes the last 3 lines (ratings) and Block 7 (practice/unused)
+  df_trials <- df %>% 
+    slice(1:(n-3)) %>% 
+    filter(block != 7) %>% 
+    mutate(emotion = str_extract(stim, "enj|dis|dom|neu|aff"))
+
+  # 4) Extract summary / post-rating data (last 3 lines)
+  df_summary <- df %>% slice((n-2):n)
+
+  # 5) Save outputs
+  out_name <- paste0(tools::file_path_sans_ext(basename(fpath)), ".csv")
+  out_name_summary <- paste0(tools::file_path_sans_ext(basename(fpath)), "_summaryPostRating.csv")
+    
+  # Save cleaned trial logs
+  write_csv(df_trials, file.path(path_csv_filtered, out_name))
+  # Save summary ratings
+  write_csv(df_summary, file.path(path_dest_covariates, out_name_summary))
+}
+cat("Log preprocessing complete.\n")
+
+
+```
+
+# 4. Condition Definitions (Shared Across Components)
+
+```{r define-conditions}
+# ==============================================================================
+# Experimental Design & Condition Pooling Specifications
+# ==============================================================================
+# Fair categorization: Offers 5:5 and 6:4
+# Unfair categorization: Offers 8:2 and 9:1
+# Note: Offer 7:3 serves as a filler condition and is excluded from the pooled 
+#       fairness contrasts to maximize signal-to-noise ratio.
+# General Inclusion Criteria: Valid reaction (>0), RT between 150 and 3000 ms.
+
+common_average_by <- list(
+    
+    # -------------------------------------------------------------------------
+    # A. Raw Cell Conditions (5 Emotions x 5 Offers)
+    # -------------------------------------------------------------------------
+    # Maintained for granular extraction, single-trial analysis (LMM), or plotting.
+    
+    Face_enj_5_5 = "emotion=='enj' & Offers_Other==5 & reaction>0 & RT >= 150 & RT <= 3000",
+    Face_dis_5_5 = "emotion=='dis' & Offers_Other==5 & reaction>0 & RT >= 150 & RT <= 3000",
+    Face_dom_5_5 = "emotion=='dom' & Offers_Other==5 & reaction>0 & RT >= 150 & RT <= 3000",
+    Face_neu_5_5 = "emotion=='neu' & Offers_Other==5 & reaction>0 & RT >= 150 & RT <= 3000",
+    Face_aff_5_5 = "emotion=='aff' & Offers_Other==5 & reaction>0 & RT >= 150 & RT <= 3000",
+    
+    Face_enj_6_4 = "emotion=='enj' & Offers_Other==6 & reaction>0 & RT >= 150 & RT <= 3000",
+    Face_dis_6_4 = "emotion=='dis' & Offers_Other==6 & reaction>0 & RT >= 150 & RT <= 3000",
+    Face_dom_6_4 = "emotion=='dom' & Offers_Other==6 & reaction>0 & RT >= 150 & RT <= 3000",
+    Face_neu_6_4 = "emotion=='neu' & Offers_Other==6 & reaction>0 & RT >= 150 & RT <= 3000",
+    Face_aff_6_4 = "emotion=='aff' & Offers_Other==6 & reaction>0 & RT >= 150 & RT <= 3000",
+    
+    Face_enj_7_3 = "emotion=='enj' & Offers_Other==7 & reaction>0 & RT >= 150 & RT <= 3000",
+    Face_dis_7_3 = "emotion=='dis' & Offers_Other==7 & reaction>0 & RT >= 150 & RT <= 3000",
+    Face_dom_7_3 = "emotion=='dom' & Offers_Other==7 & reaction>0 & RT >= 150 & RT <= 3000",
+    Face_neu_7_3 = "emotion=='neu' & Offers_Other==7 & reaction>0 & RT >= 150 & RT <= 3000",
+    Face_aff_7_3 = "emotion=='aff' & Offers_Other==7 & reaction>0 & RT >= 150 & RT <= 3000",
+    
+    Face_enj_8_2 = "emotion=='enj' & Offers_Other==8 & reaction>0 & RT >= 150 & RT <= 3000",
+    Face_dis_8_2 = "emotion=='dis' & Offers_Other==8 & reaction>0 & RT >= 150 & RT <= 3000",
+    Face_dom_8_2 = "emotion=='dom' & Offers_Other==8 & reaction>0 & RT >= 150 & RT <= 3000",
+    Face_neu_8_2 = "emotion=='neu' & Offers_Other==8 & reaction>0 & RT >= 150 & RT <= 3000",
+    Face_aff_8_2 = "emotion=='aff' & Offers_Other==8 & reaction>0 & RT >= 150 & RT <= 3000",
+    
+    Face_enj_9_1 = "emotion=='enj' & Offers_Other==9 & reaction>0 & RT >= 150 & RT <= 3000",
+    Face_dis_9_1 = "emotion=='dis' & Offers_Other==9 & reaction>0 & RT >= 150 & RT <= 3000",
+    Face_dom_9_1 = "emotion=='dom' & Offers_Other==9 & reaction>0 & RT >= 150 & RT <= 3000",
+    Face_neu_9_1 = "emotion=='neu' & Offers_Other==9 & reaction>0 & RT >= 150 & RT <= 3000",
+    Face_aff_9_1 = "emotion=='aff' & Offers_Other==9 & reaction>0 & RT >= 150 & RT <= 3000",
+
+    # -------------------------------------------------------------------------
+    # B. Main Effect Pooling (Orthogonal Dimensions)
+    # -------------------------------------------------------------------------
+    
+    # 1. Main Effect of Fairness (Collapsing across Emotion)
+    Grand_Fair   = "(emotion=='enj' | emotion=='dis' | emotion=='dom' | emotion=='neu' | emotion=='aff') & (Offers_Other==5 | Offers_Other==6) & reaction>0 & RT >= 150 & RT <= 3000",
+    Grand_Unfair = "(emotion=='enj' | emotion=='dis' | emotion=='dom' | emotion=='neu' | emotion=='aff') & (Offers_Other==8 | Offers_Other==9) & reaction>0 & RT >= 150 & RT <= 3000",
+
+    # 2. Main Effect of Emotion (Collapsing across Offer Ratios)
+    All_Neu = "emotion=='neu' & reaction>0 & RT >= 150 & RT <= 3000",
+    All_Dis = "emotion=='dis' & reaction>0 & RT >= 150 & RT <= 3000",
+    All_Enj = "emotion=='enj' & reaction>0 & RT >= 150 & RT <= 3000",
+    All_Dom = "emotion=='dom' & reaction>0 & RT >= 150 & RT <= 3000",
+    All_Aff = "emotion=='aff' & reaction>0 & RT >= 150 & RT <= 3000",
+
+    # -------------------------------------------------------------------------
+    # C. Simple Effect Pooling (Emotion within Fairness Contexts)
+    # -------------------------------------------------------------------------
+    
+    # Context: Unfair Offers (8:2 and 9:1)
+    Face_dis_Unfair = "emotion=='dis' & (Offers_Other==8 | Offers_Other==9) & reaction>0 & RT >= 150 & RT <= 3000",
+    Face_neu_Unfair = "emotion=='neu' & (Offers_Other==8 | Offers_Other==9) & reaction>0 & RT >= 150 & RT <= 3000",
+    Face_enj_Unfair = "emotion=='enj' & (Offers_Other==8 | Offers_Other==9) & reaction>0 & RT >= 150 & RT <= 3000",
+    Face_dom_Unfair = "emotion=='dom' & (Offers_Other==8 | Offers_Other==9) & reaction>0 & RT >= 150 & RT <= 3000",
+    Face_aff_Unfair = "emotion=='aff' & (Offers_Other==8 | Offers_Other==9) & reaction>0 & RT >= 150 & RT <= 3000",
+
+    # Context: Fair Offers (5:5 and 6:4)
+    Face_dis_Fair = "emotion=='dis' & (Offers_Other==5 | Offers_Other==6) & reaction>0 & RT >= 150 & RT <= 3000",
+    Face_neu_Fair = "emotion=='neu' & (Offers_Other==5 | Offers_Other==6) & reaction>0 & RT >= 150 & RT <= 3000",
+    Face_enj_Fair = "emotion=='enj' & (Offers_Other==5 | Offers_Other==6) & reaction>0 & RT >= 150 & RT <= 3000",
+    Face_dom_Fair = "emotion=='dom' & (Offers_Other==5 | Offers_Other==6) & reaction>0 & RT >= 150 & RT <= 3000",
+    Face_aff_Fair = "emotion=='aff' & (Offers_Other==5 | Offers_Other==6) & reaction>0 & RT >= 150 & RT <= 3000"
+)
+
+# Helper function to archive key output files (e.g., trials.csv)
+copy_trials_csv <- function(src_dir, dest_dir, new_filename = "trials.csv") {
+  src_trials <- file.path(src_dir, "trials.csv")
+  if (file.exists(src_trials)) {
+    file.copy(src_trials, file.path(dest_dir, new_filename), overwrite = TRUE)
+    cat(sprintf(">> Archived: %s/%s\n", basename(dest_dir), new_filename))
+  } else {
+    warning(sprintf("Source file not found: %s", src_trials))
+  }
+}
+
+
+```
+
+# 5. ERP Component Extraction and Statistical Testing
+
+## 5.1 Stimulus-Locked Phase (Unified: FRN, N400, LPP)
+
+Performs a **single-pass extraction** for component amplitudes and runs **Cluster-based Permutation Tests**.
+
+```{r stimulus-locked-phase}
+if (run_offer_phase) {
+
+  # A. Define Destination
+  out_stim <- path_dest_stim
+  if (!dir.exists(out_stim)) dir.create(out_stim, recursive = TRUE)
+
+  # --- FILE DETECTION ---
+  stim_raw_files <- list.files(path_raw_eeg, pattern = "\\.(set|vhdr)$", full.names = TRUE, ignore.case = TRUE)
+  if (length(stim_raw_files) == 0) stop("CRITICAL: No EEG files (.set or .vhdr) found in ", path_raw_eeg)
+
+  cat(sprintf("\n=== Running Stimulus-Locked Extraction & Statistics ===\n"))
+  cat(sprintf("Method: %s\n", path_suffix))
+  cat(sprintf("Found %d raw files for processing.\n", length(stim_raw_files)))
+
+  # B. Component Definition (For Single-Trial Amplitude Extraction)
+  # Standard time windows for FRN, N400, and LPP
+  erp_config <- tibble::tribble(
+    ~comp_name,    ~t_min, ~t_max, ~roi_channels,
+    "FRN",         0.250,  0.300,  c("F3","Fz","F4","FC1","FC2","Cz"),
+    "LPP_offer",   0.500,  0.800,  c("Pz","Cz","C1","C2","CP1","CP2"),
+    "N400",        0.350,  0.450,  c("Fz","Cz","CPz","Pz")
+  )
+  
+  # C. Conditional Baseline Extraction (Regression Method)
+  if (!use_baseline_correction) {
+    cat("   [Config] Adding matched baseline components (-200ms to 0ms) for covariate extraction...\n")
+    baseline_config <- erp_config %>%
+      mutate(comp_name = paste0("Baseline_", comp_name), t_min = -0.200, t_max = 0.000)
+    final_config <- bind_rows(erp_config, baseline_config)
+  } else {
+    final_config <- erp_config
+  }
+
+  # Prepare Python Arguments for Component Extraction
+  components_arg <- list(
+    name = as.list(final_config$comp_name),
+    tmin = as.list(final_config$t_min),
+    tmax = as.list(final_config$t_max),
+    roi  = final_config$roi_channels
+  )
+
+  # D. Permutation Test Configuration
+  # Hierarchical statistical contrasts to test experimental hypotheses.
+  
+  perm_contrasts_list <- list(
+    # 1. Main Effect of Fairness (Validation of UG paradigm)
+    c('Grand_Unfair', 'Grand_Fair'),
+    
+    # 2. Main Effect of Emotion (Manipulation check for facial stimuli)
+    c('All_Dis', 'All_Neu'),
+    c('All_Enj', 'All_Neu'),
+    c('All_Dom', 'All_Neu'),
+    c('All_Aff', 'All_Neu'),
+
+    # 3. Simple Effects: Emotional modulation within Unfair context
+    c('Face_dis_Unfair', 'Face_neu_Unfair'),  
+    c('Face_enj_Unfair', 'Face_neu_Unfair'),  
+    c('Face_dom_Unfair', 'Face_neu_Unfair'),  
+    c('Face_aff_Unfair', 'Face_neu_Unfair'),
+
+    # 4. Control Comparisons: Emotional modulation within Fair context
+    c('Face_dis_Fair', 'Face_neu_Fair'),
+    c('Face_enj_Fair', 'Face_neu_Fair'),
+    c('Face_dom_Fair', 'Face_neu_Fair'),
+    c('Face_aff_Fair', 'Face_neu_Fair')
+  )
+
+  # E. Execute Pipeline (Single Pass)
+  # - Extracts single-trial amplitudes for `trials.csv`
+  # - Runs permutation tests for `clusters.csv`
+  res_stim <- pipeline_mod$group_pipeline(
+    raw_files        = stim_raw_files,   
+    log_files        = path_csv_filtered,
+    output_dir       = out_stim,     
+    epochs_dir       = file.path(out_stim, "epochs"), 
+    
+    # Preprocessing Parameters
+    ica_method       = "fastica",
+    ica_n_components = 0.99,
+    triggers         = c(10:89, 150:169),
+    bad_channels     = "auto",
+    highpass_freq    = 0.05,
+    lowpass_freq     = 30.0,
+    reject_peak_to_peak = 200.0,
+    baseline         = baseline_arg, 
+    
+    # Task 1: Component Amplitude Extraction
+    components       = components_arg, 
+    average_by       = common_average_by,
+    
+    # Task 2: Cluster-Based Permutation Tests
+    # Note: Window expanded to 0.150 - 0.800 ms to capture early N200/FRN onset and late LPP dynamics.
+    perm_contrasts   = perm_contrasts_list,
+    perm_tmin        = 0.150,  
+    perm_tmax        = 0.800,  
+    perm_channels    = NULL    # Default: Whole-brain search
+  )
+  
+  # F. Archive Baseline Values (If applicable)
+  if (!use_baseline_correction) {
+      out_bl_archive <- file.path(path_dest_baseline, "Stimulus_Locked_Values")
+      if(!dir.exists(out_bl_archive)) dir.create(out_bl_archive, recursive=TRUE)
+      copy_trials_csv(out_stim, out_bl_archive, "baseline_values.csv")
+  }
+}
+
+
+```
+
+## 5.2 Response-Locked Phase (CPP)
+
+This section extracts the Central Parietal Positivity (CPP).
+**Note:** Execution is controlled by the `run_cpp_phase` flag.
+
+```{r response-locked-phase}
+if (run_cpp_phase) {
+
+  out_cpp <- path_dest_cpp
+  if (!dir.exists(out_cpp)) dir.create(out_cpp, recursive = TRUE)
+  
+  # --- STEP 1: Detect Available Files ---
+  raw_files_found <- list.files(path_raw_eeg, pattern = "\\.(set|vhdr)$", full.names = TRUE, ignore.case = TRUE)
+  log_files_found <- list.files(path_csv_filtered, pattern = "\\.csv$", full.names = TRUE)
+  
+  if (length(raw_files_found) == 0) stop("CRITICAL: No EEG files found for CPP phase.")
+  
+  cat(sprintf("\n=== Running Response-Locked Extraction (CPP) ===\n"))
+
+  # --- STEP 2: Create Aligned Logs (Numeric ID Matching) ---
+  path_csv_cpp_aligned <- file.path(path_output_root, "01_Preprocessing_Logs", "csv_cpp_aligned")
+  if (!dir.exists(path_csv_cpp_aligned)) dir.create(path_csv_cpp_aligned, recursive = TRUE)
+  
+  final_raw_list <- c()
+  final_log_list <- c()
+  log_ids <- as.integer(str_extract(basename(log_files_found), "\\d+"))
+  
+  for (raw_path in raw_files_found) {
+    raw_fname <- basename(raw_path)
+    eeg_id <- as.integer(str_extract(raw_fname, "\\d+"))
+    match_idx <- which(log_ids == eeg_id)
+    
+    if (length(match_idx) == 1) {
+      src_log <- log_files_found[match_idx]
+      df_temp <- read_csv(src_log, show_col_types = FALSE)
+      df_cpp <- df_temp %>% filter(reaction > 0)
+      
+      dest_fname <- paste0(tools::file_path_sans_ext(raw_fname), ".csv")
+      dest_log   <- file.path(path_csv_cpp_aligned, dest_fname)
+      write_csv(df_cpp, dest_log)
+      
+      final_raw_list <- c(final_raw_list, raw_path)
+      final_log_list <- c(final_log_list, dest_log)
+    }
+  }
+
+  if (length(final_raw_list) == 0) stop("No valid Raw-Log pairs found for CPP.")
+
+  # --- STEP 3: Configuration & Execution ---
+  roi_cpp <- c("Pz","Cz","C1","C2","CP1","CP2")
+  cpp_components <- list(name = list("CPP"), tmin = list(-0.30), tmax = list(0.05), roi  = list(roi_cpp))
+  
+  # Convert to R lists for Python compatibility
+  py_raw_files <- as.list(final_raw_list)
+  py_log_files <- as.list(final_log_list)
+
+  res_cpp <- pipeline_mod$group_pipeline(
+    raw_files        = py_raw_files,
+    log_files        = py_log_files,
+    output_dir       = out_cpp,
+    epochs_dir       = file.path(out_cpp, "epochs"), 
+    
+    ica_method       = "fastica",
+    ica_n_components = 0.99,
+    triggers         = c(1, 2), 
+    epochs_on_missing = 'ignore',        
+    bad_channels     = "auto",
+    highpass_freq    = 0.05,
+    lowpass_freq     = 30.0,
+    epochs_tmin      = -0.9,             
+    epochs_tmax      = 0.5,
+    baseline         = NULL, 
+    reject_peak_to_peak = 200.0,
+    components       = cpp_components,
+    average_by       = common_average_by
+  )
+
+  copy_trials_csv(out_cpp, path_dest_cpp)
+} else {
+  cat("\n[INFO] Skipping Response-Locked (CPP) Phase as configured.\n")
+}
+
+
+```
+
+# 6. Summary of Generated Files
+
+```{r summary}
+cat("\n========================================\n")
+cat("          PREPROCESSING COMPLETE          \n")
+cat("========================================\n")
+cat("Method Strategy: ", path_suffix, "\n")
+cat("Output Root:     ", path_output_root, "\n\n")
+
+cat("1. Stimulus-Locked (FRN, N400, LPP): \n")
+if (run_offer_phase) {
+  cat("   -> Data (Single Trials): ", file.path(path_dest_stim, "trials.csv"), "\n")
+  cat("   -> Stats (Permutation):  ", file.path(path_dest_stim, "group_clusters.csv"), "\n")
+  cat("   -> Epochs:               ", file.path(path_dest_stim, "epochs"), "\n")
+} else {
+  cat("   -> [SKIPPED]\n")
+}
+
+cat("2. Response-Locked (CPP): \n")
+if (run_cpp_phase) {
+  cat("   -> Data (Single Trials): ", file.path(path_dest_cpp, "trials.csv"), "\n")
+} else {
+  cat("   -> [SKIPPED]\n")
+}
+
+if (!use_baseline_correction) {
+  cat("\n[INFO] Regression Method Active: Waveforms are NOT baseline corrected.\n")
+}
+cat("========================================\n")
+
+
+```
+

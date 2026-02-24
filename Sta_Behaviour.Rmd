@@ -1,0 +1,544 @@
+---
+title: "UG Behavioral Statistical Analysis Report"
+subtitle: "Publication-Quality Modeling (Fixed & Robust) with APA Reporting"
+author: "Data Analysis Team"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_depth: 3
+    code_folding: show
+    theme: flatly
+    df_print: paged
+---
+
+``` {r setup, include=FALSE}
+# ==============================================================================
+# SECTION 0: ENVIRONMENT & CONFIGURATION
+# ==============================================================================
+
+# 1. Package Management
+if(!require("pacman")) install.packages("pacman")
+pacman::p_load(
+  here,             # Project-relative paths
+  tidyverse,        # Data wrangling
+  buildmer,         # Maximal random effects optimization
+  glmmTMB,          # Robust GLMM (Binomial)
+  lme4, lmerTest,   # LMM (Gaussian)
+  emmeans,          # Marginal means & Post-hoc
+  car,              # Type III ANOVA
+  effectsize,       # Partial Eta Squared
+  parameters,       # Standardized reporting
+  performance,      # Model checking
+  openxlsx          # Excel Reporting (Industry Standard)
+)
+
+# 2. Global Settings
+options(scipen = 999) 
+
+# [CRITICAL] Set Sum Coding for valid Type III ANOVA
+# This is mandatory when interactions are present
+options(contrasts = c("contr.sum", "contr.poly"))
+
+# [CONFIG] Force calculation of Denominator DF
+options(emm_options = list(lmerTest.limit = 50000, pbkrtest.limit = 50000))
+
+# 3. Path Configuration
+# INPUT: Relative to Project Root
+path_input <- here("data", "02_Pipeline_Output", "Method_Regression", "Stimulus_Locked", "trials.csv")
+
+# OUTPUT: Define based on Run Mode
+DEBUG_MODE <- FALSE 
+
+dir_suffix <- if(DEBUG_MODE) "Debug_Output_Final" else "Pub_Output_Final"
+path_out_root <- here("results", "Behavioral", dir_suffix)
+
+if(!dir.exists(path_out_root)) dir.create(path_out_root, recursive = TRUE)
+
+cat(sprintf(">>> SYSTEM STATUS: DEBUG_MODE = %s\n", DEBUG_MODE))
+cat(sprintf(">>> OUTPUT PATH: %s\n", path_out_root))
+
+
+```
+
+# 1. Methodology
+
+This analysis employs **Linear Mixed-Effects Models (LMM)** and **Generalized Linear Mixed-Effects Models (GLMM)**.
+
+* **Model Selection**: We use `buildmer` to identify the maximal random effects structure supported by the data, protecting fixed effects (`include` argument) to ensure hypothesis testing remains valid.
+* **Robustness Check**: Evaluates cross-experiment variations in maximal random structures via Likelihood Ratio Tests (LRT).
+* **Reporting Standard**: Extracts Type III ANOVA summaries (Satterthwaite F-tests for continuous data, Wald Chi-Square for binomial), effect sizes, and pairwise comparisons using APA-7 formatting standards.
+* **Correction**: Post-hoc pairwise comparisons are corrected using **FDR** to balance sensitivity and error rate.
+
+# 2. APA Formatting Module
+
+``` {r apa-module}
+# ==============================================================================
+# Helper: Format ANOVA Table to APA String (Supports LMM & GLMM)
+# ==============================================================================
+format_anova_apa <- function(anova_obj, model) {
+  df_res <- as.data.frame(anova_obj) %>% tibble::rownames_to_column("Effect")
+  
+  # Calculate Partial Eta Squared (Primary for LMMs)
+  es_df <- data.frame(Parameter = character(), Eta2_partial = numeric())
+  tryCatch({
+    if(!inherits(model, "glmmTMB") && !inherits(model, "glm")) {
+      es <- effectsize::eta_squared(model, partial = TRUE, ci = 0.95, verbose = FALSE)
+      es_df <- as.data.frame(es) %>% select(Parameter, Eta2_partial)
+    }
+  }, error = function(e) NULL)
+  
+  if(nrow(es_df) > 0) {
+    df_res <- left_join(df_res, es_df, by = c("Effect" = "Parameter"))
+  } else {
+    df_res$Eta2_partial <- NA
+  }
+  
+  # Safe column extractors (prevent 'object not found' during case_when evaluation)
+  get_col <- function(col_name) if(col_name %in% names(df_res)) df_res[[col_name]] else NA
+  
+  df_res <- df_res %>%
+    mutate(
+      F_val  = get_col("F value"),
+      NumDF  = get_col("NumDF"),
+      DenDF  = get_col("DenDF"),
+      Df_val = get_col("Df"),
+      Chisq  = get_col("Chisq"),
+      p_val  = if("Pr(>F)" %in% names(.)) `Pr(>F)` else if("Pr(>Chisq)" %in% names(.)) `Pr(>Chisq)` else NA,
+      
+      p_str = case_when(
+        is.na(p_val) ~ "-",
+        p_val < .001 ~ "< .001",
+        TRUE ~ paste0("= ", sprintf("%.3f", p_val))
+      ),
+      Eta_str = ifelse(is.na(Eta2_partial), "-", sprintf("%.2f", Eta2_partial))
+    )
+    
+  df_res %>%
+    mutate(
+      APA_Report = case_when(
+        !is.na(F_val) & !is.na(NumDF) & !is.na(DenDF) ~ 
+          sprintf("F(%s, %.2f) = %.2f, p %s, np2 = %s", NumDF, DenDF, F_val, p_str, Eta_str),
+        !is.na(F_val) & !is.na(Df_val) ~ 
+          sprintf("F(%s) = %.2f, p %s, np2 = %s", Df_val, F_val, p_str, Eta_str),
+        !is.na(Chisq) & !is.na(Df_val) ~ 
+          sprintf("X2(%s) = %.2f, p %s", Df_val, Chisq, p_str),
+        TRUE ~ "Format not supported"
+      )
+    ) %>%
+    # Clean up intermediate safe columns to keep the final output neat
+    select(-F_val, -NumDF, -DenDF, -Df_val, -Chisq, -p_val)
+}
+
+# ==============================================================================
+# Helper: Format Post-hoc tests (with CI)
+# ==============================================================================
+format_posthoc_apa <- function(emm_df) {
+  df_clean <- as.data.frame(emm_df)
+  
+  if("t.ratio" %in% names(df_clean)) {
+    # LMM Output Formatting
+    df_clean <- df_clean %>%
+      mutate(
+        # [FIXED]: Added paste0("= ", ...) to ensure p >= .001 displays the equal sign
+        p_str = case_when(p.value < .001 ~ "< .001", TRUE ~ paste0("= ", sprintf("%.3f", p.value))),
+        t_str = sprintf("%.2f", t.ratio),
+        df_str = sprintf("%.2f", df),
+        estimate_col = if("estimate" %in% names(.)) estimate else if("response" %in% names(.)) response else NA,
+        estimate_str = sprintf("%.2f", estimate_col),
+        se_str = sprintf("%.2f", SE),
+        Stats_String = sprintf("b = %s (SE=%s), t(%s) = %s, p %s", estimate_str, se_str, df_str, t_str, p_str)
+      )
+  } else if("z.ratio" %in% names(df_clean)) {
+    # GLMM Output Formatting (Infinite DF)
+    df_clean <- df_clean %>%
+      mutate(
+        # [FIXED]: Added paste0("= ", ...) to ensure p >= .001 displays the equal sign
+        p_str = case_when(p.value < .001 ~ "< .001", TRUE ~ paste0("= ", sprintf("%.3f", p.value))),
+        z_str = sprintf("%.2f", z.ratio),
+        estimate_col = if("estimate" %in% names(.)) estimate else if("odds.ratio" %in% names(.)) odds.ratio else NA,
+        estimate_str = sprintf("%.2f", estimate_col),
+        se_str = sprintf("%.2f", SE),
+        Stats_String = sprintf("b = %s (SE=%s), z = %s, p %s", estimate_str, se_str, z_str, p_str)
+      )
+  }
+  return(df_clean)
+}
+
+# ==============================================================================
+# Helper: Format Raw Coefficients 
+# ==============================================================================
+format_coefs <- function(model) {
+  tryCatch({
+    params <- parameters::model_parameters(model, ci = 0.95, effects = "fixed")
+    df_params <- as.data.frame(params)
+    
+    stat_col <- if("t" %in% names(df_params)) "t" else if("z" %in% names(df_params)) "z" else "Statistic"
+    
+    df_params %>% mutate(
+      p_str = case_when(p < .001 ~ "< .001", TRUE ~ paste0("= ", sprintf("%.3f", p))),
+      Report = sprintf("b = %.2f, SE = %.2f, %s = %.2f, p %s", Coefficient, SE, stat_col, !!sym(stat_col), p_str)
+    )
+  }, error = function(e) {
+    # Fallback to summary() if parameters extraction fails
+    coef_df <- summary(model)$coefficients
+    if(is.list(coef_df) && "cond" %in% names(coef_df)) coef_df <- coef_df$cond
+    as.data.frame(coef_df) %>% tibble::rownames_to_column("Predictor")
+  })
+}
+
+
+```
+
+# 3. Model Engine & Output Generation
+
+``` {r functions}
+# ------------------------------------------------------------------------------
+# FUNCTION 1: ROBUST MODELING ENGINE (With Safety Net)
+# ------------------------------------------------------------------------------
+run_robust_model <- function(formula_str, data, family_type, fixed_terms) {
+  
+  f <- as.formula(formula_str)
+  
+  # --- A. DEBUG MODE (Fast Pass) ---
+  if(DEBUG_MODE) {
+    cat("   [DEBUG] Fitting standard model (Skipping optimization)...\n")
+    suppressWarnings({
+      if(family_type == "binomial") {
+        return(glmmTMB(f, data = data, family = binomial()))
+      } else {
+        return(lmer(f, data = data, REML = TRUE))
+      }
+    })
+  } else {
+    # --- B. PRODUCTION MODE (Buildmer Optimization) ---
+    cat("   [PRODUCTION] Optimizing Random Effects via buildmer...\n")
+    
+    ctrl <- buildmerControl(include = fixed_terms, crit = "LRT")
+    
+    final_model <- tryCatch({
+      if(family_type == "binomial") {
+        bm <- buildglmmTMB(f, data = data, family = binomial(), buildmerControl = ctrl)
+        bm@model
+      } else {
+        bm <- buildmer(f, data = data, buildmerControl = ctrl)
+        bm@model
+      }
+    }, error = function(e) {
+      cat("   [ERROR] buildmer failed to converge. Fallback triggered.\n")
+      return(NULL)
+    })
+    
+    # --- C. SAFETY CHECK ---
+    if(!is.null(final_model)) {
+      is_valid_mixed <- !is.null(lme4::findbars(formula(final_model)))
+    } else {
+      is_valid_mixed <- FALSE
+    }
+    
+    if(is.null(final_model) || !is_valid_mixed) {
+      cat("   [WARNING] Optimization failed. FALLBACK: Force (1 | participant_id).\n")
+      
+      fixed_only <- as.formula(paste(deparse(fixed_terms), collapse=" "))
+      dep_var <- as.character(f)[2]
+      new_f_str <- paste(dep_var, "~", as.character(fixed_only)[2], "+ (1 | participant_id)")
+      new_f <- as.formula(new_f_str)
+      
+      if(family_type == "binomial") {
+        return(glmmTMB(new_f, data = data, family = binomial()))
+      } else {
+        return(lmer(new_f, data = data, REML = TRUE))
+      }
+    } else {
+      cat("   [SUCCESS] Maximal random effects structure identified.\n")
+      return(final_model)
+    }
+  }
+}
+
+# ------------------------------------------------------------------------------
+# FUNCTION 2: STANDARDIZED REPORTING (Excel Integration)
+# ------------------------------------------------------------------------------
+generate_report <- function(model, label, factors, data_used) {
+  
+  out_dir <- file.path(path_out_root, label)
+  if(!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
+  
+  cat(paste0("   -> Generating Reports in: ", label, "\n"))
+  
+  list_of_tables <- list()
+  
+  # 1. Formula
+  list_of_tables[["Model_Formula"]] <- data.frame(Formula = paste(deparse(formula(model)), collapse=" "))
+  
+  # 2. Coefficients (Fixed)
+  list_of_tables[["Model_Coefficients"]] <- format_coefs(model)
+  
+  # 3. Type III ANOVA (GLMM = Wald X2, LMM = Satterthwaite F)
+  if(inherits(model, "glmmTMB") || inherits(model, "glm")) {
+    anov <- car::Anova(model, type = 3)
+  } else {
+    anov <- anova(model, type = 3, ddf = "Satterthwaite")
+  }
+  list_of_tables[["ANOVA_Main"]] <- format_anova_apa(anov, model)
+  
+  # 4. Descriptive Means (EMMeans)
+  em <- emmeans(model, as.formula(paste("~", paste(factors, collapse="*"))), type="response", data = data_used)
+  em_df <- as.data.frame(em)
+  
+  if("prob" %in% names(em_df)) em_df <- em_df %>% rename(Mean = prob)
+  else if("response" %in% names(em_df)) em_df <- em_df %>% rename(Mean = response)
+  else if("emmean" %in% names(em_df)) em_df <- em_df %>% rename(Mean = emmean)
+  
+  list_of_tables[["Descriptive_Means_SE"]] <- em_df
+  
+  # 5. Smart Post-hoc (FDR Corrected)
+  p_col <- grep("Pr", names(anov), value = TRUE)[1]
+  int_rows <- grep(":", rownames(anov))
+  is_int_sig <- any(anov[int_rows, p_col] < 0.05, na.rm = TRUE)
+  
+  if(isTRUE(is_int_sig) && length(factors) >= 2) {
+    cat("      [Result] Interaction Significant -> Simple Effects (FDR).\n")
+    f1 <- factors[1]; f2 <- factors[2]
+    
+    res1 <- pairs(emmeans(model, as.formula(paste("~", f1, "|", f2)), data=data_used), adjust="fdr")
+    list_of_tables[[paste0("PostHoc_", f1, "_by_", f2)]] <- format_posthoc_apa(res1)
+    
+    res2 <- pairs(emmeans(model, as.formula(paste("~", f2, "|", f1)), data=data_used), adjust="fdr")
+    list_of_tables[[paste0("PostHoc_", f2, "_by_", f1)]] <- format_posthoc_apa(res2)
+  } else {
+    cat("      [Result] Interaction NS (or Single Factor) -> Main Effects (FDR).\n")
+    for(f in factors) {
+      res <- pairs(emmeans(model, as.formula(paste("~", f)), data=data_used), adjust="fdr")
+      list_of_tables[[paste0("PostHoc_Main_", f)]] <- format_posthoc_apa(res)
+    }
+  }
+  
+  # --- 6. Export to Multi-sheet Excel ---
+  wb <- createWorkbook()
+  for(sheet_name in names(list_of_tables)) {
+    # Ensure legal sheet names
+    safe_sheet_name <- substr(gsub("[^A-Za-z0-9_]", "_", sheet_name), 1, 31)
+    addWorksheet(wb, safe_sheet_name)
+    writeData(wb, safe_sheet_name, list_of_tables[[sheet_name]])
+    addStyle(wb, safe_sheet_name, createStyle(textDecoration="bold", border="Bottom"), rows=1, cols=1:ncol(list_of_tables[[sheet_name]]))
+    setColWidths(wb, safe_sheet_name, cols=1:ncol(list_of_tables[[sheet_name]]), widths="auto")
+  }
+  
+  save_path <- file.path(out_dir, paste0("STATS_REPORT_", label, ".xlsx"))
+  saveWorkbook(wb, save_path, overwrite = TRUE)
+  cat(paste0("      [Export] Final Excel Generated: ", basename(save_path), "\n"))
+}
+
+
+```
+
+# 4. Data Import & Cleaning
+
+``` {r data-load}
+if(!file.exists(path_input)) stop("Data file not found at: ", path_input)
+
+df_raw <- read_csv(path_input, show_col_types = FALSE)
+
+# Helper for safer ID cleaning
+clean_id <- function(x) {
+  num_part <- as.numeric(str_extract(x, "\\d+"))
+  sprintf("Vp%04d", num_part)
+}
+
+df_clean <- df_raw %>%
+  mutate(
+    participant_id = clean_id(participant_id),
+    participant_id = factor(participant_id),
+    
+    ratio_val = Offers_You / (Offers_You + Offers_Other),
+    offer_ratio = case_when(
+      abs(ratio_val - 0.5) < 0.01 ~ "5:5",
+      abs(ratio_val - 0.4) < 0.01 ~ "4:6",
+      abs(ratio_val - 0.3) < 0.01 ~ "3:7",
+      abs(ratio_val - 0.2) < 0.01 ~ "2:8",
+      abs(ratio_val - 0.1) < 0.01 ~ "1:9",
+      TRUE ~ NA_character_
+    ),
+    offer_ratio = factor(offer_ratio, levels = c("5:5", "4:6", "3:7", "2:8", "1:9")),
+    
+    offer_type = case_when(
+      offer_ratio %in% c("5:5", "4:6") ~ "Fair",
+      offer_ratio %in% c("2:8", "1:9") ~ "Unfair",
+      TRUE ~ "Other"
+    ),
+    offer_type = factor(offer_type, levels = c("Fair", "Unfair", "Other")),
+    
+    is_reject = if_else(reaction == 2, 1L, 0L),
+    logRT = log(RT),
+    emotion = factor(emotion)
+  ) %>%
+  filter(!is.na(offer_ratio), !is.na(reaction), RT >= 150, RT <= 3000)
+
+if(DEBUG_MODE) {
+  subs <- unique(df_clean$participant_id)[1:5]
+  df_clean <- df_clean %>% filter(participant_id %in% subs)
+  cat(">>> DEBUG MODE: Subset to 5 subjects.\n")
+}
+
+# CONTRASTS (CRITICAL)
+contrasts(df_clean$emotion) <- contr.sum
+contrasts(df_clean$offer_type) <- contr.sum
+contrasts(df_clean$offer_ratio) <- contr.sum
+
+cat("N Trials for Analysis:", nrow(df_clean), "\n")
+
+
+```
+
+# 5. Analysis I: Offer Type (Fair vs. Unfair) [PRIORITY]
+
+``` {r analysis-type}
+# Subset Data
+df_type <- df_clean %>% 
+  filter(offer_type %in% c("Fair", "Unfair")) %>% 
+  droplevels()
+
+# Reset Contrasts
+contrasts(df_type$offer_type) <- contr.sum
+contrasts(df_type$emotion) <- contr.sum
+
+# --- 1. Rejection Rate (MAIN PIPELINE) ---
+cat("\n>>> Running: Offer Type - Rejection Rate <<<\n")
+m_type_rej <- run_robust_model(
+  formula_str = "is_reject ~ emotion * offer_type + (emotion * offer_type | participant_id)",
+  data = df_type, 
+  family_type = "binomial", 
+  fixed_terms = ~ emotion * offer_type
+)
+generate_report(m_type_rej, "Type_Rejection_Rate", c("emotion", "offer_type"), df_type)
+
+# --- 2. Response Time (MAIN PIPELINE) ---
+cat("\n>>> Running: Offer Type - Response Time <<<\n")
+m_type_rt <- run_robust_model(
+  formula_str = "logRT ~ emotion * offer_type + (emotion * offer_type | participant_id)",
+  data = df_type, 
+  family_type = "gaussian", 
+  fixed_terms = ~ emotion * offer_type
+)
+generate_report(m_type_rt, "Type_Response_Time", c("emotion", "offer_type"), df_type)
+
+# ------------------------------------------------------------------------------
+# --- 3. Robustness Check: Cross-Experiment Random Effects Validation ---
+# ------------------------------------------------------------------------------
+# Purpose: Explicitly fit and compare the identified optimal structures from 
+# Exp 1 and Exp 2 to assess the robustness of the fixed effects.
+# Outputs are safely isolated in 'Robustness_Check_CrossExp' directory.
+
+cat("\n>>> Running: Robustness Check (Cross-Experiment Model Comparison) <<<\n")
+
+robust_dir <- "Robustness_Check_CrossExp"
+
+# Forced Model 1: Empirical optimal structure from Experiment 1
+m_forced_1 <- glmmTMB(
+  is_reject ~ emotion * offer_type + (1 + offer_type | participant_id),
+  data = df_type, 
+  family = binomial()
+)
+generate_report(m_forced_1, file.path(robust_dir, "Model_E1_Structure"), c("emotion", "offer_type"), df_type)
+
+# Forced Model 2: Empirical optimal structure from Experiment 2 applied to current data
+m_forced_2 <- tryCatch({
+  glmmTMB(
+    is_reject ~ emotion * offer_type + (1 + emotion + offer_type | participant_id),
+    data = df_type, 
+    family = binomial()
+  )
+}, warning = function(w) {
+  cat("   [Warning] Model fit anomaly (e.g., singular fit) detected:", conditionMessage(w), "\n")
+  cat("   [Fallback] Applying zero-correlation parameterization to resolve overparameterization...\n")
+  glmmTMB(
+    is_reject ~ emotion * offer_type + (1 | participant_id) + (0 + emotion | participant_id) + (0 + offer_type | participant_id),
+    data = df_type, 
+    family = binomial()
+  )
+}, error = function(e) {
+  cat("   [Error] Severe convergence failure:", conditionMessage(e), "\n")
+  return(NULL)
+})
+
+if(!is.null(m_forced_2)) {
+  generate_report(m_forced_2, file.path(robust_dir, "Model_E2_Structure"), c("emotion", "offer_type"), df_type)
+  
+  # Model Selection Metric: Likelihood Ratio Test (LRT)
+  cat("\n   [INFO] Likelihood Ratio Test (Model 1 vs. Model 2):\n")
+  lrt_results <- anova(m_forced_1, m_forced_2)
+  print(lrt_results)
+  
+  lrt_out_path <- file.path(path_out_root, robust_dir, "LRT_Model_Comparison.txt")
+  capture.output(print(lrt_results), file = lrt_out_path)
+  cat(paste0("   -> Exported LRT comparison table to: ", robust_dir, "/LRT_Model_Comparison.txt\n"))
+}
+
+
+```
+
+# 6. Analysis II: Offer Ratio (Full Spectrum)
+
+``` {r analysis-ratio}
+# Subset Data
+df_ratio <- df_clean %>% droplevels()
+contrasts(df_ratio$offer_ratio) <- contr.sum
+contrasts(df_ratio$emotion) <- contr.sum
+
+# --- 1. Rejection Rate ---
+cat("\n>>> Running: Offer Ratio - Rejection Rate <<<\n")
+m_ratio_rej <- run_robust_model(
+  formula_str = "is_reject ~ emotion * offer_ratio + (emotion * offer_ratio | participant_id)",
+  data = df_ratio, 
+  family_type = "binomial", 
+  fixed_terms = ~ emotion * offer_ratio
+)
+generate_report(m_ratio_rej, "Ratio_Rejection_Rate", c("emotion", "offer_ratio"), df_ratio)
+
+# --- 2. Response Time ---
+cat("\n>>> Running: Offer Ratio - Response Time <<<\n")
+m_ratio_rt <- run_robust_model(
+  formula_str = "logRT ~ emotion * offer_ratio + (emotion * offer_ratio | participant_id)",
+  data = df_ratio, 
+  family_type = "gaussian", 
+  fixed_terms = ~ emotion * offer_ratio
+)
+generate_report(m_ratio_rt, "Ratio_Response_Time", c("emotion", "offer_ratio"), df_ratio)
+
+
+```
+
+# 7. Analysis III: Unfair Rejection RT
+
+``` {r analysis-unfair}
+df_unfair <- df_clean %>% 
+  filter(offer_type == "Unfair", is_reject == 1) %>% 
+  droplevels()
+
+if(nrow(df_unfair) > 50) {
+  contrasts(df_unfair$emotion) <- contr.sum
+  
+  cat("\n>>> Running: Unfair Rejection RT <<<\n")
+  m_unfair <- run_robust_model(
+    formula_str = "logRT ~ emotion + (1 + emotion | participant_id)",
+    data = df_unfair,
+    family_type = "gaussian",
+    fixed_terms = ~ emotion
+  )
+  generate_report(m_unfair, "Unfair_Rejection_RT", c("emotion"), df_unfair)
+} else {
+  cat("Skipped Unfair Analysis (Insufficient Data)\n")
+}
+
+
+```
+
+# 8. Session Info
+
+``` {r session}
+sessionInfo()
+
+
+```
+

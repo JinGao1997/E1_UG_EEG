@@ -1,0 +1,426 @@
+---
+title: "ERP Statistical Analysis: Method Regression (No Baseline Correction)"
+subtitle: "Method: Mixed Models with Baseline Covariate & SVO Moderation"
+author: "Project Research Team"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+    theme: flatly
+    fig_width: 10
+    fig_height: 6
+---
+
+``` {r setup, include=FALSE}
+# ==============================================================================
+# 1. Global Configuration
+# ==============================================================================
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+options(scipen = 999, digits = 4)
+
+# [CRITICAL] Sum-to-zero contrasts for valid ANOVA main effects
+options(contrasts = c("contr.sum", "contr.poly"))
+
+if(!require("pacman")) install.packages("pacman")
+pacman::p_load(
+  here, readr, readxl, dplyr, tidyr, stringr,  # Data Wrangling
+  lme4, lmerTest, car, performance,            # Modeling
+  buildmer,                                    # Random Structure
+  emmeans, effectsize,                         # Stats
+  sjPlot, sjmisc,                              # Viz
+  ggplot2, ggpubr, gridExtra,                  # Custom Viz
+  DHARMa, openxlsx                             # Diagnostics
+)
+
+# Output Directory
+out_root <- here("results", "Analysis_Regression_Method")
+if(!dir.exists(out_root)) dir.create(out_root, recursive = TRUE)
+
+```
+
+``` {r config-aesthetics}
+# ==============================================================================
+# 2. Visual Style
+# ==============================================================================
+theme_set(theme_bw(base_size = 14))
+
+# Emotion Palette
+colors_emo <- c('neu'="#8491B4",'aff'="#91D1C2",'dis'="#E64B35",'dom'="#F39B7F",'enj'="#3C5488")
+labels_emo <- c('neu'='Neutral','aff'='Affiliative','dis'='Disgust','dom'='Dominance','enj'='Reward')
+
+# Offer Palette
+colors_off <- c('fair'="#2E86AB",'unfair'="#A23B72")
+labels_off <- c('fair'='Fair', 'unfair'='Unfair')
+
+# Helper for P-values
+format_p <- function(p) {
+  if(is.na(p)) return("")
+  if(p < 0.001) return("< .001")
+  sprintf("= %.3f", p)
+}
+
+```
+
+# 3. Data Preparation Pipeline
+
+``` {r prep-func}
+# ==============================================================================
+# Function: load_and_prep
+# Purpose:  Load Raw Data (No Baseline Correction), Center Baseline Covariate
+# ==============================================================================
+load_and_prep <- function(path_erp, path_cov, erp_name, baseline_col) {
+  
+  # --- 1. Load ERP Data ---
+  if(!file.exists(path_erp)) stop(sprintf("File not found: %s", path_erp))
+  df <- read_csv(path_erp, show_col_types = FALSE)
+  
+  # --- 2. Standardize IDs ---
+  fix_id <- function(ids) {
+    ids <- as.character(ids)
+    ifelse(grepl("^\\d+$", ids), sprintf("Vp%04d", as.numeric(ids)), ids)
+  }
+  df$participant_id <- fix_id(df$participant_id)
+  
+  # --- 3. Artifact Rejection ---
+  if(erp_name %in% names(df)) {
+    orig_n <- nrow(df)
+    df <- df %>% filter(abs(!!sym(erp_name)) < 150)
+    if(orig_n > nrow(df)) cat(sprintf("   [QC] %s: Dropped %d trials > 150µV.\n", erp_name, orig_n - nrow(df)))
+  } else {
+    stop(sprintf("Target column '%s' not found.", erp_name))
+  }
+  
+  # --- 4. Baseline Correction (Centering) ---
+  # For Regression Method: We keep the raw ERP but use Baseline as a centered covariate.
+  if(!is.null(baseline_col) && baseline_col %in% names(df)) {
+    df$Baseline_Raw <- df[[baseline_col]]
+    # Grand Mean Centering is critical for interpretation of main effects
+    df$Baseline_c <- as.numeric(scale(df$Baseline_Raw, center = TRUE, scale = FALSE))
+  } else {
+    # If no baseline provided (e.g. initial CPP load), set to 0 temporarily
+    df$Baseline_c <- 0 
+  }
+  
+  # --- 5. Merge Covariates ---
+  if(file.exists(path_cov)) {
+    if(grepl("\\.csv$", path_cov)) covs <- read_csv(path_cov, show_col_types = FALSE) else covs <- read_excel(path_cov)
+    covs$participant_id <- fix_id(covs$participant_id)
+    
+    if("Rating_1" %in% names(covs)) covs <- rename(covs, Check_Belief = Rating_1)
+    
+    target_cols <- c("participant_id", "SVO_angle", "SVO_type", "Check_Belief", 
+                     "Antagonism", "Detachment", "Disinhibition", "Negative_Affectivity", "Psychoticism")
+    
+    df <- left_join(df, covs %>% select(any_of(target_cols)), by = "participant_id")
+    
+    # [Exclusion]
+    if("Check_Belief" %in% names(df)) {
+       n_start <- n_distinct(df$participant_id)
+       df <- df %>% filter(Check_Belief > 0 | is.na(Check_Belief))
+       if(n_distinct(df$participant_id) < n_start) cat("   [Exclusion] Removed participants with Belief=0.\n")
+    }
+    
+    # [Standardization]
+    if("SVO_angle" %in% names(df)) df$SVO_Z <- as.numeric(scale(df$SVO_angle))
+    if("Antagonism" %in% names(df)) df$Antagonism_Z <- as.numeric(scale(df$Antagonism))
+  }
+  
+  # --- 6. Factors ---
+  df <- df %>% 
+    mutate(offer_type = case_when(
+      Offers_Other %in% c(5,6) ~ "fair", 
+      Offers_Other %in% c(8,9) ~ "unfair"
+    )) %>% 
+    filter(!is.na(offer_type)) %>%
+    mutate(
+      offer_type = factor(offer_type, levels = c("fair", "unfair")),
+      emotion = factor(emotion, levels = c("neu", "aff", "dis", "dom", "enj"))
+    )
+    
+  return(df)
+}
+
+```
+
+# 4. Rigorous Analysis Engine (Regression Method)
+
+``` {r analyze-func}
+# ==============================================================================
+# Function: run_regression_analysis
+# ==============================================================================
+run_regression_analysis <- function(data, erp_name, out_dir) {
+  
+  sub_dir <- file.path(out_dir, erp_name)
+  if(!dir.exists(sub_dir)) dir.create(sub_dir)
+  
+  cat(sprintf("\n>>> Analyzing %s (Subjects: %d)\n", erp_name, n_distinct(data$participant_id)))
+  
+  # --- Phase 1: Optimize Random Structure ---
+  cat("   [Phase 1] Optimizing Random Structure (buildmer)...\n")
+  
+  # Fixed effects include Baseline_c for Regression Method
+  f_fixed <- paste0(erp_name, " ~ emotion * offer_type * Baseline_c")
+  f_buildmer <- as.formula(paste(f_fixed, "+ (1 + emotion * offer_type | participant_id)"))
+  
+  bm_res <- buildmer::buildmer(f_buildmer, data = data,
+             buildmerControl = buildmerControl(
+               include = ~ emotion * offer_type * Baseline_c, # Keep fixed effects
+               direction = c("order", "backward"),
+               crit = "LRT", quiet = TRUE,
+               args = list(control = lmerControl(optimizer = "bobyqa", optCtrl = list(maxfun=100000)))
+             ))
+  final_rand_struct <- paste("(", vapply(findbars(formula(bm_res@model)), deparse, ""), ")", collapse = " + ")
+  cat("   >> Optimized Random Structure:", final_rand_struct, "\n")
+  
+  # --- Phase 2: Model Comparison ---
+  cat("   [Phase 2] Comparing Models...\n")
+  models <- list()
+  
+  # M1: Standard Regression (Emotion * Offer + Baseline)
+  # Note: Often we just add Baseline additively, or interactively.
+  # Let's use the most common regression approach: Additive Baseline or Interactive?
+  # Alday (2019) suggests allowing interaction. Let's compare.
+  
+  # M1: Additive Baseline
+  f1 <- as.formula(paste0(erp_name, " ~ emotion * offer_type + Baseline_c + ", final_rand_struct))
+  models[["M1_AddBase"]] <- lmer(f1, data, REML=FALSE, control=lmerControl(optimizer="bobyqa"))
+  
+  # M2: Interactive Baseline (Full Alday 2019 style)
+  f2 <- as.formula(paste0(erp_name, " ~ emotion * offer_type * Baseline_c + ", final_rand_struct))
+  models[["M2_IntBase"]] <- lmer(f2, data, REML=FALSE, control=lmerControl(optimizer="bobyqa"))
+  
+  # M3: SVO Moderation (on top of best baseline model)
+  # We'll assume Additive Baseline is the base for SVO to keep it simple, 
+  # or we can check which wins first. For simplicity, let's test SVO with Additive.
+  if("SVO_Z" %in% names(data)) {
+    f3 <- as.formula(paste0(erp_name, " ~ emotion * offer_type * SVO_Z + Baseline_c + ", final_rand_struct))
+    models[["M3_SVO"]] <- lmer(f3, data, REML=FALSE, control=lmerControl(optimizer="bobyqa"))
+  }
+  
+  comp_df <- data.frame(Model=names(models), AIC=NA, BIC=NA)
+  for(n in names(models)) {
+    comp_df[comp_df$Model==n, "AIC"] <- AIC(models[[n]])
+    comp_df[comp_df$Model==n, "BIC"] <- BIC(models[[n]])
+  }
+  comp_df <- comp_df[order(comp_df$AIC), ]
+  write.csv(comp_df, file.path(sub_dir, "Model_Comparison.csv"))
+  best_name <- comp_df$Model[1]
+  cat("   >> WINNER:", best_name, "\n")
+  
+  # --- Phase 3: Robust ANOVA ---
+  cat("   [Phase 3] Refitting Winner (REML) & ANOVA...\n")
+  FINAL_MODEL <- update(models[[best_name]], REML=TRUE)
+  
+  tryCatch({
+    anova_res <- car::Anova(FINAL_MODEL, type = 3)
+    # Robust Eta Squared
+    eff_res <- tryCatch({
+      effectsize::eta_squared(anova_res, partial = TRUE)$Eta2_partial
+    }, error = function(e) return(rep(NA, nrow(anova_res))))
+    
+    if(length(eff_res) == nrow(anova_res)) anova_res$part_eta_sq <- eff_res else anova_res$part_eta_sq <- NA
+    
+    write.csv(anova_res, file.path(sub_dir, "ANOVA_Winner.csv"))
+    print(anova_res)
+    
+    # --- Phase 3.5: Smart Post-hoc ---
+    cat("   [Phase 3.5] Smart Post-hoc Tests...\n")
+    p_int  <- anova_res["emotion:offer_type", "Pr(>Chisq)"]
+    p_emo  <- anova_res["emotion", "Pr(>Chisq)"]
+    p_off  <- anova_res["offer_type", "Pr(>Chisq)"]
+    
+    # Define reference grid (holding Baseline at mean = 0)
+    # This effectively removes the baseline variance for plotting/testing
+    rg <- ref_grid(FINAL_MODEL, at = list(Baseline_c = 0))
+    
+    # A. Interaction Significant
+    if(!is.na(p_int) && p_int < 0.05) {
+      cat("      -> Interaction Significant. Running FULL Simple Effects.\n")
+      
+      # 1. Compare Offers within each Emotion
+      emm1 <- emmeans(rg, ~ offer_type | emotion)
+      write.csv(as.data.frame(test(pairs(emm1), adjust="bonferroni")), 
+                file.path(sub_dir, "PostHoc_Compare_Offers_(by_Emo).csv"))
+      
+      # 2. Compare Emotions within each Offer
+      emm2 <- emmeans(rg, ~ emotion | offer_type)
+      write.csv(as.data.frame(test(pairs(emm2), adjust="bonferroni")), 
+                file.path(sub_dir, "PostHoc_Compare_Emotions_(by_Offer).csv"))
+      
+    } else {
+      # B. Interaction NS
+      cat("      -> Interaction NS. Checking Main Effects & Exploratory Trends.\n")
+      if(!is.na(p_emo) && p_emo < 0.05) {
+         write.csv(as.data.frame(test(pairs(emmeans(rg, ~ emotion)), adjust="bonferroni")), 
+                   file.path(sub_dir, "PostHoc_Main_Emotion.csv"))
+      }
+      if(!is.na(p_off) && p_off < 0.05) {
+         write.csv(as.data.frame(test(pairs(emmeans(rg, ~ offer_type)), adjust="bonferroni")), 
+                   file.path(sub_dir, "PostHoc_Main_Offer.csv"))
+      }
+      
+      # [EXPLORATORY]
+      emm1_exp <- emmeans(rg, ~ offer_type | emotion)
+      write.csv(as.data.frame(test(pairs(emm1_exp), adjust="none")), 
+                file.path(sub_dir, "Exploratory_Compare_Offers_(Uncorrected).csv"))
+      
+      emm2_exp <- emmeans(rg, ~ emotion | offer_type)
+      write.csv(as.data.frame(test(pairs(emm2_exp), adjust="none")), 
+                file.path(sub_dir, "Exploratory_Compare_Emotions_(Uncorrected).csv"))
+    }
+    
+    # C. SVO Slopes
+    if(grepl("SVO", best_name)) {
+       write.csv(as.data.frame(test(emtrends(FINAL_MODEL, ~ emotion * offer_type, var="SVO_Z"))), file.path(sub_dir, "PostHoc_SVO_Slopes.csv"))
+    }
+
+  }, error = function(e) cat("   [Error] Stats Failed:", e$message, "\n"))
+  
+  # --- Phase 4: Visualization ---
+  cat("   [Phase 4] Visualization...\n")
+  tryCatch({
+    get_ci <- function(em) { d <- as.data.frame(em); d$ymin <- d$emmean - 1.96*d$SE; d$ymax <- d$emmean + 1.96*d$SE; return(d) }
+    
+    # IMPORTANT: Plotting at Baseline_c = 0 (Mean Baseline)
+    
+    if(grepl("SVO", best_name)) {
+       # Plot SVO Moderation
+       at_list <- list(SVO_Z = c(-1, 1), Baseline_c = 0)
+       em_svo <- emmeans(FINAL_MODEL, ~ offer_type | emotion * SVO_Z, at = at_list)
+       pd <- get_ci(em_svo)
+       pd$SVO_Group <- factor(pd$SVO_Z, labels=c("Low SVO (-1SD)", "High SVO (+1SD)"))
+       p_final <- ggplot(pd, aes(x = emotion, y = emmean, color = offer_type, group = offer_type)) +
+         facet_wrap(~SVO_Group) +
+         geom_line(linewidth=1.2) + geom_point(size=3.5, shape=21, fill="white", stroke=2) +
+         geom_errorbar(aes(ymin=ymin, ymax=ymax), width=0.2) +
+         scale_color_manual(values = colors_off, labels = labels_off) +
+         scale_x_discrete(labels = labels_emo) +
+         labs(title = paste(erp_name, "Moderation by SVO"), subtitle="Adjusted for Single-Trial Baseline", y = "Predicted Amplitude (µV)", x=NULL) +
+         theme(legend.position = "top")
+       ggsave(file.path(sub_dir, "Plot_SVO_Moderation.png"), p_final, width = 10, height = 6)
+    } else {
+       # Plot Main Interaction
+       em_main <- emmeans(FINAL_MODEL, ~ offer_type | emotion, at = list(Baseline_c = 0))
+       pd <- get_ci(em_main)
+       p_final <- ggplot(pd, aes(x = emotion, y = emmean, color = offer_type, group = offer_type)) +
+         geom_line(linewidth=1.2) + geom_point(size=3.5, shape=21, fill="white", stroke=2) +
+         geom_errorbar(aes(ymin=ymin, ymax=ymax), width=0.2) +
+         scale_color_manual(values = colors_off, labels = labels_off) +
+         scale_x_discrete(labels = labels_emo) +
+         labs(title = paste(erp_name, "Interaction Effect"), subtitle="Adjusted for Single-Trial Baseline", y = "Predicted Amplitude (µV)", x=NULL) +
+         theme(legend.position = "top")
+       ggsave(file.path(sub_dir, "Plot_Main_Interaction.png"), p_final, width = 8, height = 6)
+    }
+    
+    # Plot Baseline Effect (Unique to Regression Method)
+    # Shows how single-trial baseline predicts post-stimulus ERP
+    try({
+      em_bl <- emtrends(FINAL_MODEL, ~1, var="Baseline_c")
+      bl_slope <- as.data.frame(em_bl)[1, "Baseline_c.trend"]
+      p_bl <- ggplot(data, aes(x=Baseline_c, y=get(erp_name))) +
+        geom_smooth(method="lm", color="black") +
+        labs(title=paste("Baseline Correction Check:", erp_name), 
+             subtitle=paste("Slope =", round(bl_slope, 3), "(Ideally ~ 1)"),
+             x="Centered Pre-stimulus Baseline", y="Post-stimulus Amplitude")
+      ggsave(file.path(sub_dir, "Plot_Baseline_Slope.png"), p_bl, width = 6, height = 6)
+    })
+    
+  }, error = function(e) cat("   [Warn] Plotting failed:", e$message, "\n"))
+  
+  # --- Phase 5: Diagnostics & Export ---
+  suppressWarnings({
+    dh <- DHARMa::simulateResiduals(FINAL_MODEL, n = 1000)
+    png(file.path(sub_dir, "DHARMa_Diagnostics.png"), width=800, height=500)
+    plot(dh); dev.off()
+  })
+  
+  wb <- createWorkbook()
+  addWorksheet(wb, "Model_Comparison"); writeData(wb, "Model_Comparison", comp_df)
+  if(exists("anova_res")) { addWorksheet(wb, "ANOVA_Winner"); writeData(wb, "ANOVA_Winner", as.data.frame(anova_res), rowNames=TRUE) }
+  saveWorkbook(wb, file.path(out_dir, paste0(erp_name, "_Full_Report.xlsx")), overwrite = TRUE)
+  
+  cat("   >>> Analysis Finished.\n")
+}
+
+```
+
+# 5. Execution Routine
+
+``` {r execute}
+# ==============================================================================
+# 5. Execution Routine (Method: Regression)
+# ==============================================================================
+path_pipeline <- here("data", "02_Pipeline_Output")
+path_stim <- file.path(path_pipeline, "Method_Regression", "Stimulus_Locked", "trials.csv")
+path_resp <- file.path(path_pipeline, "Method_Regression", "Response_Locked", "trials.csv")
+path_cov  <- file.path(path_pipeline, "Covariates", "SVO_PID5BF_PostRating.xlsx")
+
+if(!file.exists(path_cov)) warning("Covariates missing. SVO analysis will be skipped.")
+if(!file.exists(path_stim)) stop("Stimulus file not found.")
+
+# --- FRN ---
+cat("\n--- Processing FRN ---\n")
+if(file.exists(path_stim)) {
+  # Baseline column: 'Baseline_FRN'
+  df_frn <- load_and_prep(path_stim, path_cov, "FRN", "Baseline_FRN") 
+  run_regression_analysis(df_frn, "FRN", out_root)
+}
+
+# --- N400 ---
+cat("\n--- Processing N400 ---\n")
+if(file.exists(path_stim)) {
+  # Baseline column: 'Baseline_N400'
+  df_n400 <- load_and_prep(path_stim, path_cov, "N400", "Baseline_N400")
+  run_regression_analysis(df_n400, "N400", out_root)
+}
+
+# --- LPP ---
+cat("\n--- Processing LPP ---\n")
+if(file.exists(path_stim)) {
+  # Baseline column: 'Baseline_LPP_offer'
+  df_lpp <- load_and_prep(path_stim, path_cov, "LPP_offer", "Baseline_LPP_offer")
+  run_regression_analysis(df_lpp, "LPP_offer", out_root)
+}
+
+# --- CPP (Response) ---
+# CRITICAL: MERGING BASELINE from STIMULUS (LPP Baseline)
+if(file.exists(path_resp) && file.exists(path_stim)) {
+  cat("\n--- Processing CPP (Merging Baseline from Stimulus Data) ---\n")
+  
+  # A. Load CPP (Raw)
+  df_cpp <- load_and_prep(path_resp, path_cov, "CPP", NULL)
+  
+  # B. Load Baseline (from Stimulus file)
+  df_stim <- read_csv(path_stim, show_col_types = FALSE)
+  
+  # C. Match & Merge
+  join_keys <- intersect(names(df_cpp), names(df_stim))
+  join_keys <- join_keys[join_keys %in% c("participant_id", "epoch_index", "trial_nr")]
+  
+  if(length(join_keys) > 1) {
+     cat(sprintf("   [Merge] Joining by: %s\n", paste(join_keys, collapse=", ")))
+     df_merged <- left_join(df_cpp, df_stim %>% select(all_of(join_keys), Baseline_LPP_offer), by = join_keys)
+  } else {
+     cat("   [Merge] No epoch index found. Assuming 1-to-1 row correspondence.\n")
+     if(nrow(df_cpp) == nrow(df_stim)) {
+        df_merged <- df_cpp
+        df_merged$Baseline_LPP_offer <- df_stim$Baseline_LPP_offer
+     } else {
+        stop("Row mismatch! Cannot merge Baseline for CPP.")
+     }
+  }
+  
+  # D. Prepare for Analysis (Set Baseline variable manually)
+  df_merged$Baseline_c <- as.numeric(scale(df_merged$Baseline_LPP_offer, center=TRUE, scale=FALSE))
+  
+  # E. Run
+  run_regression_analysis(df_merged, "CPP", out_root)
+}
+
+cat("\n========================================\n")
+cat("   All Regression Analyses Completed.\n")
+cat("========================================\n")
+
+```

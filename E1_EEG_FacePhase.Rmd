@@ -1,0 +1,321 @@
+---
+title: "Master Preprocessing Pipeline: E1 UG EEG (Face Phase)"
+subtitle: "Face-locked P1, N170, EPN, LPP_face & ROI-Specific Baselines"
+author: "Project Maintainer"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    code_folding: show
+    theme: flatly
+---
+``` {r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+# ==============================================================================
+# 1. Environment and Global Configuration
+# ==============================================================================
+
+if(!require("pacman")) install.packages("pacman")
+if(!require("here")) install.packages("here")
+pacman::p_load(tidyverse, reticulate, readr, stringr, here, fs)
+
+# -----------------------------------------------------------
+# Baseline configuration (following hu-neuro-pipeline docs)
+# -----------------------------------------------------------
+# use_baseline_correction:
+#   TRUE  = apply baseline correction during preprocessing
+#   FALSE = no baseline correction (baseline may be used later as covariate)
+use_baseline_correction <- TRUE
+
+# use_full_prestim_baseline:
+#   TRUE  = use full pre-stimulus interval as baseline (c(NULL, 0.0))
+#   FALSE = use conventional -200 to 0 ms baseline (c(-0.2, 0.0))
+use_full_prestim_baseline <- FALSE
+
+baseline_arg <- NULL
+if (use_baseline_correction) {
+  if (use_full_prestim_baseline) {
+    # Full pre-stimulus interval as baseline
+    baseline_arg <- c(NULL, 0.0)
+  } else {
+    # Conventional -200 to 0 ms baseline (default in hu-neuro-pipeline)
+    baseline_arg <- c(-0.2, 0.0)
+  }
+} else {
+  # No baseline correction at preprocessing stage
+  baseline_arg <- NULL
+}
+
+# -----------------------------------------------------------
+# Phase control
+# -----------------------------------------------------------
+# Face phase includes: P1, N170, EPN, and LPP_face
+run_face_phase <- TRUE
+
+# -----------------------------------------------------------
+# Path definitions (relative paths via here() for portability)
+# -----------------------------------------------------------
+
+# 1. Input paths
+path_py_pipeline_src <- here("python_modules", "hu-neuro-pipeline")
+path_raw_eeg         <- here("data", "raw_all_cropped")
+path_raw_log         <- here("data", "csv_all")
+
+# 2. Intermediate log-processing paths
+path_csv_filtered    <- here("data", "csv_filtered")
+path_csv_summary     <- here("data", "csv_summaryPostRating")
+
+# 3. Pipeline output root (heavy data such as epochs)
+path_output_root     <- here("data", "pipeline_output")
+
+# 4. Target paths for statistical analysis (face phase and baseline)
+path_dest_face            <- here("data", "face_phase")                 # Face-locked ERP output
+path_dest_baseline_face   <- here("data", "baseline", "LPP_face")       # Baseline for face-phase LPP
+
+# Automatic directory creation
+dirs_to_create <- c(
+  path_csv_filtered, path_csv_summary, path_output_root,
+  path_dest_face, path_dest_baseline_face
+)
+purrr::walk(dirs_to_create, ~dir.create(., showWarnings = FALSE, recursive = TRUE))
+```
+
+# 2. Python Environment Initialization and Pipeline Patch
+
+``` {r python-init}
+use_condaenv("r-reticulate", required = TRUE)
+
+# Pass pipeline path from R to Python
+py_pipeline_path <- path_py_pipeline_src
+
+# Load Python pipeline and patch event extraction for S-format triggers
+py_run_string("
+import sys
+import os
+import re
+
+# Clear any previously loaded pipeline modules to avoid conflicts
+pipeline_modules = [key for key in list(sys.modules.keys()) if 'pipeline' in key]
+for module in pipeline_modules:
+    del sys.modules[module]
+print(f'Cleared {len(pipeline_modules)} pipeline modules')
+
+# Add local pipeline path
+local_path = r.py_pipeline_path
+if os.path.exists(local_path):
+    if local_path in sys.path:
+        sys.path.remove(local_path)
+    sys.path.insert(0, local_path)
+    print(f'Pipeline path added: {local_path}')
+else:
+    print(f'Error: Path not found {local_path}')
+
+# Import pipeline
+import pipeline
+print(f'Pipeline loaded from: {pipeline.__file__}')
+
+# Monkey patch: fixed event extraction for S-format triggers
+from pipeline import epoching
+
+def get_events_fixed(raw, triggers):
+    '''Fixed version to handle S-format event markers (e.g., S101).'''
+    from mne import events_from_annotations
+    
+    events, event_id = events_from_annotations(raw)
+    
+    # Extract numeric part from event labels
+    def extract_number(key):
+        match = re.search(r'\\d+', str(key))
+        return int(match.group()) if match else None
+    
+    # Filter events according to the provided trigger list
+    filtered_event_id = {}
+    for key, value in event_id.items():
+        trigger_num = extract_number(key)
+        if trigger_num and trigger_num in triggers:
+            filtered_event_id[key] = value
+    
+    return events, filtered_event_id
+
+# Apply the patch
+epoching.get_events = get_events_fixed
+print('Applied event extraction fix for S-format triggers')
+")
+
+pipeline_mod <- import("pipeline")
+```
+
+# 3. Log Preprocessing (Trial-Level and Summary Extraction)
+
+``` {r log-preprocessing}
+orig_logs <- list.files(path_raw_log, pattern = "\\.txt$", full.names = TRUE)
+
+cat("Processing", length(orig_logs), "log files...\n")
+
+for (fpath in orig_logs) {
+  # 1) Detect file encoding (UTF-16LE vs UTF-8)
+  fb  <- file(fpath, "rb")
+  bom <- readBin(fb, "raw", n = 2)
+  close(fb)
+  encoding <- if (length(bom) == 2 && identical(bom, as.raw(c(0xFF, 0xFE)))) "UTF-16LE" else "UTF-8"
+
+  # 2) Read data
+  df <- read_delim(
+    fpath,
+    delim = "\t",
+    col_types = cols(),
+    show_col_types = FALSE,
+    locale = locale(encoding = encoding)
+  )
+
+  n <- nrow(df)
+
+  # 3) Extract trial-level data (remove last 3 lines and Block 7)
+  df_trials <- df %>% 
+    slice(1:(n-3)) %>% 
+    filter(block != 7) %>% 
+    mutate(emotion = str_extract(stim, "enj|dis|dom|neu|aff"))
+
+  # 4) Extract summary / post-rating data (last 3 lines)
+  df_summary <- df %>% slice((n-2):n)
+
+  # 5) Save outputs
+  out_name <- paste0(tools::file_path_sans_ext(basename(fpath)), ".csv")
+  out_name_summary <- paste0(tools::file_path_sans_ext(basename(fpath)), "_summaryPostRating.csv")
+  
+  write_csv(df_trials, file.path(path_csv_filtered, out_name))
+  write_csv(df_summary, file.path(path_csv_summary, out_name_summary))
+}
+cat("Log preprocessing complete.\n")
+```
+
+# 4. Condition Definitions for Face Phase
+
+``` {r define-conditions}
+# ------------------------------------------------------------------------------
+# Condition definitions for face-locked analyses
+#  - Five facial expressions (enj, dis, dom, neu, aff)
+#  - Valid trials: reaction > 0
+#    (no RT restriction is applied here, in accordance with the original script)
+# ------------------------------------------------------------------------------
+
+face_average_by <- list(
+  Face_enj = "emotion=='enj' & reaction>0",
+  Face_dis = "emotion=='dis' & reaction>0",
+  Face_dom = "emotion=='dom' & reaction>0",
+  Face_neu = "emotion=='neu' & reaction>0",
+  Face_aff = "emotion=='aff' & reaction>0"
+)
+
+# Helper function: copy trials.csv from a source directory to a destination
+copy_trials_csv <- function(src_dir, dest_dir, filename = "trials.csv") {
+  src <- file.path(src_dir, "trials.csv")
+  if (file.exists(src)) {
+    file_copy(src, file.path(dest_dir, filename), overwrite = TRUE)
+    cat(sprintf(">> Exported to: %s/%s\n", basename(dest_dir), filename))
+  } else {
+    warning(sprintf("Source file not found: %s", src))
+  }
+}
+```
+
+# 5. ERP Component Extraction (Face Phase, With/Without Baseline Correction)
+
+This section extracts face-locked ERP components: P1, N170, EPN, and LPP_face.
+The `baseline` argument is controlled by `baseline_arg` defined in the setup section.
+
+``` {r face-phase}
+if (run_face_phase) {
+
+  out_face <- file.path(path_output_root, "face_phase")
+  dir.create(out_face, showWarnings = FALSE, recursive = TRUE)
+
+  cat("\n--- Running Face Phase Extraction ---\n")
+
+  res_face <- pipeline_mod$group_pipeline(
+    raw_files     = path_raw_eeg,
+    log_files     = path_csv_filtered,
+    output_dir    = out_face,
+    epochs_dir    = file.path(out_face, "epochs"),
+    ica_method    = "fastica",
+    ica_n_components = 0.99,
+    triggers      = c(101:115, 201:215),
+    bad_channels  = "auto",
+    highpass_freq = 0.05,
+    lowpass_freq  = 30.0,
+    reject_peak_to_peak = 200.0,
+    baseline      = baseline_arg,
+    components    = list(
+      name = list("P1","N170","EPN","LPP_face"),
+      tmin = list(0.080,0.130,0.200,0.500),  
+      tmax = list(0.130,0.200,0.350,0.800),  
+      roi  = list(
+        c("O1","O2","Oz","PO7","PO8"),                               # P1 ROI
+        c("TP9","TP10","P7","P8","PO9","PO10","O1","O2"),            # N170 ROI
+        c("PO7","PO8","PO9","PO10","TP9","TP10"),                    # EPN ROI
+        c("Pz","Cz","C1","C2","CP1","CP2")                           # LPP_face ROI
+      )
+    ),
+    average_by = face_average_by
+  )
+
+  # Archive for statistical analysis
+  copy_trials_csv(out_face, path_dest_face)
+}
+```
+
+# 6. ROI-Specific Baseline Extraction (Face Phase LPP)
+
+This section extracts an ROI-specific baseline measure (–200 to 0 ms) for the face-phase LPP component.
+Baseline extraction is only performed when no baseline correction has been applied during preprocessing (`use_baseline_correction == FALSE`).
+
+``` {r baseline-face-phase}
+if (!use_baseline_correction && run_face_phase) {
+
+  out_bl_face <- file.path(path_output_root, "baseline_Face")
+  dir.create(out_bl_face, showWarnings = FALSE, recursive = TRUE)
+
+  cat("\n--- Extracting Baseline for Face Phase (LPP ROI) ---\n")
+
+  pipeline_mod$group_pipeline(
+    raw_files     = path_raw_eeg,
+    log_files     = path_csv_filtered,
+    output_dir    = out_bl_face,
+    epochs_dir    = file.path(out_bl_face, "epochs"),
+    ica_method    = "fastica",
+    ica_n_components = 0.99,
+    triggers      = c(101:115, 201:215),  # Face phase triggers
+    bad_channels  = "auto",
+    highpass_freq = 0.05,
+    lowpass_freq  = 30.0,
+    baseline      = NULL,   # No correction; direct averaging of -200–0 ms
+    reject_peak_to_peak = 200.0,
+    components    = list(
+      name = list("LPPfacebaseline"),
+      tmin = list(-0.2),
+      tmax = list(0),
+      roi  = list(c("Pz","Cz","C1","C2","CP1","CP2"))  # Same ROI as LPP_face
+    ),
+    average_by = face_average_by
+  )
+
+  copy_trials_csv(out_bl_face, path_dest_baseline_face)
+}
+```
+
+# 7. Summary of Generated Files
+
+``` {r summary}
+cat("\n========================================\n")
+cat("         PREPROCESSING COMPLETE         \n")
+cat("========================================\n")
+cat("Generated Data Files (Face Phase):\n")
+cat("1. Face Phase (P1/N170/EPN/LPP): ", file.path(path_dest_face, "trials.csv"), "\n")
+
+cat("\nBaseline Files (ROI-Specific, if extracted):\n")
+cat("2. Face LPP Baseline:          ", file.path(path_dest_baseline_face, "trials.csv"), "\n")
+cat("========================================\n")
+```

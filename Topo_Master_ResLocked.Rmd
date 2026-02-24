@@ -1,0 +1,233 @@
+---
+title: "Master Topographic Report: Response-Locked (CPP)"
+subtitle: "Regression-Corrected Topographies (Exp 1)"
+author: "Project Maintainer"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_depth: 3
+    theme: flatly
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+```
+
+# 1. Configuration
+
+```{r init}
+# ==============================================================================
+# CONFIGURATION
+# ==============================================================================
+
+# [SELECT EXPERIMENT] "E1" or "E2"
+# Set this to distinguish between Results_CPP_E1 and Results_CPP_E2
+experiment_id <- "E1" 
+
+# [PROJECT ROOT] Parent of "Results_CPP_E1"
+# Ensure this matches your local path
+root_dir <- "C:/Code/UG_ERP_Project/results/EEG"
+
+# ==============================================================================
+if(!require("pacman")) install.packages("pacman")
+pacman::p_load(tidyverse, stringr, fs, gridExtra, scales, here)
+
+if (!require("eegUtils")) {
+  stop("❌ Package 'eegUtils' not found. Please install via devtools.")
+}
+
+# Component Spec
+comp_specs <- list(
+  name = "CPP",
+  # Dynamic folder name will be created in loop
+  win_ms = c(-300, 50), # Relative to Response
+  roi = c("Pz", "Cz", "C1", "C2", "CP1", "CP2"), 
+  limits_raw = c(-5.0, 5.0),      
+  limits_diff = c(-3.0, 3.0)      
+)
+
+emotion_list <- c("aff", "dis", "dom", "enj")
+offer_types  <- c("fair", "unfair")
+
+cat(sprintf("🚀 Analysis: CPP | Experiment: %s\n📂 Root: %s\n", experiment_id, root_dir))
+
+```
+
+# 2. Helpers
+
+```{r helpers}
+compute_limits <- function(values, symmetric = TRUE) {
+  if (all(is.na(values))) return(c(-1, 1))
+  max_val <- max(abs(values), na.rm = TRUE)
+  max_val <- ceiling(max_val * 10) / 10
+  return(if(symmetric) c(-max_val, max_val) else range(values, na.rm=TRUE))
+}
+
+plot_topo_unified <- function(dat_long, chan_locs, roi, main, sub, cap, file, lims, cont=TRUE) {
+  
+  if(!"electrode" %in% names(dat_long)) return(NULL)
+  
+  p <- topoplot(dat_long, chan_locs=chan_locs, interp_limit="head", contour=cont,
+                points=TRUE, highlights=roi, palette="RdBu", limits=lims) +
+       labs(title=main, subtitle=sub, caption=cap) +
+       theme(plot.title=element_text(face="bold"))
+  
+  ggsave(file, plot=p, device="tiff", width=6, height=6, dpi=300, compression="lzw")
+  return(p)
+}
+
+```
+
+# 3. Main Pipeline (Regression Only)
+
+```{r main}
+# Construct dynamic folder path based on ID
+# Example: "Results_CPP_E1"
+folder_name <- paste0("Results_", comp_specs$name, "_", experiment_id)
+comp_results_dir <- file.path(root_dir, folder_name)
+
+if (!dir_exists(comp_results_dir)) {
+  stop(sprintf("❌ Critical: Folder %s not found. Check 'experiment_id' and 'root_dir'.", comp_results_dir))
+}
+
+# Find latest session
+sessions <- dir_ls(comp_results_dir, glob = "*Session_*", type = "directory")
+if (length(sessions) == 0) stop("No sessions found.")
+current_session <- sort(sessions, decreasing = TRUE)[1]
+cat(sprintf("📍 Session: %s\n", basename(current_session)))
+
+# Load Data
+chan_file <- file.path(current_session, "Regression_Results", "channel_locations.csv")
+data_file <- file.path(current_session, "Regression_Results", "topomap_data_for_R", paste0(comp_specs$name, "_topomap_data.csv"))
+
+if (!file.exists(chan_file) || !file.exists(data_file)) stop("❌ Data files missing.")
+
+chanlocs <- read_csv(chan_file, show_col_types = FALSE) %>% rename(electrode = channel)
+topo_data <- read_csv(data_file, show_col_types = FALSE)
+
+# ==============================================================================
+# CALCULATE DIFFERENCES & MAIN EFFECTS (Corrected Logic)
+# ==============================================================================
+cat("🧮 Calculating Differences & Main Effects...\n")
+
+# 1. Conditional Differences (Emotion - Neutral within Offer)
+for(o in offer_types) {
+  neu_col <- paste0("raw_neu_", o)
+  for(e in emotion_list) {
+    tgt <- paste0("raw_", e, "_", o)
+    if(neu_col %in% names(topo_data) & tgt %in% names(topo_data)) 
+      topo_data[[paste0("conditional_diff_", e, "_vs_neu_", o)]] <- topo_data[[tgt]] - topo_data[[neu_col]]
+  }
+  
+  # 2. Offer Main Effect (Average across all emotions for this offer type)
+  cols <- paste0("raw_", c("neu", emotion_list), "_", o)
+  valid <- cols[cols %in% names(topo_data)]
+  if(length(valid)>0) topo_data[[paste0("offer_main_", o)]] <- rowMeans(topo_data[, valid], na.rm=TRUE)
+}
+
+# 3. Emotion Main Effect (Average across offer types for this emotion)
+for(e in c("neu", emotion_list)) {
+  cols <- paste0("raw_", e, "_", offer_types)
+  valid <- cols[cols %in% names(topo_data)]
+  if(length(valid)>0) topo_data[[paste0("emotion_main_", e)]] <- rowMeans(topo_data[, valid], na.rm=TRUE)
+  
+  # Emotion Main Diff (vs Neutral)
+  if(e != "neu" && paste0("emotion_main_", e) %in% names(topo_data) && "emotion_main_neu" %in% names(topo_data)) {
+     topo_data[[paste0("emotion_diff_main_", e, "_vs_neu")]] <- topo_data[[paste0("emotion_main_", e)]] - topo_data[["emotion_main_neu"]]
+  }
+}
+
+# 4. Offer Main Diff (Unfair - Fair)
+if("offer_main_unfair" %in% names(topo_data) && "offer_main_fair" %in% names(topo_data)) 
+  topo_data[["offer_diff_main_unfair_vs_fair"]] <- topo_data[["offer_main_unfair"]] - topo_data[["offer_main_fair"]]
+
+# Prepare for plotting
+topo_long <- topo_data %>% rename(electrode = channel)
+
+# Output Setup
+out_base <- file.path(current_session, "Regression_Results", "topoplots_R")
+dir_map <- c("raw", "diff", "offer_diff", "emotion_main", "emotion_diff")
+walk(file.path(out_base, dir_map), dir_create)
+
+# Limits
+lims_raw  <- if(!is.null(comp_specs$limits_raw)) comp_specs$limits_raw else compute_limits(unlist(topo_long[, grep("^raw_", names(topo_long))]))
+lims_diff <- if(!is.null(comp_specs$limits_diff)) comp_specs$limits_diff else compute_limits(unlist(topo_long[, grep("^conditional_diff_", names(topo_long))]))
+
+cat("📊 Generating Plots...\n")
+
+# [A] Raw
+for (ofr in offer_types) {
+  for (emo in c("neu", emotion_list)) {
+    col <- paste0("raw_", emo, "_", ofr)
+    if (col %in% names(topo_long)) {
+      plot_topo_unified(
+        select(topo_long, electrode, amplitude = all_of(col)),
+        chanlocs, comp_specs$roi,
+        "CPP Regression-Corrected", paste(ofr, emo, sep=" | "), "-300 to 50ms",
+        file.path(out_base, "raw", paste0("CPP_", ofr, "_", emo, ".tiff")),
+        lims_raw
+      )
+    }
+  }
+}
+
+# [B] Conditional Diff
+for (ofr in offer_types) {
+  for (emo in emotion_list) {
+    col <- paste0("conditional_diff_", emo, "_vs_neu_", ofr)
+    if (col %in% names(topo_long)) {
+      plot_topo_unified(
+        select(topo_long, electrode, amplitude = all_of(col)),
+        chanlocs, comp_specs$roi,
+        "CPP Difference", paste(ofr, paste0(emo, "-neu"), sep=" | "), "Diff Wave",
+        file.path(out_base, "diff", paste0("CPP_diff_", ofr, "_", emo, "_vs_neu.tiff")),
+        lims_diff, cont=FALSE
+      )
+    }
+  }
+}
+
+# [C] Offer Main Diff
+if ("offer_diff_main_unfair_vs_fair" %in% names(topo_long)) {
+  plot_topo_unified(
+    select(topo_long, electrode, amplitude = offer_diff_main_unfair_vs_fair),
+    chanlocs, comp_specs$roi,
+    "CPP Main Effect", "Unfair - Fair", "Main Diff",
+    file.path(out_base, "offer_diff", "CPP_diff_unfair_vs_fair.tiff"),
+    lims_diff, cont=FALSE
+  )
+}
+
+# [D] Emotion Main Effect (Added for completeness)
+for (e in c("neu", emotion_list)) {
+  col <- paste0("emotion_main_", e)
+  if (col %in% names(topo_long)) {
+     plot_topo_unified(
+      select(topo_long, electrode, amplitude = all_of(col)), chanlocs, comp_specs$roi,
+      "CPP Main Effect", paste0("Emotion: ", e), "Avg across Offers",
+      file.path(out_base, "emotion_main", paste0("CPP_main_emotion_", e, ".tiff")),
+      lims_raw
+    )
+  }
+}
+
+# [E] Emotion Main Diff (Added for completeness)
+for (e in emotion_list) {
+  col <- paste0("emotion_diff_main_", e, "_vs_neu")
+  if (col %in% names(topo_long)) {
+     plot_topo_unified(
+      select(topo_long, electrode, amplitude = all_of(col)), chanlocs, comp_specs$roi,
+      "CPP Main Effect Diff", paste0(e, " - Neu"), "Diff Wave",
+      file.path(out_base, "emotion_diff", paste0("CPP_main_diff_", e, "_vs_neu.tiff")),
+      lims_diff, cont=FALSE
+    )
+  }
+}
+
+cat(sprintf("✅ Done. Outputs: %s\n", out_base))
+
+```
+

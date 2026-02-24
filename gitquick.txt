@@ -1,0 +1,64 @@
+**Git Sync Quick Reference** for daily use.
+
+### **Git Sync Quick Reference**
+
+**1. Check Remote (Optional)**
+Verify the remote storage name (usually `origin`) and URL.
+
+```bash
+git remote -v
+
+```
+
+**2. Check Status**
+View modified files (red) vs. staged files (green).
+
+```bash
+git status
+
+```
+
+**3. Stage Changes**
+Prepare files for the commit.
+
+* **Add all changes:**
+```bash
+git add .
+
+```
+
+
+* **Add specific file:**
+```bash
+git add analysis/preprocessing.Rmd
+
+```
+
+
+
+**4. Commit Changes**
+Save the snapshot with a descriptive message (English recommended).
+
+```bash
+git commit -m "Refine pipeline: Fix R-Python baseline arg and comments"
+
+```
+
+**5. Push to GitHub**
+Upload commits to the remote repository.
+
+* `origin` = Remote storage name
+* `main` = Branch name
+
+```bash
+git push origin main
+
+```
+
+---
+
+### **Key Vocabulary**
+
+* **Remote (`origin`):** The alias for your GitHub URL.
+* **Branch (`main`):** The primary line of development (sometimes called `master`).
+* **PAT (Personal Access Token):** Use this if prompted for a password.

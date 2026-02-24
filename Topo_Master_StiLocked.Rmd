@@ -1,0 +1,550 @@
+---
+title: "Master Topographic Report: Stimulus-Locked Components"
+subtitle: "Visualization of Regression-Corrected & Standard Topographies with Exploratory Slicing"
+author: "Project Maintainer"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    code_folding: show
+    theme: flatly
+---
+
+``` {r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+
+```
+
+# 1. Configuration & Setup
+
+```{r init}
+# ==============================================================================
+# 1.1 GLOBAL DIRECTORY & PIPELINE CONFIGURATION
+# ==============================================================================
+
+# [EXPERIMENT ID] Matches upstream Python pre-processing output nomenclature.
+experiment_id <- "E2" 
+
+# [PROJECT ROOT] Parent directory containing all component-specific subdirectories.
+root_dir <- "C:/Code/UG_ERP_Project/results/EEG" 
+
+# [TIME COURSE RESOLUTION] Temporal step size (in milliseconds) for topographic grids.
+time_course_step_ms <- 40 
+
+# ==============================================================================
+# 1.2 DEPENDENCY MANAGEMENT
+# ==============================================================================
+if(!require("pacman")) install.packages("pacman")
+pacman::p_load(tidyverse, stringr, fs, gridExtra, scales, here, cowplot, purrr)
+
+# eegUtils is mandatory for topographic interpolation and mapping.
+if (!require("eegUtils")) {
+  stop("Critical Package Missing: 'eegUtils'. Install via devtools::install_github('craddm/eegUtils')")
+}
+
+# ==============================================================================
+# 1.3 COMPONENT & SPATIOTEMPORAL DEFINITIONS
+# ==============================================================================
+component_specs <- list(
+  
+  # --- Confirmatory Components (A Priori Defined) ---
+  FRN = list(
+    win_ms = c(250, 300),            
+    roi = c("F3", "Fz", "F4", "FC1", "FC2", "Cz"),
+    source_comp = "FRN"
+  ),
+  LPP = list(
+    win_ms = c(500, 800),            
+    roi = c("Pz", "Cz", "C1", "C2", "CP1", "CP2"),
+    source_comp = "LPP"
+  ),
+  N400 = list(
+    win_ms = c(350, 450),            
+    roi = c("Fz", "Cz", "CPz", "Pz"),
+    source_comp = "N400"
+  ),
+  
+  # --- Exploratory / Methodological Test Components ---
+  testFRN = list(
+    win_ms = c(200, 250), 
+    roi = c("F3", "Fz", "F4", "FC1", "FC2", "Cz"),
+    source_comp = "FRN"
+  ),
+  testLPP = list(
+    win_ms = c(600, 900), 
+    roi = c("Pz", "Cz", "C1", "C2", "CP1", "CP2"),
+    source_comp = "LPP"
+  ),
+  testN400 = list(
+    win_ms = c(300, 500), 
+    roi = c("Fz", "Cz", "CPz", "Pz"),
+    source_comp = "N400"
+  ),
+  testN170 = list(
+    win_ms = c(150, 350), 
+    roi = c("P7", "P8", "PO7", "PO8"),
+    source_comp = "FRN" 
+  )
+)
+
+# Experimental condition nomenclature mapping
+emotion_list <- c("aff", "dis", "dom", "enj")
+offer_types  <- c("fair", "unfair")
+
+cat(sprintf("Pipeline Initialized.\nTarget Experiment: %s\nData Root: %s\n", experiment_id, root_dir))
+
+
+```
+
+# 2. Methodological Helper Functions
+
+```{r helpers}
+# ==============================================================================
+# Dynamic Scale Limit Computation
+# ==============================================================================
+compute_limits <- function(values, symmetric = TRUE) {
+  if (all(is.na(values))) return(c(-1, 1))
+  
+  if (symmetric) {
+    max_val <- max(abs(values), na.rm = TRUE)
+    if (is.infinite(max_val) || max_val == 0) return(c(-1, 1))
+    max_val <- ceiling(max_val * 5) / 5 
+    return(c(-max_val, max_val))
+  } else {
+    return(range(values, na.rm = TRUE))
+  }
+}
+
+# ==============================================================================
+# Unified Topographic Plotting Engine
+# ==============================================================================
+plot_topo_unified <- function(dat_long, chan_locs, roi, 
+                              main_title, sub_title, caption_text, 
+                              filename, limits, show_contour = TRUE) {
+  
+  if(!"electrode" %in% names(dat_long)) {
+    warning("Spatial mapping failed: 'electrode' identifier missing.")
+    return(NULL)
+  }
+
+  # Apply automatic text wrapping for safe rendering in single plots
+  safe_title <- str_wrap(main_title, width = 45)
+  safe_sub   <- str_wrap(sub_title, width = 45)
+
+  p <- topoplot(
+    dat_long, chan_locs = chan_locs, interp_limit = "head",
+    contour = show_contour, points = TRUE, highlights = roi,
+    palette = "RdBu", limits = limits
+  ) +
+    labs(title = safe_title, subtitle = safe_sub, caption = caption_text) +
+    theme(plot.title = element_text(size = 14, face = "bold", margin = margin(b=8)),
+          plot.subtitle = element_text(size = 12, margin = margin(b=5)),
+          plot.caption = element_text(size = 10, color = "grey40", margin = margin(t=10)),
+          plot.margin = margin(15, 15, 15, 15))
+  
+  ggsave(filename, plot = p, device = "png", width = 6.5, height = 6.5, dpi = 300)
+  
+  return(p)
+}
+
+
+```
+
+# 3. Component Processing & Visualization Engine
+
+```{r main_pipeline}
+for (comp_name in names(component_specs)) {
+  
+  spec <- component_specs[[comp_name]]
+  
+  target_source <- ifelse(!is.null(spec$source_comp), spec$source_comp, comp_name)
+  target_folder_name <- paste0("Results_", target_source, "_", experiment_id)
+  comp_results_dir   <- file.path(root_dir, target_folder_name)
+  
+  cat(paste0("\n", str_dup("#", 75), "\n"))
+  cat(sprintf("ANALYSIS TARGET: %s | PHYSICAL SOURCE: %s\n", comp_name, target_folder_name))
+  cat(paste0(str_dup("#", 75), "\n"))
+  
+  if (!dir_exists(comp_results_dir)) {
+    cat(sprintf("Directory unresolved: %s. \nEnsure upstream extraction is complete. Skipping.\n", comp_results_dir))
+    next
+  }
+  
+  sessions <- dir_ls(comp_results_dir, glob = "*Session_*", type = "directory")
+  if (length(sessions) == 0) { cat("Session index empty. Skipping.\n"); next }
+  current_session <- sort(sessions, decreasing = TRUE)[1]
+  cat(sprintf("Active Session Target: %s\n", basename(current_session)))
+  
+  chan_file <- file.path(current_session, "Regression_Results", "channel_locations.csv")
+  if (!file.exists(chan_file)) chan_file <- file.path(current_session, "Standard_Baseline", "channel_locations.csv")
+  
+  if (!file.exists(chan_file)) { cat("Spatial montage missing. Skipping.\n"); next }
+  chanlocs <- read_csv(chan_file, show_col_types = FALSE, lazy = FALSE) %>% rename(electrode = channel)
+  
+  methods_to_run <- c("Regression", "Standard")
+  
+  for (method in methods_to_run) {
+    
+    # [METHODOLOGICAL GUARD]
+    if (method == "Regression" && comp_name != target_source) {
+      cat(sprintf("\n  >>> Analytical Method: %s\n", method))
+      cat("    [GUARD INTERCEPT] Skipped. Regression data cannot be temporally resliced for exploratory targets.\n")
+      next
+    }
+    
+    cat(sprintf("\n  >>> Analytical Method: %s\n", method))
+    topo_data <- NULL; title_prefix <- ""
+    
+    # ==========================================================================
+    # 3.1 DATA INGESTION & TEMPORAL SLICING
+    # ==========================================================================
+    if (method == "Regression") {
+      f <- file.path(current_session, "Regression_Results", "topomap_data_for_R", paste0(target_source, "_topomap_data.csv"))
+      if (file.exists(f)) {
+        topo_data <- read_csv(f, show_col_types = FALSE, lazy = FALSE)
+        title_prefix <- "Regression-Corrected"
+      } else { cat("    File absent. Skipping.\n"); next }
+      
+    } else if (method == "Standard") {
+      f <- file.path(current_session, "Standard_Baseline", paste0(target_source, "_ave_labelled.csv"))
+      if (file.exists(f)) {
+        raw_df <- read_csv(f, show_col_types = FALSE, lazy = FALSE)
+        valid_chans <- intersect(names(raw_df), chanlocs$electrode)
+        
+        df_agg <- raw_df %>%
+          pivot_longer(all_of(valid_chans), names_to = "channel", values_to = "uV") %>%
+          filter(time >= spec$win_ms[1]/1000 & time <= spec$win_ms[2]/1000) %>%
+          group_by(channel, emotion, offer_type) %>%
+          summarise(mean_amp = mean(uV, na.rm=TRUE), .groups="drop")
+        
+        topo_data <- df_agg %>%
+          pivot_wider(names_from = c(emotion, offer_type), values_from = mean_amp, names_sep = "_") %>%
+          rename_with(~paste0("raw_", .), -channel)
+          
+        title_prefix <- "Baseline-Subtracted"
+      } else { cat("    File absent. Skipping.\n"); next }
+    }
+    
+    # ==========================================================================
+    # 3.2 FACTORIAL DIFFERENCE COMPUTATION
+    # ==========================================================================
+    if (!is.null(topo_data)) {
+      cat("    Computing factorial contrasts...\n")
+      
+      for(o in offer_types) {
+        neu_col <- paste0("raw_neu_", o)
+        for(e in emotion_list) {
+          tgt <- paste0("raw_", e, "_", o)
+          if(neu_col %in% names(topo_data) & tgt %in% names(topo_data)) 
+            topo_data[[paste0("conditional_diff_", e, "_vs_neu_", o)]] <- topo_data[[tgt]] - topo_data[[neu_col]]
+        }
+        
+        cols <- paste0("raw_", c("neu", emotion_list), "_", o)
+        valid <- cols[cols %in% names(topo_data)]
+        if(length(valid)>0) topo_data[[paste0("offer_main_", o)]] <- rowMeans(topo_data[, valid], na.rm=TRUE)
+      }
+      
+      for(e in c("neu", emotion_list)) {
+        cols <- paste0("raw_", e, "_", offer_types)
+        valid <- cols[cols %in% names(topo_data)]
+        if(length(valid)>0) topo_data[[paste0("emotion_main_", e)]] <- rowMeans(topo_data[, valid], na.rm=TRUE)
+        
+        if(e != "neu" && paste0("emotion_main_", e) %in% names(topo_data) && "emotion_main_neu" %in% names(topo_data)) {
+           topo_data[[paste0("emotion_diff_main_", e, "_vs_neu")]] <- topo_data[[paste0("emotion_main_", e)]] - topo_data[["emotion_main_neu"]]
+        }
+      }
+      
+      if("offer_main_unfair" %in% names(topo_data) && "offer_main_fair" %in% names(topo_data)) {
+        topo_data[["offer_diff_main_unfair_vs_fair"]] <- topo_data[["offer_main_unfair"]] - topo_data[["offer_main_fair"]]
+      }
+
+      for(e in c("neu", emotion_list)) {
+        unfair_col <- paste0("raw_", e, "_unfair")
+        fair_col   <- paste0("raw_", e, "_fair")
+        if(unfair_col %in% names(topo_data) && fair_col %in% names(topo_data)) {
+          topo_data[[paste0("offer_diff_conditional_", e, "_unfair_vs_fair")]] <- topo_data[[unfair_col]] - topo_data[[fair_col]]
+        }
+      }
+    }
+
+    # ==========================================================================
+    # 3.3 GLOBAL SCALING & DIRECTORY PROVISIONING
+    # ==========================================================================
+    subfolder <- ifelse(method == "Regression", "Regression_Results", "Standard_Baseline")
+    out_base <- file.path(current_session, subfolder, paste0("topoplots_R_", comp_name))
+    
+    dir_map_static <- c("raw", "diff", "emotion_main", "emotion_diff", "offer_main", "offer_diff", "offer_diff_conditional")
+    walk(file.path(out_base, dir_map_static), dir_create)
+    
+    if (method == "Standard") {
+      dir_map_tc <- c("raw_offer", "raw_emotion", "raw_cond", "diff_offer", "diff_emotion", "diff_cond")
+      walk(file.path(out_base, "time_course_grids", dir_map_tc), dir_create)
+    }
+    
+    topo_long <- topo_data %>% rename(electrode = channel)
+    
+    cat("    Deriving dynamic global scaling properties...\n")
+    
+    raw_cols <- grep("^raw_|^offer_main_|^emotion_main_", names(topo_long), value = TRUE)
+    raw_vals <- if(length(raw_cols) > 0) unlist(topo_long[, raw_cols]) else 0
+    diff_cols <- grep("diff_", names(topo_long), value = TRUE)
+    diff_vals <- if(length(diff_cols) > 0) unlist(topo_long[, diff_cols]) else 0
+    
+    if (method == "Standard" && exists("raw_df")) {
+        valid_chans_tc <- intersect(names(raw_df), chanlocs$electrode)
+        df_tc_scan <- raw_df %>%
+          filter(time >= spec$win_ms[1]/1000 & time <= spec$win_ms[2]/1000) %>%
+          pivot_longer(all_of(valid_chans_tc), names_to = "channel", values_to = "uV") %>%
+          group_by(time, channel, emotion, offer_type) %>%
+          summarise(uV = mean(uV, na.rm=TRUE), .groups="drop")
+          
+        raw_vals <- c(raw_vals, df_tc_scan$uV)
+        
+        diff_max_approx <- df_tc_scan %>%
+          group_by(time, channel) %>%
+          summarise(max_diff = max(uV) - min(uV), .groups="drop") %>%
+          pull(max_diff)
+        diff_vals <- c(diff_vals, diff_max_approx)
+    }
+    
+    lims_raw  <- compute_limits(raw_vals)
+    lims_diff <- compute_limits(diff_vals)
+    
+    cat(sprintf("       -> Amplitude bounds secured at: [%.1f, %.1f] µV\n", lims_raw[1], lims_raw[2]))
+    cat(sprintf("       -> Contrast bounds secured at: [%.1f, %.1f] µV\n", lims_diff[1], lims_diff[2]))
+
+    # ==========================================================================
+    # 3.4 STATIC TOPOGRAPHIC RENDERINGS
+    # ==========================================================================
+    for (ofr in offer_types) {
+      for (emo in c("neu", emotion_list)) {
+        col <- paste0("raw_", emo, "_", ofr)
+        if (col %in% names(topo_long)) {
+          plot_topo_unified(
+            dat_long = select(topo_long, electrode, amplitude = all_of(col)), chan_locs = chanlocs, roi = spec$roi,
+            main_title = paste(comp_name, title_prefix), sub_title = paste(str_to_title(ofr), str_to_title(emo), sep=" | "),
+            caption_text = paste0("Averaging Window: ", spec$win_ms[1], "-", spec$win_ms[2], " ms"),
+            filename = file.path(out_base, "raw", paste0(comp_name, "_", ofr, "_", emo, ".png")), limits = lims_raw
+          )
+        }
+      }
+    }
+    
+    for (ofr in offer_types) {
+      for (emo in emotion_list) {
+        col <- paste0("conditional_diff_", emo, "_vs_neu_", ofr)
+        if (col %in% names(topo_long)) {
+          plot_topo_unified(
+            dat_long = select(topo_long, electrode, amplitude = all_of(col)), chan_locs = chanlocs, roi = spec$roi,
+            main_title = paste(comp_name, title_prefix), sub_title = paste(str_to_title(ofr), paste0(str_to_title(emo), "-Neu"), sep=" | "),
+            caption_text = "Difference Waveform Morphology",
+            filename = file.path(out_base, "diff", paste0(comp_name, "_diff_", ofr, "_", emo, "_vs_neu.png")),
+            limits = lims_diff, show_contour = FALSE
+          )
+        }
+      }
+    }
+    
+    if ("offer_diff_main_unfair_vs_fair" %in% names(topo_long)) {
+       plot_topo_unified(
+          dat_long = select(topo_long, electrode, amplitude = offer_diff_main_unfair_vs_fair), chan_locs = chanlocs, roi = spec$roi,
+          main_title = paste(comp_name, title_prefix), sub_title = "Main Contrast: Unfair minus Fair", caption_text = "Main Effect Visualization",
+          filename = file.path(out_base, "offer_diff", paste0(comp_name, "_diff_unfair_vs_fair.png")),
+          limits = lims_diff, show_contour = FALSE
+       )
+    }
+
+    for (e in c("neu", emotion_list)) {
+      col <- paste0("emotion_main_", e)
+      if (col %in% names(topo_long)) {
+         plot_topo_unified(
+          dat_long = select(topo_long, electrode, amplitude = all_of(col)), chan_locs = chanlocs, roi = spec$roi,
+          main_title = paste(comp_name, title_prefix), sub_title = paste0("Main Effect Context: ", str_to_title(e)),
+          caption_text = paste0("Avg Window: ", spec$win_ms[1], "-", spec$win_ms[2], " ms"),
+          filename = file.path(out_base, "emotion_main", paste0(comp_name, "_main_emotion_", e, ".png")), limits = lims_raw
+        )
+      }
+    }
+
+    for (e in emotion_list) {
+      col <- paste0("emotion_diff_main_", e, "_vs_neu")
+      if (col %in% names(topo_long)) {
+         plot_topo_unified(
+          dat_long = select(topo_long, electrode, amplitude = all_of(col)), chan_locs = chanlocs, roi = spec$roi,
+          main_title = paste(comp_name, title_prefix), sub_title = paste0("Main Contrast: ", str_to_title(e), " minus Neu"), caption_text = "Main Effect Visualization",
+          filename = file.path(out_base, "emotion_diff", paste0(comp_name, "_main_diff_", e, "_vs_neu.png")),
+          limits = lims_diff, show_contour = FALSE
+        )
+      }
+    }
+    
+    for (e in c("neu", emotion_list)) {
+      col <- paste0("offer_diff_conditional_", e, "_unfair_vs_fair")
+      if (col %in% names(topo_long)) {
+         plot_topo_unified(
+          dat_long = select(topo_long, electrode, amplitude = all_of(col)), chan_locs = chanlocs, roi = spec$roi,
+          main_title = paste(comp_name, title_prefix), sub_title = paste0("Unfair - Fair | Structural Context: ", str_to_title(e)), caption_text = "Conditional Analysis",
+          filename = file.path(out_base, "offer_diff_conditional", paste0(comp_name, "_diff_unfair_vs_fair_in_", e, ".png")),
+          limits = lims_diff, show_contour = FALSE
+        )
+      }
+    }
+
+    # ==========================================================================
+    # 3.5 SPATIOTEMPORAL MATRIX GENERATION (TIME COURSE GRIDS)
+    # ==========================================================================
+    if (method == "Standard" && exists("raw_df")) {
+      cat("    Constructing high-density spatiotemporal matrix plots...\n")
+      
+      tc_out_dir <- file.path(out_base, "time_course_grids")
+      t_step <- time_course_step_ms
+      tmins  <- seq(spec$win_ms[1], spec$win_ms[2] - t_step, by = t_step)
+      
+      build_tc_row <- function(df_subset, row_label, limits, roi, palette="RdBu") {
+        plots <- purrr::map(tmins, function(tmin) {
+          tmax <- tmin + t_step
+          dat <- df_subset %>%
+             filter(time >= tmin/1000 & time < tmax/1000) %>%
+             group_by(channel) %>%
+             summarise(amplitude = mean(amplitude, na.rm=TRUE), .groups="drop") %>%
+             rename(electrode = channel)
+
+          topoplot(dat, chan_locs = chanlocs, interp_limit = "head", 
+                   contour = FALSE, limits = limits, palette = palette,
+                   highlights = roi) + 
+            ggtitle(paste0(tmin, "-", tmax, " ms")) +
+            theme(plot.title = element_text(size = 13, hjust = 0.5, face = "bold", margin = margin(b=10)), 
+                  legend.position = "none",
+                  plot.margin = margin(20, 15, 20, 15)) 
+        })
+        
+        label_gg <- cowplot::ggdraw() + 
+                    cowplot::draw_label(row_label, fontface = "bold", size = 16, angle = 90)
+        
+        row_grid <- cowplot::plot_grid(plotlist = plots, nrow = 1)
+        cowplot::plot_grid(label_gg, row_grid, ncol = 2, rel_widths = c(0.12, length(tmins)))
+      }
+
+      save_mega_tc <- function(row_plots, main_title, limits, file_name, palette="RdBu") {
+        
+        dummy_df <- data.frame(electrode = chanlocs$electrode[1:2], amplitude = limits)
+        bar_h <- min(length(row_plots) * 2.8, 12) 
+        
+        dummy_p <- topoplot(dummy_df, chan_locs = chanlocs, limits = limits, palette = palette) +
+           guides(fill = guide_colorbar(title = "Amplitude\n(µV)", title.position = "top", 
+                                        barheight = unit(bar_h, "cm"), barwidth = unit(0.8, "cm"))) +
+           theme(legend.position = "right", 
+                 legend.title = element_text(size=14, face="bold", margin=margin(b=15)),
+                 legend.text = element_text(size=12),
+                 legend.margin = margin(0, 20, 0, 20)) 
+        shared_legend <- cowplot::get_legend(dummy_p)
+
+        mega_stack <- cowplot::plot_grid(plotlist = row_plots, ncol = 1)
+        stack_w_leg <- cowplot::plot_grid(mega_stack, shared_legend, ncol = 2, rel_widths = c(length(tmins), 0.8))
+
+        # [LAYOUT FIX 1]: Force line wrapping for extremely long main titles
+        safe_main_title <- stringr::str_wrap(main_title, width = 60)
+        
+        # [LAYOUT FIX 2]: Render title with adjusted margins
+        title_gg <- cowplot::ggdraw() + 
+                    cowplot::draw_label(safe_main_title, fontface = "bold", size = 22, lineheight = 1.1) +
+                    theme(plot.margin = margin(25, 10, 20, 10))
+                    
+        # [LAYOUT FIX 3]: Use absolute proportional weights to prevent vertical squishing
+        final_plot <- cowplot::plot_grid(title_gg, stack_w_leg, ncol = 1, rel_heights = c(0.6, length(row_plots) * 2.5))
+
+        # [LAYOUT FIX 4]: Establish a HARD MINIMUM width for the canvas (12 inches)
+        calculated_width <- 2.0 + (length(tmins) * 2.8) + 2.5
+        dynamic_width <- max(12, calculated_width)
+        dynamic_height <- 1.5 + (length(row_plots) * 2.8)
+
+        ggsave(file.path(tc_out_dir, file_name), final_plot, 
+               width = dynamic_width, height = dynamic_height, dpi = 300, bg = "white", limitsize = FALSE)
+      }
+
+      valid_chans_tc <- intersect(names(raw_df), chanlocs$electrode)
+      df_tc_base <- raw_df %>%
+        pivot_longer(all_of(valid_chans_tc), names_to = "channel", values_to = "uV") %>%
+        group_by(time, channel, emotion, offer_type) %>%
+        summarise(uV = mean(uV, na.rm=TRUE), .groups="drop")
+
+      row_plots <- list()
+      for (ofr in offer_types) {
+        df_slice <- df_tc_base %>% filter(offer_type == ofr) %>%
+                    group_by(time, channel) %>% summarise(amplitude = mean(uV, na.rm=TRUE), .groups="drop")
+        row_plots[[length(row_plots)+1]] <- build_tc_row(df_slice, paste("Offer:", str_to_title(ofr)), lims_raw, spec$roi)
+      }
+      save_mega_tc(row_plots, paste(comp_name, "Evolution: Main Effects of Offer Context"), 
+                   lims_raw, file.path("raw_offer", paste0(comp_name, "_TC_Raw_Offer_Megaplot.png")))
+
+      row_plots <- list()
+      for (emo in c("neu", emotion_list)) {
+        df_slice <- df_tc_base %>% filter(emotion == emo) %>%
+                    group_by(time, channel) %>% summarise(amplitude = mean(uV, na.rm=TRUE), .groups="drop")
+        row_plots[[length(row_plots)+1]] <- build_tc_row(df_slice, paste("Emotion:", str_to_title(emo)), lims_raw, spec$roi)
+      }
+      save_mega_tc(row_plots, paste(comp_name, "Evolution: Main Effects of Emotional Salience"), 
+                   lims_raw, file.path("raw_emotion", paste0(comp_name, "_TC_Raw_Emotion_Megaplot.png")))
+
+      row_plots <- list()
+      for (emo in c("neu", emotion_list)) {
+        for (ofr in offer_types) {
+          df_slice <- df_tc_base %>% filter(offer_type == ofr, emotion == emo) %>% rename(amplitude = uV)
+          row_label <- paste0(str_to_title(emo), "\n(", str_to_title(ofr), ")")
+          row_plots[[length(row_plots)+1]] <- build_tc_row(df_slice, row_label, lims_raw, spec$roi)
+        }
+      }
+      save_mega_tc(row_plots, paste(comp_name, "Evolution: Offer Type per Emotional Context"), 
+                   lims_raw, file.path("raw_cond", paste0(comp_name, "_TC_Raw_Conditional_Megaplot.png")))
+
+      row_plots <- list()
+      df_slice <- df_tc_base %>%
+        group_by(time, channel, offer_type) %>%
+        summarise(uV = mean(uV, na.rm=TRUE), .groups="drop") %>%
+        pivot_wider(names_from = offer_type, values_from = uV) %>%
+        mutate(amplitude = unfair - fair)
+      row_plots[[length(row_plots)+1]] <- build_tc_row(df_slice, "Unfair - Fair\n(Aggregated)", lims_diff, spec$roi)
+      save_mega_tc(row_plots, paste(comp_name, "Spatiotemporal Contrast: Unfair minus Fair"), 
+                   lims_diff, file.path("diff_offer", paste0(comp_name, "_TC_Diff_Offer_Main_Megaplot.png")))
+
+      row_plots <- list()
+      for (emo in emotion_list) {
+        df_slice <- df_tc_base %>%
+          filter(emotion %in% c(emo, "neu")) %>%
+          group_by(time, channel, emotion) %>%
+          summarise(uV = mean(uV, na.rm=TRUE), .groups="drop") %>%
+          pivot_wider(names_from = emotion, values_from = uV) %>%
+          mutate(amplitude = !!sym(emo) - neu)
+        row_plots[[length(row_plots)+1]] <- build_tc_row(df_slice, paste0(str_to_title(emo), "\n- Neu"), lims_diff, spec$roi)
+      }
+      save_mega_tc(row_plots, paste(comp_name, "Spatiotemporal Contrast: Emotion minus Neutral"), 
+                   lims_diff, file.path("diff_emotion", paste0(comp_name, "_TC_Diff_Emotion_Main_Megaplot.png")))
+
+      row_plots <- list()
+      for (emo in c("neu", emotion_list)) {
+        df_slice <- df_tc_base %>%
+          filter(emotion == emo) %>%
+          group_by(time, channel, offer_type) %>%
+          summarise(uV = mean(uV, na.rm=TRUE), .groups="drop") %>%
+          pivot_wider(names_from = offer_type, values_from = uV) %>%
+          mutate(amplitude = unfair - fair)
+        row_plots[[length(row_plots)+1]] <- build_tc_row(df_slice, paste0("Unfair - Fair\n(", str_to_title(emo), ")"), lims_diff, spec$roi)
+      }
+      save_mega_tc(row_plots, paste(comp_name, "Spatiotemporal Contrast: Conditional Interactions"), 
+                   lims_diff, file.path("diff_cond", paste0(comp_name, "_TC_Diff_Conditional_Megaplot.png")))
+    }
+    
+    cat(sprintf("    Exportation complete. Assets localized at: %s\n", out_base))
+  }
+  
+  graphics.off()
+  closeAllConnections()
+  gc(verbose = FALSE)
+}
+
+
+```
+

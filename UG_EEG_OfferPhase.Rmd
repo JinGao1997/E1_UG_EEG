@@ -1,0 +1,552 @@
+---
+title: "Master Preprocessing Pipeline: E1 UG EEG"
+subtitle: "Optimized: Single-Pass Stimulus-Locked Extraction with Reports"
+author: "Project Maintainer"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    code_folding: show
+    theme: flatly
+---
+
+``` {r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+# ==============================================================================
+# 1. Environment and Global Configuration
+# ==============================================================================
+
+# Ensure required packages are installed and loaded
+if(!require("pacman")) install.packages("pacman")
+if(!require("here")) install.packages("here")
+pacman::p_load(tidyverse, reticulate, readr, stringr, here, fs)
+
+# -----------------------------------------------------------
+# Method Configuration
+# -----------------------------------------------------------
+# Defines the preprocessing strategy for statistical analysis.
+# TRUE  = Standard Method: Subtracts baseline mean from the epoch (traditional ERP).
+# FALSE = Regression Method: No baseline subtraction. Pre-stimulus baseline 
+#          activity is extracted as a covariate for LMMs (Recommended).
+use_baseline_correction <- TRUE  
+
+# -----------------------------------------------------------
+# Baseline Parameters (Stimulus-Locked Only)
+# -----------------------------------------------------------
+use_full_prestim_baseline <- FALSE
+
+# Construct the baseline argument for MNE-Python.
+# NOTE: 'reticulate' handling of R lists vs. vectors is critical here.
+# - R: list(NULL, 0) -> Python: [None, 0] -> MNE: (None, 0) [Correct]
+# - R: c(NULL, 0)    -> Python: 0.0        -> MNE: Error       [Incorrect]
+baseline_arg <- NULL
+
+if (use_baseline_correction) {
+  if (use_full_prestim_baseline) {
+    # Baseline: Start of epoch to 0ms
+    baseline_arg <- list(NULL, 0.0) 
+  } else {
+    # Baseline: -200ms to 0ms
+    baseline_arg <- c(-0.2, 0.0)    
+  }
+} else {
+  # Baseline: None (No correction applied)
+  baseline_arg <- NULL 
+}
+
+# -----------------------------------------------------------
+# Phase Control
+# -----------------------------------------------------------
+run_offer_phase <- TRUE
+
+# -----------------------------------------------------------
+# Path Definitions (Hierarchical & Dynamic)
+# -----------------------------------------------------------
+
+# A. Source Directories (Input)
+path_py_pipeline_src <- here("python_modules", "hu-neuro-pipeline")
+path_raw_eeg         <- here("data", "00_Raw_Input", "raw_all_cropped")
+path_raw_log         <- here("data", "00_Raw_Input", "csv_all")
+
+# B. Intermediate Processing Logs (Output)
+path_csv_filtered    <- here("data", "01_Preprocessing_Logs", "csv_filtered")
+path_csv_summary     <- here("data", "01_Preprocessing_Logs", "csv_summary")
+
+# C. Pipeline Output Root
+path_output_root     <- here("data", "02_Pipeline_Output")
+
+# D. Dynamic Directory Naming based on Method
+if (use_baseline_correction) {
+  path_suffix <- "Standard_Baseline"
+  method_folder <- "Method_Standard"
+} else {
+  path_suffix <- "No_Baseline"
+  method_folder <- "Method_Regression"
+}
+
+# Sub-directory names
+dir_stim_name  <- "Stimulus_Locked"    
+dir_cpp_name   <- "Response_Locked"
+
+# E. Destination Paths (Absolute)
+path_dest_stim       <- file.path(path_output_root, method_folder, dir_stim_name)
+path_dest_cpp        <- file.path(path_output_root, method_folder, dir_cpp_name)
+path_dest_covariates <- file.path(path_output_root, "Covariates")
+path_dest_baseline   <- file.path(path_output_root, "Baseline_Raw") 
+
+# Report Paths
+path_dest_report_stim <- file.path(path_dest_stim, "report")
+path_dest_report_cpp  <- file.path(path_dest_cpp, "report")
+
+# F. Directory Initialization
+dirs_to_create <- c(
+  path_csv_filtered, 
+  path_csv_summary, 
+  path_output_root,
+  path_dest_stim, 
+  path_dest_cpp, 
+  path_dest_covariates,
+  path_dest_baseline,
+  path_dest_report_stim,
+  path_dest_report_cpp
+)
+purrr::walk(dirs_to_create, ~dir.create(., showWarnings = FALSE, recursive = TRUE))
+
+
+
+```
+
+# 2. Python Environment Initialization
+
+``` {r Environment, include=FALSE}
+# Initialize the conda environment for reticulate
+use_condaenv("r-reticulate", required = TRUE)
+
+# Pass the local pipeline source path from R to Python
+py_pipeline_path <- path_py_pipeline_src
+
+py_run_string("
+import sys
+import os
+import importlib
+
+# Logic to handle pipeline module reloading for development/updates
+pipeline_modules = [key for key in list(sys.modules.keys()) if 'pipeline' in key]
+
+# Inject local pipeline source into sys.path
+local_path = r.py_pipeline_path
+if os.path.exists(local_path):
+    if local_path not in sys.path:
+        sys.path.insert(0, local_path)
+    print(f'Info: Using LOCAL pipeline source at: {local_path}')
+else:
+    print(f'Warning: Local path not found. Using system pipeline.')
+
+try:
+    import pipeline
+    importlib.reload(pipeline) # Force reload to ensure latest code is used
+    print(f'Info: Pipeline loaded from: {pipeline.__file__}')
+except ImportError as e:
+    print(f'Error: Could not import pipeline. Check path configuration. {e}')
+")
+
+# Import the pipeline module into R
+pipeline_mod <- import("pipeline")
+
+
+
+```
+
+# 3. Log Preprocessing (Trial-Level and Summary Extraction)
+
+``` {r log-preprocessing}
+orig_logs <- list.files(path_raw_log, pattern = "\\.txt$", full.names = TRUE)
+
+cat("Processing", length(orig_logs), "log files...\n")
+
+for (fpath in orig_logs) {
+  # 1) Detect file encoding (UTF-16LE vs UTF-8) using Byte Order Mark (BOM)
+  fb  <- file(fpath, "rb")
+  bom <- readBin(fb, "raw", n = 2)
+  close(fb)
+  encoding <- if (length(bom) == 2 && identical(bom, as.raw(c(0xFF, 0xFE)))) "UTF-16LE" else "UTF-8"
+
+  # 2) Read data with detected encoding
+  df <- read_delim(
+    fpath,
+    delim = "\t",
+    col_types = cols(),
+    show_col_types = FALSE,
+    locale = locale(encoding = encoding)
+  )
+
+  n <- nrow(df)
+
+  # 3) Extract trial-level data 
+  # Removes the last 3 lines (ratings) and Block 7 (practice/unused)
+  df_trials <- df %>% 
+    slice(1:(n-3)) %>% 
+    filter(block != 7) %>% 
+    mutate(emotion = str_extract(stim, "enj|dis|dom|neu|aff"))
+
+  # 4) Extract summary / post-rating data (last 3 lines)
+  df_summary <- df %>% slice((n-2):n)
+
+  # 5) Save outputs
+  out_name <- paste0(tools::file_path_sans_ext(basename(fpath)), ".csv")
+  out_name_summary <- paste0(tools::file_path_sans_ext(basename(fpath)), "_summaryPostRating.csv")
+    
+  # Save cleaned trial logs
+  write_csv(df_trials, file.path(path_csv_filtered, out_name))
+  # Save summary ratings
+  write_csv(df_summary, file.path(path_dest_covariates, out_name_summary))
+}
+cat("Log preprocessing complete.\n")
+
+
+
+```
+
+# 4. Condition Definitions (Shared Across Components)
+
+``` {r define-conditions}
+# Define selection criteria for averaging (Python/Pandas query syntax)
+# Used to stratify epochs by experimental conditions (Face Emotion * Offer Ratio)
+common_average_by <- list(
+    # 5:5 Conditions
+    Face_enj_5_5 = "emotion=='enj' & Offers_Other==5 & Offers_You==5 & reaction>0 & RT >= 150 & RT <= 3000",
+    Face_dis_5_5 = "emotion=='dis' & Offers_Other==5 & Offers_You==5 & reaction>0 & RT >= 150 & RT <= 3000",
+    Face_dom_5_5 = "emotion=='dom' & Offers_Other==5 & Offers_You==5 & reaction>0 & RT >= 150 & RT <= 3000",
+    Face_neu_5_5 = "emotion=='neu' & Offers_Other==5 & Offers_You==5 & reaction>0 & RT >= 150 & RT <= 3000",
+    Face_aff_5_5 = "emotion=='aff' & Offers_Other==5 & Offers_You==5 & reaction>0 & RT >= 150 & RT <= 3000",
+    
+    # 6:4 Conditions
+    Face_enj_6_4 = "emotion=='enj' & Offers_Other==6 & Offers_You==4 & reaction>0 & RT >= 150 & RT <= 3000",
+    Face_dis_6_4 = "emotion=='dis' & Offers_Other==6 & Offers_You==4 & reaction>0 & RT >= 150 & RT <= 3000",
+    Face_dom_6_4 = "emotion=='dom' & Offers_Other==6 & Offers_You==4 & reaction>0 & RT >= 150 & RT <= 3000",
+    Face_neu_6_4 = "emotion=='neu' & Offers_Other==6 & Offers_You==4 & reaction>0 & RT >= 150 & RT <= 3000",
+    Face_aff_6_4 = "emotion=='aff' & Offers_Other==6 & Offers_You==4 & reaction>0 & RT >= 150 & RT <= 3000",
+    
+    # 7:3 Conditions
+    Face_enj_7_3 = "emotion=='enj' & Offers_Other==7 & Offers_You==3 & reaction>0 & RT >= 150 & RT <= 3000",
+    Face_dis_7_3 = "emotion=='dis' & Offers_Other==7 & Offers_You==3 & reaction>0 & RT >= 150 & RT <= 3000",
+    Face_dom_7_3 = "emotion=='dom' & Offers_Other==7 & Offers_You==3 & reaction>0 & RT >= 150 & RT <= 3000",
+    Face_neu_7_3 = "emotion=='neu' & Offers_Other==7 & Offers_You==3 & reaction>0 & RT >= 150 & RT <= 3000",
+    Face_aff_7_3 = "emotion=='aff' & Offers_Other==7 & Offers_You==3 & reaction>0 & RT >= 150 & RT <= 3000",
+    
+    # 8:2 Conditions
+    Face_enj_8_2 = "emotion=='enj' & Offers_Other==8 & Offers_You==2 & reaction>0 & RT >= 150 & RT <= 3000",
+    Face_dis_8_2 = "emotion=='dis' & Offers_Other==8 & Offers_You==2 & reaction>0 & RT >= 150 & RT <= 3000",
+    Face_dom_8_2 = "emotion=='dom' & Offers_Other==8 & Offers_You==2 & reaction>0 & RT >= 150 & RT <= 3000",
+    Face_neu_8_2 = "emotion=='neu' & Offers_Other==8 & Offers_You==2 & reaction>0 & RT >= 150 & RT <= 3000",
+    Face_aff_8_2 = "emotion=='aff' & Offers_Other==8 & Offers_You==2 & reaction>0 & RT >= 150 & RT <= 3000",
+    
+    # 9:1 Conditions
+    Face_enj_9_1 = "emotion=='enj' & Offers_Other==9 & Offers_You==1 & reaction>0 & RT >= 150 & RT <= 3000",
+    Face_dis_9_1 = "emotion=='dis' & Offers_Other==9 & Offers_You==1 & reaction>0 & RT >= 150 & RT <= 3000",
+    Face_dom_9_1 = "emotion=='dom' & Offers_Other==9 & Offers_You==1 & reaction>0 & RT >= 150 & RT <= 3000",
+    Face_neu_9_1 = "emotion=='neu' & Offers_Other==9 & Offers_You==1 & reaction>0 & RT >= 150 & RT <= 3000",
+    Face_aff_9_1 = "emotion=='aff' & Offers_Other==9 & Offers_You==1 & reaction>0 & RT >= 150 & RT <= 3000"
+)
+
+# Helper function to archive key output files (e.g., trials.csv)
+copy_trials_csv <- function(src_dir, dest_dir, new_filename = "trials.csv") {
+  src_trials <- file.path(src_dir, "trials.csv")
+  if (file.exists(src_trials)) {
+    file.copy(src_trials, file.path(dest_dir, new_filename), overwrite = TRUE)
+    cat(sprintf(">> Archived: %s/%s\n", basename(dest_dir), new_filename))
+  } else {
+    warning(sprintf("Source file not found: %s", src_trials))
+  }
+}
+
+
+```
+
+# 5. ERP Component Extraction (Optimized Unified Architecture)
+
+## 5.1 Stimulus-Locked Phase (Unified: FRN, LPP, N400)
+
+Performs a **single-pass extraction** for all components time-locked to the Offer stimulus.
+
+``` {r stimulus-locked-phase}
+if (run_offer_phase) {
+
+  # A. Define Destination
+  out_stim <- path_dest_stim
+  if (!dir.exists(out_stim)) dir.create(out_stim, recursive = TRUE)
+
+  # --- FILE DETECTION (UPDATED) ---
+  # Explicitly find files to ensure compatibility with both .set and .vhdr
+  # Uses case-insensitive regex matching for file extensions.
+  stim_raw_files <- list.files(path_raw_eeg, pattern = "\\.(set|vhdr)$", full.names = TRUE, ignore.case = TRUE)
+  if (length(stim_raw_files) == 0) stop("CRITICAL: No EEG files (.set or .vhdr) found in ", path_raw_eeg)
+
+  cat(sprintf("\n=== Running Stimulus-Locked Extraction (Unified) ===\n"))
+  cat(sprintf("Method: %s\n", path_suffix))
+  cat(sprintf("Found %d raw files for processing.\n", length(stim_raw_files)))
+  cat(sprintf("Output Directory: %s\n", basename(out_stim)))
+
+  # B. Master Configuration Table
+  # Define standard Stimulus-Locked components
+  erp_config <- tibble::tribble(
+    ~comp_name,    ~t_min, ~t_max, ~roi_channels,
+    "FRN",         0.250,  0.300,  c("F3","Fz","F4","FC1","FC2","Cz"),
+    "LPP_offer",   0.500,  0.800,  c("Pz","Cz","C1","C2","CP1","CP2"),
+    "N400",        0.350,  0.450,  c("Fz","Cz","CPz","Pz")
+  )
+  
+  # C. Conditional Baseline Extraction (Regression Method)
+  # If baseline correction is disabled (use_baseline_correction = FALSE), 
+  # we calculate the mean voltage of the pre-stimulus period (-200ms to 0ms)
+  # to use as a statistical covariate (e.g., 'Baseline_FRN').
+  if (!use_baseline_correction) {
+    cat("   [Config] Adding matched baseline components (-200ms to 0ms) for covariate extraction...\n")
+    baseline_config <- erp_config %>%
+      mutate(
+        comp_name = paste0("Baseline_", comp_name),
+        t_min = -0.200,
+        t_max = 0.000,
+        roi_channels = roi_channels 
+      )
+    final_config <- bind_rows(erp_config, baseline_config)
+  } else {
+    final_config <- erp_config
+  }
+
+  # D. Prepare Python Arguments
+  # Converts R list structure to Python-compatible dictionary of lists
+  components_arg <- list(
+    name = as.list(final_config$comp_name),
+    tmin = as.list(final_config$t_min),
+    tmax = as.list(final_config$t_max),
+    roi  = final_config$roi_channels
+  )
+
+  # E. Execute Pipeline (One Pass)
+  # Changed raw_files argument to use the explicit file list (stim_raw_files)
+  # ensuring that only supported formats detected by list.files() are passed.
+  res_stim <- pipeline_mod$group_pipeline(
+    raw_files        = stim_raw_files,   
+    log_files        = path_csv_filtered,
+    output_dir       = out_stim,     
+    epochs_dir       = file.path(out_stim, "epochs"), 
+    
+    #report_dir       = path_dest_report_stim,
+    
+    ica_method       = "fastica",
+    ica_n_components = 0.99,         # Explicitly set to avoid warnings
+    triggers         = c(10:89, 150:169),
+    bad_channels     = "auto",
+    highpass_freq    = 0.05,         # Critical for non-baselined data to remove DC offset
+    lowpass_freq     = 30.0,
+    reject_peak_to_peak = 200.0,
+    
+    baseline         = baseline_arg, # Passes (None, 0) or None based on config
+    
+    components       = components_arg, 
+    average_by       = common_average_by
+  )
+  
+  # F. Archive Baseline Values (If applicable)
+  if (!use_baseline_correction) {
+      out_bl_archive <- file.path(path_dest_baseline, "Stimulus_Locked_Values")
+      if(!dir.exists(out_bl_archive)) dir.create(out_bl_archive, recursive=TRUE)
+      copy_trials_csv(out_stim, out_bl_archive, "baseline_values.csv")
+  }
+  
+}
+
+
+```
+
+## 5.2 Response-Locked Phase (CPP)
+
+This section extracts the Central Parietal Positivity (CPP).
+
+**Methodological Note:** Under the **Regression Method**, CPP extraction does **not** perform baseline correction (`baseline = NULL`). The statistical model should instead control for the trial-specific baseline using the `Baseline_LPP` variable extracted in the Stimulus-Locked phase.
+
+``` {r response-locked-phase}
+## 5.2 Response-Locked Phase (CPP)
+
+# This section extracts the Central Parietal Positivity (CPP).
+#
+# Methodological Note: 
+# 1. Alignment Fix (Mismatch Error): 
+#    We explicitly detect available Raw EEG files and only process/pass 
+#    the corresponding Log files.
+# 2. Robust Matching (ID-based): 
+#    Handles inconsistent naming (e.g., EEG "VP0001.vhdr" <--> Log "1.csv").
+#    Extracts numeric IDs to ensure correct pairing.
+# 3. Type Safety Fix:
+#    Explicitly converts file paths to lists to prevent Python from interpreting
+#    a single file path as a directory (AssertionError).
+# 4. File Format Compatibility:
+#    Updated to support both BrainVision (.vhdr) and EEGLAB (.set) formats.
+
+if (run_offer_phase) {
+
+  out_cpp <- path_dest_cpp
+  if (!dir.exists(out_cpp)) dir.create(out_cpp, recursive = TRUE)
+  
+  # --- STEP 1: Detect Available Files (Diagnostics) ---
+  # CHANGED: Regex pattern accepts both .vhdr AND .set (case insensitive)
+  raw_files_found <- list.files(path_raw_eeg, 
+                                pattern = "\\.(set|vhdr)$", 
+                                full.names = TRUE, 
+                                ignore.case = TRUE)
+                                
+  log_files_found <- list.files(path_csv_filtered, pattern = "\\.csv$", full.names = TRUE)
+  
+  if (length(raw_files_found) == 0) stop("CRITICAL: No EEG files (.set or .vhdr) found in ", path_raw_eeg)
+  if (length(log_files_found) == 0) stop("CRITICAL: No .csv files found in ", path_csv_filtered)
+  
+  cat(sprintf("\n=== Preparing Aligned Logs for CPP Analysis ===\n"))
+  cat(sprintf("Found %d raw EEG files and %d preprocessed log files.\n", 
+              length(raw_files_found), length(log_files_found)))
+
+  # --- STEP 2: Create Aligned Logs (Numeric ID Matching) ---
+  path_csv_cpp_aligned <- file.path(path_output_root, "01_Preprocessing_Logs", "csv_cpp_aligned")
+  if (!dir.exists(path_csv_cpp_aligned)) dir.create(path_csv_cpp_aligned, recursive = TRUE)
+  
+  final_raw_list <- c()
+  final_log_list <- c()
+  
+  # Pre-calculate Log IDs to speed up lookup
+  log_ids <- as.integer(str_extract(basename(log_files_found), "\\d+"))
+  
+  for (raw_path in raw_files_found) {
+    # 1. Extract EEG ID
+    raw_fname <- basename(raw_path)
+    eeg_id <- as.integer(str_extract(raw_fname, "\\d+"))
+    
+    # 2. Find Matching Log File
+    if (is.na(eeg_id)) {
+      warning(sprintf("Skipping %s: Could not extract numeric ID from filename.", raw_fname))
+      next
+    }
+    
+    match_idx <- which(log_ids == eeg_id)
+    
+    if (length(match_idx) == 1) {
+      # Perfect Match
+      src_log <- log_files_found[match_idx]
+      
+      # Process: Read -> Filter Misses -> Save
+      df_temp <- read_csv(src_log, show_col_types = FALSE)
+      df_cpp <- df_temp %>% filter(reaction > 0)
+      
+      # Destination
+      dest_fname <- paste0(tools::file_path_sans_ext(raw_fname), ".csv")
+      dest_log   <- file.path(path_csv_cpp_aligned, dest_fname)
+      write_csv(df_cpp, dest_log)
+      
+      # Add to Lists
+      final_raw_list <- c(final_raw_list, raw_path)
+      final_log_list <- c(final_log_list, dest_log)
+      
+      cat(sprintf("  [MATCH] EEG: %s (ID=%d) <--> Log: %s\n", raw_fname, eeg_id, basename(src_log)))
+      
+    } else if (length(match_idx) > 1) {
+      warning(sprintf("Ambiguous match for EEG %s (ID=%d). Found multiple logs.", raw_fname, eeg_id))
+    } else {
+      cat(sprintf("  [SKIP]  No log found for EEG: %s (ID=%d)\n", raw_fname, eeg_id))
+    }
+  }
+
+  if (length(final_raw_list) == 0) {
+    stop("No valid Raw-Log pairs found. Check [SKIP] messages above.")
+  }
+
+  cat(sprintf("\n=== Running Response-Locked Extraction (CPP) ===\n"))
+  cat(sprintf("Processing %d matched subjects...\n", length(final_raw_list)))
+  cat(sprintf("Output Directory: %s\n", basename(out_cpp)))
+
+  # --- STEP 3: Configuration ---
+  roi_cpp <- c("Pz","Cz","C1","C2","CP1","CP2")
+  
+  cpp_components <- list(
+    name = list("CPP"),
+    tmin = list(-0.30),
+    tmax = list(0.05),
+    roi  = list(roi_cpp)
+  )
+  
+  # === CRITICAL FIX: Ensure Lists are Explicitly Lists ===
+  # When length is 1, R vectors might pass as strings to Python. 
+  # We force them to be lists using I() or explicitly creating list structure.
+  
+  # Convert vector of strings to R list (which reticulate converts to Python list)
+  py_raw_files <- as.list(final_raw_list)
+  py_log_files <- as.list(final_log_list)
+
+  # --- STEP 4: Execute Pipeline ---
+  res_cpp <- pipeline_mod$group_pipeline(
+    raw_files        = py_raw_files,  # Explicit list passed
+    log_files        = py_log_files,  # Explicit list passed
+    
+    output_dir       = out_cpp,
+    epochs_dir       = file.path(out_cpp, "epochs"), 
+    
+    #report_dir       = path_dest_report_cpp, 
+    
+    ica_method       = "fastica",
+    ica_n_components = 0.99,
+    
+    triggers         = c(1, 2), 
+    
+    epochs_on_missing = 'ignore',        
+    bad_channels     = "auto",
+    highpass_freq    = 0.05,
+    lowpass_freq     = 30.0,
+    
+    epochs_tmin      = -0.9,             
+    epochs_tmax      = 0.5,
+    
+    baseline         = NULL, 
+    
+    reject_peak_to_peak = 200.0,
+    components       = cpp_components,
+    average_by       = common_average_by
+  )
+
+  # Archive results
+  copy_trials_csv(out_cpp, path_dest_cpp)
+}
+
+```
+
+# 6. Summary of Generated Files
+
+``` {r summary}
+cat("\n========================================\n")
+cat("          PREPROCESSING COMPLETE          \n")
+cat("========================================\n")
+cat("Method Strategy: ", path_suffix, "\n")
+cat("Output Root:     ", path_output_root, "\n\n")
+
+cat("Generated Files:\n")
+cat("1. Stimulus-Locked (FRN, N400, LPP): \n")
+cat("   -> Data:     ", file.path(path_dest_stim, "trials.csv"), "\n")
+cat("   -> Epochs:   ", file.path(path_dest_stim, "epochs", "sub-XX_epo.fif"), "\n")
+cat("   -> Reports: ", file.path(path_dest_report_stim), "\n")
+
+cat("2. Response-Locked (CPP): \n")
+cat("   -> Data:     ", file.path(path_dest_cpp, "trials.csv"), "\n")
+cat("   -> Reports: ", file.path(path_dest_report_cpp), "\n")
+
+if (!use_baseline_correction) {
+  cat("\n[INFO] Regression Method Active:\n")
+  cat("       - Waveforms are NOT baseline corrected.\n")
+  cat("       - Baseline values (-200ms to 0ms) are saved in Stimulus-Locked 'trials.csv'.\n")
+  cat("       - ACTION REQUIRED: Include these baseline columns as covariates in your statistical models.\n")
+}
+
+cat("3. Covariates (Behavioral/Ratings): \n")
+cat("   -> ", file.path(path_dest_covariates), "\n")
+
+cat("========================================\n")
+```
