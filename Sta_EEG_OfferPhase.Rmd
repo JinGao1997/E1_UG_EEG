@@ -30,8 +30,8 @@ experiment_version <- "E2"  # Options: "E1" or "E2"
 
 # Component definitions. Format: c("Component_Name" = Include_Covariate_Boolean)
 analyze_stim_components <- c(
-  "FRN"       = FALSE,
-  "N400"      = FALSE,
+  "FRN"       = TRUE,
+  "N400"      = TRUE,
   "LPP_offer" = TRUE
 )
 

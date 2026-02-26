@@ -2,7 +2,7 @@
 # -*- coding: UTF-8 -*-
 
 """
-Sta_Behaviour Downstream Visualization Pipeline (v1.5 - Adapted for Excel Output)
+Sta_Behaviour Downstream Visualization Pipeline (v1.6 - Delta Method SE Approximation)
 ================================================================================
 Description:
     Generates publication-quality figures based on Sta_Behaviour.Rmd outputs.
@@ -54,9 +54,9 @@ from matplotlib.ticker import MaxNLocator
 ERROR_BAR_TYPE = "SE"
 
 # Fixed Y-axis limits for Reaction Time (RT) plots.
-# Ensures cross-experiment comparability. Set to None to enable auto-scaling.
+# Set MAX to None to enable auto-scaling and prevent error bar clipping.
 RT_Y_MIN = 600
-RT_Y_MAX = 1000
+RT_Y_MAX = None 
 
 LABELS = [
     "Type_Rejection_Rate",
@@ -200,6 +200,8 @@ def plot_interaction_line(df, y_col, lower_col, upper_col, ylabel, title, filena
     if "Time" in ylabel or "ms" in ylabel:
         if RT_Y_MIN is not None and RT_Y_MAX is not None:
             ax.set_ylim(RT_Y_MIN, RT_Y_MAX)
+        elif RT_Y_MIN is not None:
+            ax.set_ylim(bottom=RT_Y_MIN)
     else:
         ax.set_ylim(0, 1.05)
 
@@ -263,6 +265,8 @@ def plot_interaction_bar(df, y_col, lower_col, upper_col, ylabel, title, filenam
     if "Time" in ylabel or "ms" in ylabel:
         if RT_Y_MIN is not None and RT_Y_MAX is not None:
             ax.set_ylim(RT_Y_MIN, RT_Y_MAX)
+        elif RT_Y_MIN is not None:
+            ax.set_ylim(bottom=RT_Y_MIN)
         else:
             min_val = float(df[lower_col].min())
             ax.set_ylim(bottom=max(0, min_val - 100))
@@ -366,16 +370,10 @@ def plot_forest_from_posthoc(df: pd.DataFrame, title: str, filename: Path, mode:
 
 def load_and_clean_trials(trials_path: Path) -> pd.DataFrame:
     """
-    Best-effort replication of Sta_Behaviour.Rmd cleaning logic:
-      - offer_ratio derived from Offers_You/(Offers_You+Offers_Other)
-      - offer_type: Fair (5:5,4:6), Unfair (2:8,1:9), drop others
-      - emotion standardized to EMOTION_ORDER
-      - rejection_rate = (reaction==2)*100
-      - RT range: 150..3000
+    Best-effort replication of Sta_Behaviour.Rmd cleaning logic.
     """
     df = pd.read_csv(trials_path)
 
-    # Participant ID (best-effort standardization)
     if "participant_id" in df.columns:
         def clean_id(x):
             if pd.isna(x):
@@ -389,46 +387,34 @@ def load_and_clean_trials(trials_path: Path) -> pd.DataFrame:
             return f"Vp{int(digits):04d}"
         df["participant_id"] = df["participant_id"].apply(clean_id)
 
-    # Offer ratio mapping
     if {"Offers_You", "Offers_Other"}.issubset(df.columns):
         denom = (df["Offers_You"] + df["Offers_Other"]).replace(0, np.nan)
         ratio_val = df["Offers_You"] / denom
 
         def map_ratio(r):
-            if pd.isna(r):
-                return np.nan
-            if abs(r - 0.5) < 0.01:
-                return "5:5"
-            if abs(r - 0.4) < 0.01:
-                return "4:6"
-            if abs(r - 0.3) < 0.01:
-                return "3:7"
-            if abs(r - 0.2) < 0.01:
-                return "2:8"
-            if abs(r - 0.1) < 0.01:
-                return "1:9"
+            if pd.isna(r): return np.nan
+            if abs(r - 0.5) < 0.01: return "5:5"
+            if abs(r - 0.4) < 0.01: return "4:6"
+            if abs(r - 0.3) < 0.01: return "3:7"
+            if abs(r - 0.2) < 0.01: return "2:8"
+            if abs(r - 0.1) < 0.01: return "1:9"
             return np.nan
 
         df["offer_ratio"] = ratio_val.apply(map_ratio)
 
         def map_type(oratio):
-            if pd.isna(oratio):
-                return "drop"
-            if oratio in ["5:5", "4:6"]:
-                return "fair"
-            if oratio in ["2:8", "1:9"]:
-                return "unfair"
+            if pd.isna(oratio): return "drop"
+            if oratio in ["5:5", "4:6"]: return "fair"
+            if oratio in ["2:8", "1:9"]: return "unfair"
             return "drop"
 
         df["offer_type"] = df["offer_ratio"].apply(map_type)
         df = df[df["offer_type"] != "drop"].copy()
 
-    # Emotion normalization
     if "emotion" in df.columns:
         df["emotion"] = df["emotion"].apply(normalize_emotion)
         df = df[df["emotion"].isin(EMOTION_ORDER)].copy()
 
-    # Rejection + RT filter
     if "reaction" in df.columns:
         df["is_reject"] = (df["reaction"] == 2).astype(int)
         df["rejection_rate"] = df["is_reject"] * 100.0
@@ -445,74 +431,39 @@ def load_and_clean_trials(trials_path: Path) -> pd.DataFrame:
 
 
 # ==============================================================================
-# 7) Distribution plots: Facet by offer_type; within facet each emotion is a pair
+# 7) Distribution plots
 # ==============================================================================
 
 def _rgba(hex_color: str, alpha: float) -> tuple:
-    """Convert hex color to RGBA tuple with specified alpha."""
     r, g, b = mcolors.to_rgb(hex_color)
     return (r, g, b, alpha)
 
 def _nice_ylim(values: pd.Series, lower_q=0.01, upper_q=0.99, pad_ratio=0.08):
-    """Compute robust y-limits using quantiles + padding."""
     v = pd.to_numeric(values, errors="coerce").dropna()
-    if v.empty:
-        return None
+    if v.empty: return None
     lo = float(v.quantile(lower_q))
     hi = float(v.quantile(upper_q))
-    if hi <= lo:
-        lo, hi = float(v.min()), float(v.max())
+    if hi <= lo: lo, hi = float(v.min()), float(v.max())
     pad = (hi - lo) * pad_ratio if hi > lo else 1.0
     return lo - pad, hi + pad
-
 
 from scipy.stats import gaussian_kde
 
 def plot_facet_paired_box_violin(
-    df_raw: pd.DataFrame,
-    y_var: str,
-    y_label: str,
-    title: str,
-    output_path_png: Path,
-    output_path_pdf: Path | None = None,
-    subject_col: str = "participant_id",
-    emotion_col: str = "emotion",
-    offer_col: str = "offer_type",
-    offer_order=("fair", "unfair"),
+    df_raw: pd.DataFrame, y_var: str, y_label: str, title: str,
+    output_path_png: Path, output_path_pdf: Path | None = None,
+    subject_col: str = "participant_id", emotion_col: str = "emotion",
+    offer_col: str = "offer_type", offer_order=("fair", "unfair"),
     emotion_order=("dis", "dom", "neu", "aff", "enj"),
-    label_map=None,
-    color_map=None,
-    violin_alpha=0.22,
-    box_alpha=0.45,
-    point_alpha=0.80,
-    point_size=28,
-    jitter=0.12,
-    pair_gap=0.55,
-    group_gap=0.95,
-    bw_adjust=0.85,
-    max_violin_width=0.55,
-    outline_alpha=0.65,
-    outline_lw=1.2,
-    n_grid=250,
+    label_map=None, color_map=None,
+    violin_alpha=0.22, box_alpha=0.45, point_alpha=0.80, point_size=28,
+    jitter=0.12, pair_gap=0.55, group_gap=0.95, bw_adjust=0.85,
+    max_violin_width=0.55, outline_alpha=0.65, outline_lw=1.2, n_grid=250,
 ):
-    """
-    Faceted distribution figure:
-      - Facets: offer_type (Fair / Unfair)
-      - Within each facet, each emotion is displayed as a paired group:
-          left = boxplot + points; right = half-violin density (right side only).
-      - Density uses gaussian_kde with boundary reflection for bounded variables.
-    """
+    if label_map is None: label_map = {}
+    if color_map is None: color_map = {}
 
-    if label_map is None:
-        label_map = {}
-    if color_map is None:
-        color_map = {}
-
-    df_agg = (
-        df_raw
-        .groupby([subject_col, emotion_col, offer_col], as_index=False)[y_var]
-        .mean()
-    )
+    df_agg = df_raw.groupby([subject_col, emotion_col, offer_col], as_index=False)[y_var].mean()
     df_agg = df_agg[df_agg[offer_col].isin(list(offer_order))].copy()
     df_agg[emotion_col] = pd.Categorical(df_agg[emotion_col], categories=list(emotion_order), ordered=True)
     df_agg[offer_col] = pd.Categorical(df_agg[offer_col], categories=list(offer_order), ordered=True)
@@ -526,14 +477,11 @@ def plot_facet_paired_box_violin(
         y_min, y_max = float(RT_Y_MIN), float(RT_Y_MAX)
     else:
         ylim = _nice_ylim(df_agg[y_var])
-        if ylim is None:
-            return
+        if ylim is None: return
         y_min, y_max = float(ylim[0]), float(ylim[1])
-        if is_rt and y_min < 0:
-            y_min = 0.0
+        if is_rt and y_min < 0: y_min = 0.0
 
     y_grid = np.linspace(y_min, y_max, n_grid)
-
     positions = []
     tick_positions = []
     x = 0.0
@@ -562,39 +510,27 @@ def plot_facet_paired_box_violin(
         for emo_idx, emo in enumerate(emotion_order):
             box_pos, vio_pos = positions[emo_idx]
             sub_emo = sub_offer[sub_offer[emotion_col] == emo]
-            if sub_emo.empty:
-                continue
+            if sub_emo.empty: continue
 
             color = color_map.get(emo, "#808080")
             y_vals = pd.to_numeric(sub_emo[y_var], errors="coerce").dropna().values
-            if len(y_vals) < 2:
-                continue
+            if len(y_vals) < 2: continue
 
             ax.boxplot(
-                y_vals,
-                positions=[box_pos],
-                widths=0.42,
-                patch_artist=True,
-                showfliers=False,
+                y_vals, positions=[box_pos], widths=0.42, patch_artist=True, showfliers=False,
                 boxprops=dict(facecolor=_rgba(color, box_alpha), edgecolor="#3A3A3A", linewidth=1.25),
                 whiskerprops=dict(color="#3A3A3A", linewidth=1.05),
                 capprops=dict(color="#3A3A3A", linewidth=1.05),
-                medianprops=dict(color="#1F1F1F", linewidth=1.7),
-                zorder=2,
+                medianprops=dict(color="#1F1F1F", linewidth=1.7), zorder=2,
             )
 
             x_jit = box_pos + np.random.uniform(-jitter, jitter, size=len(y_vals))
             ax.scatter(
-                x_jit, y_vals,
-                s=point_size,
-                c=[_rgba(color, point_alpha)],
-                edgecolors="white",
-                linewidths=0.75,
-                zorder=3,
+                x_jit, y_vals, s=point_size, c=[_rgba(color, point_alpha)],
+                edgecolors="white", linewidths=0.75, zorder=3,
             )
 
             kde_data = y_vals.copy()
-
             if is_bounded_0_100:
                 kde_data = np.concatenate([kde_data, -kde_data, 200.0 - kde_data])
                 kde_data = kde_data[(kde_data >= -50) & (kde_data <= 150)]
@@ -611,23 +547,11 @@ def plot_facet_paired_box_violin(
 
             x_right = vio_pos + half_width
             x_left = np.full_like(x_right, vio_pos)
-
             xs = np.concatenate([x_left, x_right[::-1]])
             ys = np.concatenate([y_grid, y_grid[::-1]])
 
-            ax.fill(
-                xs, ys,
-                facecolor=_rgba(color, violin_alpha),
-                edgecolor="none",
-                zorder=1,
-            )
-
-            ax.plot(
-                x_right, y_grid,
-                color=_rgba(color, outline_alpha),
-                linewidth=outline_lw,
-                zorder=2,
-            )
+            ax.fill(xs, ys, facecolor=_rgba(color, violin_alpha), edgecolor="none", zorder=1)
+            ax.plot(x_right, y_grid, color=_rgba(color, outline_alpha), linewidth=outline_lw, zorder=2)
 
         facet_title = "Fair" if offer == "fair" else "Unfair"
         ax.set_title(facet_title, fontsize=14, fontweight="bold", pad=10)
@@ -639,13 +563,9 @@ def plot_facet_paired_box_violin(
         ax.set_xlim(x_min, x_max)
         ax.set_ylim(y_min, y_max)
         ax.yaxis.set_major_locator(MaxNLocator(nbins=6))
-
         ax.set_xlabel("")
-        if ax_i == 0:
-            ax.set_ylabel(y_label, fontsize=13, fontweight="bold")
-        else:
-            ax.set_ylabel("")
-
+        if ax_i == 0: ax.set_ylabel(y_label, fontsize=13, fontweight="bold")
+        else: ax.set_ylabel("")
         sns.despine(ax=ax)
 
     fig.suptitle(title, fontsize=18, fontweight="bold", y=1.03)
@@ -655,7 +575,6 @@ def plot_facet_paired_box_violin(
     if output_path_pdf is not None:
         plt.savefig(output_path_pdf, transparent=True, bbox_inches="tight")
     plt.close(fig)
-
     print(f"   -> Saved Distribution Figure: {output_path_png.name}")
 
 
@@ -664,11 +583,7 @@ def plot_facet_paired_box_violin(
 # ==============================================================================
 
 def process_label_folder(label_dir: Path, figures_dir: Path):
-    """
-    Process one Sta_Behaviour output label folder by reading the STATS_REPORT Excel file.
-    """
     print(f"\n>>> Processing Label: {label_dir.name}")
-    
     excel_file = label_dir / f"STATS_REPORT_{label_dir.name}.xlsx"
     
     if not excel_file.exists():
@@ -681,7 +596,6 @@ def process_label_folder(label_dir: Path, figures_dir: Path):
         print(f"   [Error] Could not read Excel file {excel_file.name}: {e}")
         return
 
-    # Extract Descriptive Means
     if "Descriptive_Means_SE" in xls.sheet_names:
         df_desc = pd.read_excel(xls, sheet_name="Descriptive_Means_SE")
         if "emotion" in df_desc.columns:
@@ -692,55 +606,68 @@ def process_label_folder(label_dir: Path, figures_dir: Path):
         if y_col is None:
             print("   [Skip] Descriptive_Means_SE sheet has no recognized mean column.")
         else:
+            se_col = get_first_existing_col(df_desc, ["SE", "std.error"])
             lower_col = get_first_existing_col(df_desc, ["asymp.LCL", "lower.CL", "lower", "LCL"])
             upper_col = get_first_existing_col(df_desc, ["asymp.UCL", "upper.CL", "upper", "UCL"])
-            se_col = get_first_existing_col(df_desc, ["SE", "std.error"])
 
-            # Compute specific bounds based on ERROR_BAR_TYPE specification
-            if ERROR_BAR_TYPE == "SE" and se_col:
-                df_desc["__LCL_SE"] = df_desc[y_col] - df_desc[se_col]
-                df_desc["__UCL_SE"] = df_desc[y_col] + df_desc[se_col]
-                lower_col, upper_col = "__LCL_SE", "__UCL_SE"
-            elif lower_col is None or upper_col is None:
-                if se_col:
+            # Safety check
+            if se_col is None:
+                print("   [Skip] Descriptive_Means_SE missing standard error column.")
+                return
+
+            is_rt_label = ("Response_Time" in label_dir.name) or ("RT" in label_dir.name) or ("Time" in label_dir.name)
+            mean_numeric = float(pd.to_numeric(df_desc[y_col], errors="coerce").dropna().mean()) if not df_desc.empty else np.nan
+
+            err_suffix = "(+/- 1 SE)" if ERROR_BAR_TYPE == "SE" else "(95% CI)"
+
+            # [MODIFIED]: Delta Method application for back-transforming LogRT to ms
+            if is_rt_label and np.isfinite(mean_numeric) and mean_numeric < 20:
+                print("   [Transform] Log-scale detected. Applying Delta Method for symmetric error bars in ms.")
+                
+                # Convert the mean from log to linear (ms)
+                df_desc["RT_ms"] = np.exp(df_desc[y_col].astype(float))
+                
+                # Delta Method approximation: SE(exp(x)) ≈ exp(x) * SE(x)
+                log_se = df_desc[se_col].astype(float)
+                se_ms = df_desc["RT_ms"] * log_se
+                
+                if ERROR_BAR_TYPE == "SE":
+                    df_desc["lower_ms"] = df_desc["RT_ms"] - se_ms
+                    df_desc["upper_ms"] = df_desc["RT_ms"] + se_ms
+                else: 
+                    df_desc["lower_ms"] = df_desc["RT_ms"] - (CI_MULTIPLIER * se_ms)
+                    df_desc["upper_ms"] = df_desc["RT_ms"] + (CI_MULTIPLIER * se_ms)
+                    
+                y_col_use, l_col_use, u_col_use = "RT_ms", "lower_ms", "upper_ms"
+                ylabel = f"Reaction Time (ms) {err_suffix}"
+            else:
+                # Normal handling for probabilities (Rejection Rate)
+                if ERROR_BAR_TYPE == "SE":
+                    df_desc["__LCL_SE"] = df_desc[y_col] - df_desc[se_col]
+                    df_desc["__UCL_SE"] = df_desc[y_col] + df_desc[se_col]
+                    l_col_use, u_col_use = "__LCL_SE", "__UCL_SE"
+                elif lower_col is None or upper_col is None:
                     df_desc["__LCL"] = df_desc[y_col] - CI_MULTIPLIER * df_desc[se_col]
                     df_desc["__UCL"] = df_desc[y_col] + CI_MULTIPLIER * df_desc[se_col]
-                    lower_col, upper_col = "__LCL", "__UCL"
+                    l_col_use, u_col_use = "__LCL", "__UCL"
                 else:
-                    print("   [Skip] No CI/SE columns for interaction plot.")
-                    lower_col = upper_col = None
+                    l_col_use, u_col_use = lower_col, upper_col
+                    
+                y_col_use = y_col
+                ylabel = f"Rejection Probability {err_suffix}"
 
-            if lower_col and upper_col:
-                is_rt_label = ("Response_Time" in label_dir.name) or ("RT" in label_dir.name) or ("Time" in label_dir.name)
-                mean_numeric = float(pd.to_numeric(df_desc[y_col], errors="coerce").dropna().mean()) if not df_desc.empty else np.nan
-
-                # Determine ylabel suffix depending on configuration
-                err_suffix = "(+/- 1 SE)" if ERROR_BAR_TYPE == "SE" else "(95% CI)"
-
-                if is_rt_label and np.isfinite(mean_numeric) and mean_numeric < 20:
-                    print("   [Transform] Log-scale detected for RT. Converting to ms via exp().")
-                    df_desc["RT_ms"] = np.exp(df_desc[y_col].astype(float))
-                    df_desc["lower_ms"] = np.exp(df_desc[lower_col].astype(float))
-                    df_desc["upper_ms"] = np.exp(df_desc[upper_col].astype(float))
-                    y_col_use, l_col_use, u_col_use = "RT_ms", "lower_ms", "upper_ms"
-                    ylabel = f"Reaction Time (ms) {err_suffix}"
-                else:
-                    y_col_use, l_col_use, u_col_use = y_col, lower_col, upper_col
-                    ylabel = f"Rejection Probability {err_suffix}" if "Rejection" in label_dir.name else f"Log Reaction Time {err_suffix}"
-
-                tag = label_dir.name
-                plot_interaction_line(
-                    df_desc, y_col_use, l_col_use, u_col_use, ylabel,
-                    f"{tag}: Interaction", figures_dir / f"{tag}_Interaction_Line.png"
-                )
-                plot_interaction_bar(
-                    df_desc, y_col_use, l_col_use, u_col_use, ylabel,
-                    f"{tag}: Interaction", figures_dir / f"{tag}_Interaction_Bar.png"
-                )
+            tag = label_dir.name
+            plot_interaction_line(
+                df_desc, y_col_use, l_col_use, u_col_use, ylabel,
+                f"{tag}: Interaction", figures_dir / f"{tag}_Interaction_Line.png"
+            )
+            plot_interaction_bar(
+                df_desc, y_col_use, l_col_use, u_col_use, ylabel,
+                f"{tag}: Interaction", figures_dir / f"{tag}_Interaction_Bar.png"
+            )
     else:
         print("   [Skip] Descriptive_Means_SE sheet not found in Excel report.")
 
-    # Extract PostHoc tests
     posthoc_sheets = [s for s in xls.sheet_names if s.startswith("PostHoc_")]
     if not posthoc_sheets:
         print("   [Skip] No PostHoc_* sheets found in Excel report.")
@@ -752,78 +679,41 @@ def process_label_folder(label_dir: Path, figures_dir: Path):
                 if "emotion" in df_ph.columns:
                     df_ph["emotion"] = df_ph["emotion"].apply(normalize_emotion)
                 plot_forest_from_posthoc(
-                    df_ph,
-                    title=f"{label_dir.name}: {sheet}",
-                    filename=figures_dir / f"{label_dir.name}_{sheet}_Forest.png",
-                    mode=mode
+                    df_ph, title=f"{label_dir.name}: {sheet}",
+                    filename=figures_dir / f"{label_dir.name}_{sheet}_Forest.png", mode=mode
                 )
             except Exception as e:
                 print(f"   [Warn] Forest plot failed for sheet {sheet}: {e}")
 
-
 def plot_distributions_from_trials(trials_path: Path, figures_dir: Path):
-    """Generate distribution figures with paired box|violin per emotion in each offer facet."""
     print("\n>>> Processing Raw Data for Distribution Plots...")
     print(f"   -> Loading: {trials_path}")
-
     df_trials = load_and_clean_trials(trials_path)
 
     rain_dir = figures_dir / "Raincloud"
     rain_dir.mkdir(parents=True, exist_ok=True)
+    emo_label_map = {"dis": "Disgust", "dom": "Dominance", "neu": "Neutral", "aff": "Affiliative", "enj": "Reward"}
 
-    emo_label_map = {
-        "dis": "Disgust",
-        "dom": "Dominance",
-        "neu": "Neutral",
-        "aff": "Affiliative",
-        "enj": "Reward",
-    }
-
-    # RT
     if "RT" in df_trials.columns:
         plot_facet_paired_box_violin(
-            df_raw=df_trials,
-            y_var="RT",
-            y_label="Reaction Time (ms)",
-            title="Distribution RT",
+            df_raw=df_trials, y_var="RT", y_label="Reaction Time (ms)", title="Distribution RT",
             output_path_png=rain_dir / "Distribution_RT_PairedBoxViolin_FacetOffer.png",
             output_path_pdf=rain_dir / "Distribution_RT_PairedBoxViolin_FacetOffer.pdf",
-            label_map=emo_label_map,
-            color_map=COLOR_MAP,
-            violin_alpha=0.32,
-            box_alpha=0.45,
-            point_alpha=0.80,
+            label_map=emo_label_map, color_map=COLOR_MAP, violin_alpha=0.32, box_alpha=0.45, point_alpha=0.80,
         )
-    else:
-        print("   [Skip] RT not available in trials data.")
+    else: print("   [Skip] RT not available in trials data.")
 
-    # Rejection rate (%)
     if "rejection_rate" in df_trials.columns:
         plot_facet_paired_box_violin(
-            df_raw=df_trials,
-            y_var="rejection_rate",
-            y_label="Rejection Rate (%)",
-            title="Distribution Rejection",
+            df_raw=df_trials, y_var="rejection_rate", y_label="Rejection Rate (%)", title="Distribution Rejection",
             output_path_png=rain_dir / "Distribution_Rejection_PairedBoxViolin_FacetOffer.png",
             output_path_pdf=rain_dir / "Distribution_Rejection_PairedBoxViolin_FacetOffer.pdf",
-            label_map=emo_label_map,
-            color_map=COLOR_MAP,
-            violin_alpha=0.22,
-            box_alpha=0.45,
-            point_alpha=0.80,
+            label_map=emo_label_map, color_map=COLOR_MAP, violin_alpha=0.22, box_alpha=0.45, point_alpha=0.80,
         )
-    else:
-        print("   [Skip] rejection_rate not available in trials data.")
-
-
-# ==============================================================================
-# 9) Entry point
-# ==============================================================================
+    else: print("   [Skip] rejection_rate not available in trials data.")
 
 if __name__ == "__main__":
-
     prefer_debug = ("--debug" in sys.argv)
-
     current_path = Path(__file__).resolve()
     project_root = detect_project_root(current_path)
     if project_root is None:
@@ -837,22 +727,15 @@ if __name__ == "__main__":
     print(f"Info: Output Root:  {out_root}")
     print(f"Info: Figures Dir:  {figures_dir}")
 
-    # 1) Label-based figures (Read from Excel)
     for label in LABELS:
         label_dir = out_root / label
-        if label_dir.exists():
-            process_label_folder(label_dir, figures_dir)
-        else:
-            print(f"\n>>> [Skip] Label folder not found: {label_dir}")
+        if label_dir.exists(): process_label_folder(label_dir, figures_dir)
+        else: print(f"\n>>> [Skip] Label folder not found: {label_dir}")
 
-    # 2) Distribution figures from trials.csv
     trials_path = find_trials_csv(project_root)
     if trials_path and trials_path.exists():
-        try:
-            plot_distributions_from_trials(trials_path, figures_dir)
-        except Exception as e:
-            print(f"   [Warn] Distribution pipeline failed: {e}")
-    else:
-        print("\n>>> [Skip] trials.csv not found via Sta_Behaviour path or recursive search.")
+        try: plot_distributions_from_trials(trials_path, figures_dir)
+        except Exception as e: print(f"   [Warn] Distribution pipeline failed: {e}")
+    else: print("\n>>> [Skip] trials.csv not found.")
 
     print("\nDone! Figures saved to:", figures_dir)

@@ -1,49 +1,29 @@
-1. Overview
-This project contains a comprehensive data analysis pipeline for the Ultimatum Game (UG) experiment. The pipeline covers everything from raw EEG data preprocessing and ERP component extraction (Face Phase & Offer Phase) to advanced statistical analysis using Linear Mixed Models (LMM/GLMM) for both behavioral and neural data.
+# EEG & Behavioral Data Analysis Pipeline
 
+This repository contains a streamlined, dual-language (Python/R) pipeline for processing, analyzing, and visualizing EEG and behavioral data. 
 
-2. Directory Structure
-To ensure the scripts run successfully, please organize your raw data exactly as shown below after downloading the project:
+The core EEG processing engine is adapted from [alexenge/hu-neuro-pipeline](https://github.com/alexenge/hu-neuro-pipeline) and specifically customized for the requirements of this research.
 
-EEG_Project/
-├── EEG_Project.Rproj          <-- [Launch] Double-click to open the project in RStudio
-├── README.md                  <-- [Info] This document
+## 📂 Project Structure & File Descriptions
+
+```text
+.
+├── python_modules/
+│   └── hu-neuro-pipeline/       # 核心脑电数据处理管线 (预处理、Epoching、TFR、RIDE等)
 │
-├── python_modules/            <-- [Config] Core Python pipeline
-│   └── hu-neuro-pipeline/     <-- ★ [Manual Copy] Copy your Python pipeline folder here
-│
-├── scripts/                   <-- [Code] Analysis scripts (Run in order)
-│   ├── E1_UG_EEG_BaselineCov.Rmd       # 1. Master EEG Preprocessing (inc. Baseline extraction)
-│   ├── Sta_FacePhase.Rmd         # 2. Face Phase Statistical Analysis
-│   ├── Sta_OfferPhase.Rmd          # 3. Offer/Resp Phase Statistics (FRN/LPP/N400/CPP)
-│   └── Sta_Behaviour.Rmd              # 4. Behavioral Data Statistics
-│
-├── data/                      <-- [Data] Data Storage Center
-│   ├── raw_all_cropped/       <-- ★ [Input] Place raw EEG data here (.set/.fdt/.vhdr)
-│   ├── csv_all/               <-- ★ [Input] Place raw behavioral logs here (.txt)
-│   ├── covariates/            <-- ★ [Input] Place questionnaires here (SVO_PID5BF_PostRating.xlsx)
+├── results/
+│   ├── EEG/                     
+│   │   ├── ERP_Report_*_StiLocked.py  # 刺激锁定(Stimulus-locked) ERP 结果的波形可视化与导出
+│   │   └── ERP_Report_*_ResLocked.py  # 反应锁定(Response-locked) ERP 结果的波形可视化与导出
 │   │
-│   ├── pipeline_output/       <-- [Auto-generated] Heavy intermediate files (Epochs, etc.)
-│   ├── csv_filtered/          <-- [Auto-generated] Cleaned behavioral CSVs
-│   │
-│   ├── face_phase/            <-- [Auto-archived] Single-trial Face ERP CSV
-│   ├── offer_phase/           <-- [Auto-archived] Single-trial Offer ERP CSV (FRN/LPP/Behavior)
-│   ├── N400/                  <-- [Auto-archived] Single-trial N400 ERP CSV
-│   ├── response_locked/       <-- [Auto-archived] Single-trial CPP ERP CSV
-│   │
-│   └── baseline/              <-- [Auto-archived] ROI-specific baseline data
-│       ├── FRN/
-│       ├── LPP_face/
-│       ├── LPP_CPP/
-│       └── N400/
+│   └── Behavioral/              
+│       └── Visualization_Behavior.py  # 行为学结果的可视化图表绘制
 │
-└── results/                   <-- [Output] Final statistical reports, plots, and Excel tables
-    ├── Face_Phase/
-    ├── FRN/
-    ├── LPP_offer/
-    ├── N400/
-    ├── CPP/
-    └── Behavioral/
-
-
-Note: Folders marked with ★ require you to manually place your raw data files. All other folders will be automatically created by the scripts.
+├── UG_EEG_OfferPhase.Rmd                      # 报价阶段(Offer Phase)的脑电预处理
+├── UG_EEG_OfferPhase_ClusterPermutation*.Rmd  # 报价阶段脑电预处理及 Cluster-based 置换检验
+├── Sta_Behaviour.Rmd                          # 行为学数据的统计分析 (R语言)
+├── E1_Sta_*.Rmd / E2_Sta_*.Rmd                # 脑电数据的统计分析与协变量基线校正 (R语言)
+├── Topo_*.py / Topo_*.Rmd                     # 脑地形图的数据计算与绘制
+│
+├── renv.lock & renv/            # R语言包的依赖环境配置文件
+└── .gitignore                   # Git忽略配置 (屏蔽本地庞大的数据文件)

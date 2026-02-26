@@ -23,9 +23,6 @@ options(scipen = 999, digits = 4)
 # [CRITICAL] Sum-to-zero contrasts for valid Type III ANOVA results
 options(contrasts = c("contr.sum", "contr.poly"))
 
-# [CONFIG] Force calculation of Denominator DF (Avoids 'Inf' df in post-hoc)
-options(emm_options = list(lmerTest.limit = 50000, pbkrtest.limit = 50000))
-
 if(!require("pacman")) install.packages("pacman")
 pacman::p_load(
   here, readr, readxl, dplyr, tidyr, stringr,  # Data Wrangling
@@ -37,6 +34,10 @@ pacman::p_load(
   ggplot2, ggpubr, gridExtra,                  # Publication Visualization
   openxlsx                                     # Excel Reporting
 )
+
+
+# [CONFIG] Force calculation of Denominator DF (Avoids 'Inf' df in post-hoc)
+emmeans::emm_options(lmerTest.limit = 50000, pbkrtest.limit = 50000)
 
 # [PATH] Output Directory: Separated for E1
 # Structure: results/EEG/E1_Stats_Regression_Method/[Component]/
