@@ -1,6 +1,6 @@
 ---
 title: "UG Behavioral Statistical Analysis Report"
-subtitle: "Publication-Quality Modeling (Fixed & Robust) with APA Reporting"
+subtitle: "Publication-Quality Modeling (GLMM/LMM) with Data-Driven Maximal Random Structure"
 author: "Data Analysis Team"
 date: "`r Sys.Date()`"
 output: 
@@ -22,41 +22,44 @@ if(!require("pacman")) install.packages("pacman")
 pacman::p_load(
   here,             # Project-relative paths
   tidyverse,        # Data wrangling
-  buildmer,         # Maximal random effects optimization
-  glmmTMB,          # Robust GLMM (Binomial)
-  lme4, lmerTest,   # LMM (Gaussian)
+  buildmer,         # Maximal random effects optimization via LRT
+  glmmTMB,          # Robust GLMM (Binomial outcomes)
+  lme4, lmerTest,   # LMM (Gaussian outcomes)
   emmeans,          # Marginal means & Post-hoc
-  car,              # Type III ANOVA
+  car,              # Type III ANOVA (Wald tests for GLMM)
   effectsize,       # Partial Eta Squared
   parameters,       # Standardized reporting
   performance,      # Model checking
-  openxlsx          # Excel Reporting (Industry Standard)
+  openxlsx          # Excel Reporting
 )
 
 # 2. Global Settings
 options(scipen = 999) 
-
 # [CRITICAL] Set Sum Coding for valid Type III ANOVA
-# This is mandatory when interactions are present
+# Mandatory for unbiased main effects in the presence of interactions.
 options(contrasts = c("contr.sum", "contr.poly"))
 
-# Note: emmeans::emm_options limit will be set dynamically in respective 
-# chunks based on model dimensionality (confirmatory vs exploratory) 
-# to balance precision and computational stability.
+# ------------------------------------------------------------------------------
+# [USER CONFIGURATION] Global Settings & Analysis Targets
+# ------------------------------------------------------------------------------
+# Set this to "E1" or "E2" depending on which project folder you are running.
+# This ensures output reports and folders are cleanly isolated.
+experiment_version <- "E2"  
+DEBUG_MODE <- FALSE 
+# ------------------------------------------------------------------------------
 
 # 3. Path Configuration
-# INPUT: Relative to Project Root
+# [MATCHED WITH EEG PIPELINE]: Reads exactly from where the EEG script dumps the trials.
 path_input <- here("data", "02_Pipeline_Output", "Method_Regression", "Stimulus_Locked", "trials.csv")
 
-# OUTPUT: Define based on Run Mode
-DEBUG_MODE <- FALSE 
-
+# [UPGRADED]: Isolates output reporting by Experiment Version to prevent overwrite.
 dir_suffix <- if(DEBUG_MODE) "Debug_Output_Final" else "Pub_Output_Final"
-path_out_root <- here("results", "Behavioral", dir_suffix)
+path_out_root <- here("results", "Behavioral", paste0(experiment_version, "_", dir_suffix))
 
 if(!dir.exists(path_out_root)) dir.create(path_out_root, recursive = TRUE)
 
-cat(sprintf(">>> SYSTEM STATUS: DEBUG_MODE = %s\n", DEBUG_MODE))
+cat(sprintf(">>> SYSTEM STATUS: Experiment = %s | DEBUG_MODE = %s\n", experiment_version, DEBUG_MODE))
+cat(sprintf(">>> INPUT PATH DETECTED: %s\n", path_input))
 cat(sprintf(">>> OUTPUT PATH: %s\n", path_out_root))
 
 
@@ -64,13 +67,11 @@ cat(sprintf(">>> OUTPUT PATH: %s\n", path_out_root))
 
 # 1. Methodology
 
-This analysis employs **Linear Mixed-Effects Models (LMM)** and **Generalized Linear Mixed-Effects Models (GLMM)**.
+This analysis employs **Linear Mixed-Effects Models (LMM)** for continuous response times and **Generalized Linear Mixed-Effects Models (GLMM)** for binary decision outcomes (e.g., Rejection Rates). The analysis is dynamically configured for **`r experiment_version`**.
 
-* **Model Selection**: We use `buildmer` to identify the maximal random effects structure supported by the data, protecting fixed effects (`include` argument) to ensure hypothesis testing remains valid.
-* **Robustness Check**: Evaluates cross-experiment variations in maximal random structures via Likelihood Ratio Tests (LRT).
-* **Reporting Standard**: Extracts Type III ANOVA summaries (Satterthwaite F-tests for continuous data, Wald Chi-Square for binomial), effect sizes, and pairwise comparisons using APA-7 formatting standards.
-* **Correction**: Post-hoc pairwise comparisons are corrected using **FDR** to balance sensitivity and error rate.
-* **Analysis Structure**: The primary confirmatory analysis focuses on binary Offer Type (Fair vs. Unfair). Full Offer Ratio analyses are treated as exploratory, adjusting computational parameters dynamically to handle high-dimensional singular matrix risks.
+* **Random Effects Optimization**: To balance Type I error control and statistical power, we follow Matuschek et al. (2017) and Barr et al. (2013). Models are initialized with a strictly maximal random effects structure. The `buildmer` package is utilized to perform backward stepwise elimination via Likelihood Ratio Tests (LRT). Nonsignificant random slopes and covariance parameters are sequentially removed until a maximal-justifiable (parsimonious) and convergent structure is achieved. Fixed effects are strictly protected to preserve hypothesis testing integrity.
+* **Inferential Statistics**: For LMMs, we report Type III ANOVA $F$-statistics with Satterthwaite's approximation for degrees of freedom. For binomial GLMMs, we report Type III Wald $\chi^2$ statistics (infinite denominator degrees of freedom).
+* **Post-hoc Analysis**: Simple and main effects are adjusted using the False Discovery Rate (FDR) procedure. For high-dimensional exploratory models, asymptotic approximations ($z$-tests) are employed to prevent computational singularity.
 
 # 2. APA Formatting Module
 
@@ -81,7 +82,7 @@ This analysis employs **Linear Mixed-Effects Models (LMM)** and **Generalized Li
 format_anova_apa <- function(anova_obj, model) {
   df_res <- as.data.frame(anova_obj) %>% tibble::rownames_to_column("Effect")
   
-  # Calculate Partial Eta Squared (Primary for LMMs)
+  # Calculate Partial Eta Squared (Primary for LMMs, NA for GLMMs)
   es_df <- data.frame(Parameter = character(), Eta2_partial = numeric())
   tryCatch({
     if(!inherits(model, "glmmTMB") && !inherits(model, "glm")) {
@@ -96,7 +97,6 @@ format_anova_apa <- function(anova_obj, model) {
     df_res$Eta2_partial <- NA
   }
   
-  # Safe column extractors (prevent 'object not found' during case_when evaluation)
   get_col <- function(col_name) if(col_name %in% names(df_res)) df_res[[col_name]] else NA
   
   df_res <- df_res %>%
@@ -128,7 +128,6 @@ format_anova_apa <- function(anova_obj, model) {
         TRUE ~ "Format not supported"
       )
     ) %>%
-    # Clean up intermediate safe columns to keep the final output neat
     select(-F_val, -NumDF, -DenDF, -Df_val, -Chisq, -p_val)
 }
 
@@ -139,7 +138,7 @@ format_posthoc_apa <- function(emm_df) {
   df_clean <- as.data.frame(emm_df)
   
   if("t.ratio" %in% names(df_clean)) {
-    # LMM Output Formatting
+    # LMM Output Formatting (Satterthwaite DF)
     df_clean <- df_clean %>%
       mutate(
         p_str = case_when(p.value < .001 ~ "< .001", TRUE ~ paste0("= ", sprintf("%.3f", p.value))),
@@ -151,7 +150,7 @@ format_posthoc_apa <- function(emm_df) {
         Stats_String = sprintf("b = %s (SE=%s), t(%s) = %s, p %s", estimate_str, se_str, df_str, t_str, p_str)
       )
   } else if("z.ratio" %in% names(df_clean)) {
-    # GLMM Output Formatting (Infinite DF)
+    # GLMM Output Formatting (Asymptotic/Infinite DF)
     df_clean <- df_clean %>%
       mutate(
         p_str = case_when(p.value < .001 ~ "< .001", TRUE ~ paste0("= ", sprintf("%.3f", p.value))),
@@ -180,13 +179,11 @@ format_coefs <- function(model) {
       Report = sprintf("b = %.2f, SE = %.2f, %s = %.2f, p %s", Coefficient, SE, stat_col, !!sym(stat_col), p_str)
     )
   }, error = function(e) {
-    # Fallback to summary() if parameters extraction fails
     coef_df <- summary(model)$coefficients
     if(is.list(coef_df) && "cond" %in% names(coef_df)) coef_df <- coef_df$cond
     as.data.frame(coef_df) %>% tibble::rownames_to_column("Predictor")
   })
 }
-
 
 ```
 
@@ -194,14 +191,14 @@ format_coefs <- function(model) {
 
 ```{r functions}
 # ------------------------------------------------------------------------------
-# FUNCTION 1: ROBUST MODELING ENGINE (With Safety Net)
+# FUNCTION 1: ROBUST MODELING ENGINE (Data-Driven Maximal Optimization)
 # ------------------------------------------------------------------------------
 run_robust_model <- function(formula_str, data, family_type, fixed_terms) {
   
   f <- as.formula(formula_str)
   
   if(DEBUG_MODE) {
-    cat("   [DEBUG] Fitting standard model (Skipping optimization)...\n")
+    cat("   [DEBUG] Fitting base model, skipping complex optimization for speed...\n")
     suppressWarnings({
       if(family_type == "binomial") {
         return(glmmTMB(f, data = data, family = binomial()))
@@ -210,9 +207,15 @@ run_robust_model <- function(formula_str, data, family_type, fixed_terms) {
       }
     })
   } else {
-    cat("   [PRODUCTION] Optimizing Random Effects via buildmer...\n")
+    cat("   [PRODUCTION] Optimizing Random Effects via buildmer (Backward LRT)...\n")
     
-    ctrl <- buildmerControl(include = fixed_terms, crit = "LRT")
+    # Strictly protect fixed effects while allowing backward elimination of random slopes
+    ctrl <- buildmerControl(
+      include = fixed_terms, 
+      direction = c("order", "backward"),
+      crit = "LRT",
+      quiet = TRUE
+    )
     
     final_model <- tryCatch({
       if(family_type == "binomial") {
@@ -223,7 +226,7 @@ run_robust_model <- function(formula_str, data, family_type, fixed_terms) {
         bm@model
       }
     }, error = function(e) {
-      cat("   [ERROR] buildmer failed to converge. Fallback triggered.\n")
+      cat("   [ERROR] Optimization failed critically. Fallback triggered.\n")
       return(NULL)
     })
     
@@ -234,7 +237,7 @@ run_robust_model <- function(formula_str, data, family_type, fixed_terms) {
     }
     
     if(is.null(final_model) || !is_valid_mixed) {
-      cat("   [WARNING] Optimization failed. FALLBACK: Force (1 | participant_id).\n")
+      cat("   [WARNING] Maximal structure non-convergent. FALLBACK: Random Intercept Only.\n")
       
       fixed_only <- as.formula(paste(deparse(fixed_terms), collapse=" "))
       dep_var <- as.character(f)[2]
@@ -247,7 +250,8 @@ run_robust_model <- function(formula_str, data, family_type, fixed_terms) {
         return(lmer(new_f, data = data, REML = TRUE))
       }
     } else {
-      cat("   [SUCCESS] Maximal random effects structure identified.\n")
+      cat("   [SUCCESS] Data-driven maximal random structure identified.\n")
+      cat("   [FINAL FORMULA]:", paste(deparse(formula(final_model)), collapse=" "), "\n")
       return(final_model)
     }
   }
@@ -267,6 +271,9 @@ generate_report <- function(model, label, factors, data_used) {
   list_of_tables[["Model_Formula"]] <- data.frame(Formula = paste(deparse(formula(model)), collapse=" "))
   list_of_tables[["Model_Coefficients"]] <- format_coefs(model)
   
+  # Type III ANOVA Extraction
+  # Note: glmmTMB models utilize Wald Chi-Square tests via car::Anova.
+  # Lmer models utilize Satterthwaite approximations.
   if(inherits(model, "glmmTMB") || inherits(model, "glm")) {
     anov <- car::Anova(model, type = 3)
   } else {
@@ -287,7 +294,7 @@ generate_report <- function(model, label, factors, data_used) {
   is_int_sig <- any(anov[int_rows, p_col] < 0.05, na.rm = TRUE)
   
   if(isTRUE(is_int_sig) && length(factors) >= 2) {
-    cat("      [Result] Interaction Significant -> Simple Effects (FDR).\n")
+    cat("      [Result] Interaction Significant -> Decomposing Simple Effects (FDR).\n")
     f1 <- factors[1]; f2 <- factors[2]
     
     res1 <- pairs(emmeans(model, as.formula(paste("~", f1, "|", f2)), data=data_used), adjust="fdr")
@@ -296,7 +303,7 @@ generate_report <- function(model, label, factors, data_used) {
     res2 <- pairs(emmeans(model, as.formula(paste("~", f2, "|", f1)), data=data_used), adjust="fdr")
     list_of_tables[[paste0("PostHoc_", f2, "_by_", f1)]] <- format_posthoc_apa(res2)
   } else {
-    cat("      [Result] Interaction NS (or Single Factor) -> Main Effects (FDR).\n")
+    cat("      [Result] Interaction NS (or Single Factor) -> Reporting Main Effects (FDR).\n")
     for(f in factors) {
       res <- pairs(emmeans(model, as.formula(paste("~", f)), data=data_used), adjust="fdr")
       list_of_tables[[paste0("PostHoc_Main_", f)]] <- format_posthoc_apa(res)
@@ -312,11 +319,11 @@ generate_report <- function(model, label, factors, data_used) {
     setColWidths(wb, safe_sheet_name, cols=1:ncol(list_of_tables[[sheet_name]]), widths="auto")
   }
   
-  save_path <- file.path(out_dir, paste0("STATS_REPORT_", label, ".xlsx"))
+  # Dynamic naming with experiment version
+  save_path <- file.path(out_dir, paste0("STATS_REPORT_", experiment_version, "_", label, ".xlsx"))
   saveWorkbook(wb, save_path, overwrite = TRUE)
   cat(paste0("      [Export] Final Excel Generated: ", basename(save_path), "\n"))
 }
-
 
 ```
 
@@ -324,6 +331,8 @@ generate_report <- function(model, label, factors, data_used) {
 
 ```{r data-load}
 if(!file.exists(path_input)) stop("Data file not found at: ", path_input)
+
+cat(sprintf("\nLoading Trials Data for [%s] Pipeline...\n", experiment_version))
 
 df_raw <- read_csv(path_input, show_col_types = FALSE)
 
@@ -362,6 +371,8 @@ df_clean <- df_raw %>%
   filter(!is.na(offer_ratio), !is.na(reaction), RT >= 150, RT <= 3000)
 
 if(DEBUG_MODE) {
+  # Warning: Aggressive subsetting restricts within-subject variance estimation.
+  # Random effects structures may collapse to intercept-only during debugging.
   subs <- unique(df_clean$participant_id)[1:5]
   df_clean <- df_clean %>% filter(participant_id %in% subs)
   cat(">>> DEBUG MODE: Subset to 5 subjects.\n")
@@ -374,19 +385,20 @@ contrasts(df_clean$offer_ratio) <- contr.sum
 
 cat("N Trials for Analysis:", nrow(df_clean), "\n")
 
-
 ```
 
 # 5. Confirmatory Analysis: Offer Type (Fair vs. Unfair)
 
-This section contains our primary hypothesis testing. Due to the targeted nature of the interaction ($5 \times 2$ cells), matrix inversion is computationally stable. We apply a high limit to enforce precise Satterthwaite degrees of freedom estimations.
+This section executes our primary hypothesis testing. The model initiates with the strictly maximal random structure `(1 + emotion * offer_type | participant_id)` and reduces iteratively. Because the parameter space is constrained ($5 \times 2$ matrix), full Satterthwaite degrees of freedom are computationally viable.
 
 ```{r analysis-type}
-# [CONFIG DYNAMIC SHIFT]: Force calculation of precise Denominator DF for Confirmatory Analysis
+# Methodological Note: 
+# High degrees of freedom limits are enforced to guarantee exact Satterthwaite 
+# calculations for continuous RT data within computationally stable confines.
 emmeans::emm_options(lmerTest.limit = 50000, pbkrtest.limit = 50000)
 cat(">>> Configured emmeans: High precision DF enabled for Confirmatory Analysis.\n")
 
-# Subset Data
+# Subset Data & Re-apply Contrasts (Protection against droplevels)
 df_type <- df_clean %>% 
   filter(offer_type %in% c("Fair", "Unfair")) %>% 
   droplevels()
@@ -394,20 +406,20 @@ df_type <- df_clean %>%
 contrasts(df_type$offer_type) <- contr.sum
 contrasts(df_type$emotion) <- contr.sum
 
-# --- 1. Rejection Rate ---
-cat("\n>>> Running: Confirmatory - Rejection Rate <<<\n")
+# --- 1. Rejection Rate (GLMM - Binomial) ---
+cat(sprintf("\n>>> Running: Confirmatory - Rejection Rate [%s] <<<\n", experiment_version))
 m_type_rej <- run_robust_model(
-  formula_str = "is_reject ~ emotion * offer_type + (1 | participant_id) + (0 + emotion | participant_id) + (0 + offer_type | participant_id) + (0 + emotion:offer_type | participant_id)",
+  formula_str = "is_reject ~ emotion * offer_type + (1 + emotion * offer_type | participant_id)",
   data = df_type, 
   family_type = "binomial", 
   fixed_terms = ~ emotion * offer_type
 )
 generate_report(m_type_rej, "Type_Rejection_Rate", c("emotion", "offer_type"), df_type)
 
-# --- 2. Response Time ---
-cat("\n>>> Running: Confirmatory - Response Time <<<\n")
+# --- 2. Response Time (LMM - Gaussian) ---
+cat(sprintf("\n>>> Running: Confirmatory - Response Time [%s] <<<\n", experiment_version))
 m_type_rt <- run_robust_model(
-  formula_str = "logRT ~ emotion * offer_type + (1 | participant_id) + (0 + emotion | participant_id) + (0 + offer_type | participant_id) + (0 + emotion:offer_type | participant_id)",
+  formula_str = "logRT ~ emotion * offer_type + (1 + emotion * offer_type | participant_id)",
   data = df_type, 
   family_type = "gaussian", 
   fixed_terms = ~ emotion * offer_type
@@ -415,17 +427,19 @@ m_type_rt <- run_robust_model(
 generate_report(m_type_rt, "Type_Response_Time", c("emotion", "offer_type"), df_type)
 
 # ------------------------------------------------------------------------------
-# --- 3. Robustness Check: Cross-Experiment Random Effects Validation ---
+# --- 3. Robustness Check: Testing Sub-Maximal Structural Constraints ---
 # ------------------------------------------------------------------------------
-cat("\n>>> Running: Robustness Check (Cross-Experiment Model Comparison) <<<\n")
-robust_dir <- "Robustness_Check_CrossExp"
+# Methodological Note: This section manually evaluates structural variations 
+# to explicitly test constraints that automated buildmer algorithms might resolve implicitly.
+cat(sprintf("\n>>> Running: Robustness Check (Explicit Model Comparison) [%s] <<<\n", experiment_version))
+robust_dir <- "Robustness_Check_Structural"
 
 m_forced_1 <- glmmTMB(
   is_reject ~ emotion * offer_type + (1 + offer_type | participant_id),
   data = df_type, 
   family = binomial()
 )
-generate_report(m_forced_1, file.path(robust_dir, "Model_E1_Structure"), c("emotion", "offer_type"), df_type)
+generate_report(m_forced_1, file.path(robust_dir, "Model_A_Structure"), c("emotion", "offer_type"), df_type)
 
 m_forced_2 <- tryCatch({
   glmmTMB(
@@ -434,49 +448,48 @@ m_forced_2 <- tryCatch({
     family = binomial()
   )
 }, warning = function(w) {
-  cat("   [Warning] Model fit anomaly (e.g., singular fit) detected:", conditionMessage(w), "\n")
-  cat("   [Fallback] Applying zero-correlation parameterization to resolve overparameterization...\n")
+  cat("   [Warning] Singular fit detected, applying ZCP fallback...\n")
   glmmTMB(
     is_reject ~ emotion * offer_type + (1 | participant_id) + (0 + emotion | participant_id) + (0 + offer_type | participant_id),
     data = df_type, 
     family = binomial()
   )
 }, error = function(e) {
-  cat("   [Error] Severe convergence failure:", conditionMessage(e), "\n")
+  cat("   [Error] Severe convergence failure.\n")
   return(NULL)
 })
 
 if(!is.null(m_forced_2)) {
-  generate_report(m_forced_2, file.path(robust_dir, "Model_E2_Structure"), c("emotion", "offer_type"), df_type)
-  cat("\n   [INFO] Likelihood Ratio Test (Model 1 vs. Model 2):\n")
+  generate_report(m_forced_2, file.path(robust_dir, "Model_B_Structure"), c("emotion", "offer_type"), df_type)
+  cat("\n   [INFO] Likelihood Ratio Test (Nested Structural Comparison):\n")
   lrt_results <- anova(m_forced_1, m_forced_2)
   print(lrt_results)
-  lrt_out_path <- file.path(path_out_root, robust_dir, "LRT_Model_Comparison.txt")
+  
+  lrt_out_path <- file.path(path_out_root, robust_dir, paste0("LRT_Model_Comparison_", experiment_version, ".txt"))
   capture.output(print(lrt_results), file = lrt_out_path)
 }
-
 
 ```
 
 # 6. Exploratory Analysis: Offer Ratio (Full Spectrum)
 
-This section treats the full 5-level offer ratio as an exploratory analysis. Because the fixed effects matrix entails 25 unique interactions ($5 \times 5$), computing exact degrees of freedom via matrix inversion causes computational singularity. To resolve this, we enforce asymptotic approximation (z-tests).
+This section treats the 5-level continuous-like proxy (`offer_ratio`) strictly as a categorical interaction ($5 \times 5 = 25$ unique cells). Because precise variance-covariance matrix inversion across 25 factor combinations frequently triggers numerical singularity and memory exhaustion, we enforce asymptotic approximation algorithms ($z$-tests).
 
 ```{r analysis-ratio}
-# [CONFIG DYNAMIC SHIFT]: Revert to asymptotic mode (z-tests) to prevent matrix 
-# singularity and memory crashes on high-dimensional exploratory models.
+# Methodological Note (Singularity Protection):
+# Reducing the limit triggers asymptotic distributions (infinite DF) in `emmeans`, 
+# bypassing computationally explosive Satterthwaite matrix inversions in high-dimensional grids.
 emmeans::emm_options(lmerTest.limit = 3000, pbkrtest.limit = 3000)
-cat(">>> Configured emmeans: Asymptotic z-tests enabled for Exploratory Analysis (Singularity Protection).\n")
+cat(">>> Configured emmeans: Asymptotic approximations enabled for Exploratory Analysis.\n")
 
-# Subset Data
 df_ratio <- df_clean %>% droplevels()
 contrasts(df_ratio$offer_ratio) <- contr.sum
 contrasts(df_ratio$emotion) <- contr.sum
 
 # --- 1. Rejection Rate ---
-cat("\n>>> Running: Exploratory - Offer Ratio Rejection Rate <<<\n")
+cat(sprintf("\n>>> Running: Exploratory - Offer Ratio Rejection Rate [%s] <<<\n", experiment_version))
 m_ratio_rej <- run_robust_model(
-  formula_str = "is_reject ~ emotion * offer_ratio + (1 | participant_id) + (0 + emotion | participant_id) + (0 + offer_ratio | participant_id) + (0 + emotion:offer_ratio | participant_id)",
+  formula_str = "is_reject ~ emotion * offer_ratio + (1 + emotion * offer_ratio | participant_id)",
   data = df_ratio, 
   family_type = "binomial", 
   fixed_terms = ~ emotion * offer_ratio
@@ -484,15 +497,14 @@ m_ratio_rej <- run_robust_model(
 generate_report(m_ratio_rej, "Ratio_Rejection_Rate", c("emotion", "offer_ratio"), df_ratio)
 
 # --- 2. Response Time ---
-cat("\n>>> Running: Exploratory - Offer Ratio Response Time <<<\n")
+cat(sprintf("\n>>> Running: Exploratory - Offer Ratio Response Time [%s] <<<\n", experiment_version))
 m_ratio_rt <- run_robust_model(
-  formula_str = "logRT ~ emotion * offer_ratio + (1 | participant_id) + (0 + emotion | participant_id) + (0 + offer_ratio | participant_id) + (0 + emotion:offer_ratio | participant_id)",
+  formula_str = "logRT ~ emotion * offer_ratio + (1 + emotion * offer_ratio | participant_id)",
   data = df_ratio, 
   family_type = "gaussian", 
   fixed_terms = ~ emotion * offer_ratio
 )
 generate_report(m_ratio_rt, "Ratio_Response_Time", c("emotion", "offer_ratio"), df_ratio)
-
 
 ```
 
@@ -506,18 +518,17 @@ df_unfair <- df_clean %>%
 if(nrow(df_unfair) > 50) {
   contrasts(df_unfair$emotion) <- contr.sum
   
-  cat("\n>>> Running: Exploratory - Unfair Rejection RT <<<\n")
+  cat(sprintf("\n>>> Running: Exploratory - Unfair Rejection RT [%s] <<<\n", experiment_version))
   m_unfair <- run_robust_model(
-    formula_str = "logRT ~ emotion + (1 | participant_id) + (0 + emotion | participant_id)",
+    formula_str = "logRT ~ emotion + (1 + emotion | participant_id)",
     data = df_unfair,
     family_type = "gaussian",
     fixed_terms = ~ emotion
   )
   generate_report(m_unfair, "Unfair_Rejection_RT", c("emotion"), df_unfair)
 } else {
-  cat("Skipped Unfair Analysis (Insufficient Data)\n")
+  cat(sprintf("Skipped Unfair Analysis for %s (Insufficient Data: Model untestable)\n", experiment_version))
 }
-
 
 ```
 
@@ -525,7 +536,6 @@ if(nrow(df_unfair) > 50) {
 
 ```{r session}
 sessionInfo()
-
 
 ```
 

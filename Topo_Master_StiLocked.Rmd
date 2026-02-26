@@ -12,9 +12,8 @@ output:
     theme: flatly
 ---
 
-``` {r setup, include=FALSE}
+```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
-
 
 ```
 
@@ -25,7 +24,8 @@ knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
 # 1.1 GLOBAL DIRECTORY & PIPELINE CONFIGURATION
 # ==============================================================================
 
-# [EXPERIMENT ID] Matches upstream Python pre-processing output nomenclature.
+# [EXPERIMENT ID] Toggle between "E1" and "E2". 
+# Matches upstream Python pre-processing output nomenclature automatically.
 experiment_id <- "E2" 
 
 # [PROJECT ROOT] Parent directory containing all component-specific subdirectories.
@@ -48,45 +48,62 @@ if (!require("eegUtils")) {
 # ==============================================================================
 # 1.3 COMPONENT & SPATIOTEMPORAL DEFINITIONS
 # ==============================================================================
+# Fully synchronized with preprocessing and visualization parameters
 component_specs <- list(
   
   # --- Confirmatory Components (A Priori Defined) ---
+  N170 = list(
+    win_ms = c(150, 200),            
+    roi = c("P7", "P8", "PO7", "PO8"),
+    source_comp = "N170"
+  ),
   FRN = list(
     win_ms = c(250, 300),            
     roi = c("F3", "Fz", "F4", "FC1", "FC2", "Cz"),
     source_comp = "FRN"
   ),
-  LPP = list(
-    win_ms = c(500, 800),            
-    roi = c("Pz", "Cz", "C1", "C2", "CP1", "CP2"),
-    source_comp = "LPP"
+  P2 = list(
+    win_ms = c(200, 300),            
+    roi = c("PO3", "POz", "PO4", "O1", "Oz", "O2"),
+    source_comp = "P2"
   ),
   N400 = list(
     win_ms = c(350, 450),            
     roi = c("Fz", "Cz", "CPz", "Pz"),
     source_comp = "N400"
   ),
+  LPP = list(
+    win_ms = c(500, 800),            
+    roi = c("Pz", "Cz", "C1", "C2", "CP1", "CP2"),
+    source_comp = "LPP"
+  ),
   
   # --- Exploratory / Methodological Test Components ---
+  # Used for alternative temporal slicing without re-running regressions
+  testN170 = list(
+    win_ms = c(150, 350), 
+    roi = c("P7", "P8", "PO7", "PO8"),
+    source_comp = "N170"
+  ),
   testFRN = list(
     win_ms = c(200, 250), 
     roi = c("F3", "Fz", "F4", "FC1", "FC2", "Cz"),
     source_comp = "FRN"
   ),
-  testLPP = list(
-    win_ms = c(600, 900), 
-    roi = c("Pz", "Cz", "C1", "C2", "CP1", "CP2"),
-    source_comp = "LPP"
+  testP2 = list(
+    win_ms = c(200, 400), 
+    roi = c("PO3", "POz", "PO4", "O1", "Oz", "O2"),
+    source_comp = "P2"
   ),
   testN400 = list(
     win_ms = c(300, 500), 
     roi = c("Fz", "Cz", "CPz", "Pz"),
     source_comp = "N400"
   ),
-  testN170 = list(
-    win_ms = c(150, 350), 
-    roi = c("P7", "P8", "PO7", "PO8"),
-    source_comp = "FRN" 
+  testLPP = list(
+    win_ms = c(400, 600), 
+    roi = c("Pz", "Cz", "C1", "C2", "CP1", "CP2"),
+    source_comp = "LPP"
   )
 )
 
@@ -95,7 +112,6 @@ emotion_list <- c("aff", "dis", "dom", "enj")
 offer_types  <- c("fair", "unfair")
 
 cat(sprintf("Pipeline Initialized.\nTarget Experiment: %s\nData Root: %s\n", experiment_id, root_dir))
-
 
 ```
 
@@ -149,7 +165,6 @@ plot_topo_unified <- function(dat_long, chan_locs, roi,
   
   return(p)
 }
-
 
 ```
 
@@ -545,6 +560,4 @@ for (comp_name in names(component_specs)) {
   gc(verbose = FALSE)
 }
 
-
 ```
-

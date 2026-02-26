@@ -1,6 +1,6 @@
 ---
 title: "Exp 1 & 2 ERP Statistical Analysis: Regression-Based Baseline Correction"
-subtitle: "Method: LMM (F-Tests via Satterthwaite) with Decomposed Random Slopes & APA Reporting"
+subtitle: "Method: LMM (F-Tests via Satterthwaite) with Data-Driven Maximal Random Structure & APA Reporting"
 author: "Project Research Team"
 date: "`r Sys.Date()`"
 output: 
@@ -13,24 +13,28 @@ output:
     fig_height: 6
 ---
 
-``` {r setup, include=FALSE}
+```{r setup, include=FALSE}
 # ==============================================================================
 # 1. Global Configuration & Environment
 # ==============================================================================
 knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
 options(scipen = 999, digits = 4)
 
-# [CRITICAL] Sum-to-zero contrasts for valid Type III ANOVA results
+# Options configuration: Sum-to-zero contrasts for valid Type III ANOVA results 
+# and valid zero-correlation parameterizations.
 options(contrasts = c("contr.sum", "contr.poly"))
 
 # ------------------------------------------------------------------------------
-# [USER CONFIGURATION] Global Settings & Analysis Targets
+# Global Settings & Analysis Targets
 # ------------------------------------------------------------------------------
 experiment_version <- "E2"  # Options: "E1" or "E2"
 
 # Component definitions. Format: c("Component_Name" = Include_Covariate_Boolean)
+# Synchronized with preprocessing output (N170, FRN, P2, N400, LPP_offer).
 analyze_stim_components <- c(
+  "N170"      = TRUE,
   "FRN"       = TRUE,
+  "P2"        = TRUE,
   "N400"      = TRUE,
   "LPP_offer" = TRUE
 )
@@ -52,10 +56,10 @@ pacman::p_load(
   openxlsx                                     # Excel Reporting
 )
 
-# [CONFIG] Force calculation of Denominator DF
+# Configuration: Force calculation of Denominator DF
 emmeans::emm_options(lmerTest.limit = 50000, pbkrtest.limit = 50000)
 
-# [PATH] Dynamic Output Directory
+# Path definition: Dynamic Output Directory
 out_root <- here("results", "EEG", paste0(experiment_version, "_Stats_Regression_Method"))
 if(!dir.exists(out_root)) dir.create(out_root, recursive = TRUE)
 
@@ -75,9 +79,9 @@ custom_control <- lmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 2000
 
 ```
 
-``` {r apa-module}
+```{r apa-module}
 # ==============================================================================
-# Helper: Format ANOVA F-Table to APA String
+# Helper Function: Format ANOVA F-Table to APA String
 # ==============================================================================
 format_anova_apa <- function(anova_obj) {
   df_res <- as.data.frame(anova_obj) %>% tibble::rownames_to_column("Effect")
@@ -118,7 +122,7 @@ format_anova_apa <- function(anova_obj) {
 }
 
 # ==============================================================================
-# Helper: Format Post-hoc tests (with CI)
+# Helper Function: Format Post-hoc tests (with CI)
 # ==============================================================================
 format_posthoc_apa <- function(emm_df) {
   df_clean <- as.data.frame(emm_df)
@@ -136,11 +140,10 @@ format_posthoc_apa <- function(emm_df) {
 }
 
 # ==============================================================================
-# Helper: Format Raw Coefficients (Adapted from Behavioral Script)
+# Helper Function: Format Raw Coefficients 
 # ==============================================================================
 format_coefs <- function(model) {
   tryCatch({
-    # parameters package extracts standardized outputs including 95% CIs
     params <- parameters::model_parameters(model, ci = 0.95, effects = "fixed")
     df_params <- as.data.frame(params)
     
@@ -151,7 +154,6 @@ format_coefs <- function(model) {
       Report = sprintf("b = %.2f, SE = %.2f, %s = %.2f, p %s", Coefficient, SE, stat_col, !!sym(stat_col), p_str)
     )
   }, error = function(e) {
-    # Fallback if parameters extraction fails
     coef_df <- as.data.frame(summary(model)$coefficients) %>% tibble::rownames_to_column("Predictor")
     return(coef_df)
   })
@@ -159,9 +161,9 @@ format_coefs <- function(model) {
 
 ```
 
-``` {r prep-functions}
+```{r prep-functions}
 # ==============================================================================
-# Data Loading & Cleaning
+# Data Loading & Cleaning Functions
 # ==============================================================================
 standardize_id <- function(ids) sprintf("Vp%04d", as.numeric(str_extract(ids, "\\d+")))
 
@@ -218,59 +220,81 @@ check_uniqueness <- function(df, context_name) {
 
 ```
 
-``` {r stats-engine}
+```{r stats-engine}
 # ==============================================================================
-# Analytical Engine
+# Analytical Engine: Linear Mixed-Effects Modeling
 # ==============================================================================
 run_regression_analysis <- function(data, erp_name, out_dir, exp_version, use_svo = FALSE) {
   
   sub_dir <- file.path(out_dir, erp_name)
-  if(!dir.exists(sub_dir)) dir.create(sub_dir)
+  if(!dir.exists(sub_dir)) dir.create(sub_dir, recursive = TRUE)
   
-  cat(sprintf("\n>>> Analyzing Component: %s [%s] (Subjects: %d)\n", erp_name, exp_version, n_distinct(data$participant_id)))
+  cat(sprintf("\n>>> Analyzing Component: %s [%s] (N = %d)\n", 
+              erp_name, exp_version, n_distinct(data$participant_id)))
   
-  # --- Step 1: Baseline Logic Definition (Experiment Specific) ---
+  # ----------------------------------------------------------------------------
+  # Baseline Logic & Fixed Effects Specification
+  # ----------------------------------------------------------------------------
+  # Methodological definition:
+  # E1 incorporates baseline as an interaction term.
+  # E2 utilizes additive baseline correction.
   if (exp_version == "E1") {
     baseline_formula <- "+ emotion * Baseline_c" 
   } else if (exp_version == "E2") {
     baseline_formula <- "+ Baseline_c"
   } else {
-    stop("Unknown experiment_version. Please configure as 'E1' or 'E2'.")
+    stop("Configuration Error: Unknown experiment_version. Must be 'E1' or 'E2'.")
   }
 
   fixed_effects <- paste0(erp_name, " ~ emotion * offer_type ", baseline_formula)
   if(use_svo && "SVO_Z" %in% names(data)) {
-    cat("   [Config] Including SVO Moderation in initial model...\n")
+    cat("   [Config] Including continuous SVO moderation in structural model...\n")
     fixed_effects <- paste0(erp_name, " ~ emotion * offer_type * SVO_Z ", baseline_formula)
   }
 
-  # --- Step 2: Random Structure Assignment ---
-  cat("   [Phase 1] Optimizing Random Structure (bobyqa)...\n")
-  random_structure <- "+ (1 | participant_id) + (0 + emotion | participant_id) + (0 + offer_type | participant_id) + (0 + emotion:offer_type | participant_id)"
+  # ----------------------------------------------------------------------------
+  # Random Effects Structure Optimization (Data-Driven Maximal Approach)
+  # ----------------------------------------------------------------------------
+  # Methodological definition:
+  # Initialized with maximum random effects structure (Barr et al., 2013).
+  # Reduced via backward stepwise elimination using LRT to prevent singular fits.
   
-  f_buildmer <- as.formula(paste(fixed_effects, random_structure))
+  cat("   [Phase 1] Optimizing Random Structure via backward LRT...\n")
   
-  bm_res <- buildmer::buildmer(f_buildmer, data = data,
+  random_maximal <- "+ (1 + emotion * offer_type | participant_id)"
+  f_buildmer <- as.formula(paste(fixed_effects, random_maximal))
+  
+  bm_res <- buildmer::buildmer(
+    formula = f_buildmer, 
+    data = data,
     buildmerControl = buildmerControl(
-        include = as.formula(paste("~", str_split(fixed_effects, "~")[[1]][2])),
-        direction = c("order", "backward"), crit = "LRT", quiet = TRUE,
-        args = list(control = custom_control)
-    ))
+      include = as.formula(paste("~", str_split(fixed_effects, "~")[[1]][2])),
+      direction = c("order", "backward"), 
+      crit = "LRT", 
+      quiet = TRUE,
+      args = list(control = custom_control)
+    )
+  )
   
-  # --- Step 3: Final Fit & Inference ---
-  cat("   [Phase 2] Final Fit (REML) & F-Tests...\n")
+  # ----------------------------------------------------------------------------
+  # Final Model Fit & Inferential Statistics
+  # ----------------------------------------------------------------------------
+  cat("   [Phase 2] Fitting final optimized model (REML)...\n")
   final_formula <- formula(bm_res@model)
+  
   FINAL_MODEL <- lmer(final_formula, data = data, REML = TRUE, control = custom_control)
   
   formula_str <- paste(deparse(final_formula), collapse = " ")
-  cat("\n   [FINAL MODEL FORMULA]:\n   ", formula_str, "\n\n")
+  cat("\n   [FINAL MODEL FORMULA]:\n   ", str_squish(formula_str), "\n\n")
 
   anova_res <- anova(FINAL_MODEL, type = 3, ddf = "Satterthwaite")
   anova_apa <- format_anova_apa(anova_res)
   print(anova_apa %>% select(Effect, APA_Report))
 
-  # --- Step 4: Robust Post-hoc Strategy (Adapted from Behavioral Script) ---
-  cat("   [Phase 3] Post-hoc Analysis (Bidirectional & FDR)...\n")
+  # ----------------------------------------------------------------------------
+  # Post-hoc Interactions & Simple Effects
+  # ----------------------------------------------------------------------------
+  cat("   [Phase 3] Marginal Means & Post-hoc Contrasts (FDR corrected)...\n")
   
   target_term <- "emotion:offer_type"
   svo_survived <- FALSE
@@ -279,13 +303,11 @@ run_regression_analysis <- function(data, erp_name, out_dir, exp_version, use_sv
     svo_survived <- TRUE
   }
   
-  # Extract p-value of the highest-order interaction
   p_int <- anova_res[target_term, "Pr(>F)"]
   if(is.na(p_int)) p_int <- 1.0
   
-  # Anchor EMMs calculation at the mean of continuous covariates
   at_list <- list(Baseline_c = 0)
-  if(svo_survived) at_list$SVO_Z <- c(-1, 1)
+  if(svo_survived) at_list$SVO_Z <- c(-1, 1) 
   
   list_of_tables <- list(
     "ANOVA_Main" = anova_apa, 
@@ -293,40 +315,36 @@ run_regression_analysis <- function(data, erp_name, out_dir, exp_version, use_sv
     "Model_Coefficients" = format_coefs(FINAL_MODEL)
   )
   
-  # Logic branching based on interaction significance
   if (p_int < 0.05) {
-    cat("      -> Interaction SIG (p < .05). Computing bidirectional simple effects (FDR).\n")
-    
-    # 1. Simple effect of Offer Type within each Emotion
-    res_off_by_emo <- pairs(emmeans(FINAL_MODEL, as.formula("~ offer_type | emotion"), at = at_list), adjust="fdr")
-    list_of_tables[["Simple_Offer_by_Emotion"]] <- format_posthoc_apa(res_off_by_emo)
-    
-    # 2. Simple effect of Emotion within each Offer Type
-    res_emo_by_off <- pairs(emmeans(FINAL_MODEL, as.formula("~ emotion | offer_type"), at = at_list), adjust="fdr")
-    list_of_tables[["Simple_Emotion_by_Offer"]] <- format_posthoc_apa(res_emo_by_off)
-    
+    cat("      -> Significant Interaction detected. Decomposing bidirectional simple effects.\n")
+    list_of_tables[["Simple_Offer_by_Emotion"]] <- format_posthoc_apa(
+      pairs(emmeans(FINAL_MODEL, as.formula("~ offer_type | emotion"), at = at_list), adjust="fdr")
+    )
+    list_of_tables[["Simple_Emotion_by_Offer"]] <- format_posthoc_apa(
+      pairs(emmeans(FINAL_MODEL, as.formula("~ emotion | offer_type"), at = at_list), adjust="fdr")
+    )
   } else {
-    cat("      -> Interaction NS (p >= .05). Computing Main Effects (FDR).\n")
+    cat("      -> No robust interaction detected. Reporting Main Effects.\n")
+    list_of_tables[["Main_Effect_Offer"]] <- format_posthoc_apa(
+      pairs(emmeans(FINAL_MODEL, ~ offer_type, at = at_list), adjust="fdr")
+    )
+    list_of_tables[["Main_Effect_Emotion"]] <- format_posthoc_apa(
+      pairs(emmeans(FINAL_MODEL, ~ emotion, at = at_list), adjust="fdr")
+    )
     
-    # Main effect of Offer Type
-    res_main_off <- pairs(emmeans(FINAL_MODEL, ~ offer_type, at = at_list), adjust="fdr")
-    list_of_tables[["Main_Effect_Offer"]] <- format_posthoc_apa(res_main_off)
-    
-    # Main effect of Emotion
-    res_main_emo <- pairs(emmeans(FINAL_MODEL, ~ emotion, at = at_list), adjust="fdr")
-    list_of_tables[["Main_Effect_Emotion"]] <- format_posthoc_apa(res_main_emo)
-    
-    # Exploratory analysis for marginally significant interactions
     if (p_int < 0.10) {
-      cat("      -> Interaction Marginal (p < .10). Adding uncorrected exploratory effects.\n")
-      res_expl <- pairs(emmeans(FINAL_MODEL, as.formula("~ offer_type | emotion"), at = at_list), adjust="none")
-      list_of_tables[["Exploratory_Simple_Offer"]] <- format_posthoc_apa(res_expl)
+      cat("      -> Marginal Interaction detected (p < .10). Adding uncorrected exploratory effects.\n")
+      list_of_tables[["Exploratory_Simple_Offer"]] <- format_posthoc_apa(
+        pairs(emmeans(FINAL_MODEL, as.formula("~ offer_type | emotion"), at = at_list), adjust="none")
+      )
     }
   }
 
   list_of_tables[["Descriptive_Means_SE"]] <- as.data.frame(emmeans(FINAL_MODEL, ~ offer_type * emotion, at = list(Baseline_c = 0)))
   
-  # --- Step 5: Export to Excel ---
+  # ----------------------------------------------------------------------------
+  # Data Export & Visualization
+  # ----------------------------------------------------------------------------
   wb <- createWorkbook()
   for(sheet_name in names(list_of_tables)) {
     safe_sheet_name <- substr(gsub("[^A-Za-z0-9_]", "_", sheet_name), 1, 31)
@@ -336,8 +354,7 @@ run_regression_analysis <- function(data, erp_name, out_dir, exp_version, use_sv
   }
   saveWorkbook(wb, file.path(sub_dir, paste0("STATS_REPORT_", exp_version, "_", erp_name, ".xlsx")), overwrite = TRUE)
 
-  # --- Step 6: Visualization ---
-  cat("   [Phase 4] Visualization...\n")
+  cat("   [Phase 4] Generating diagnostic and interaction plots...\n")
   try({
     p_forest <- sjPlot::plot_model(FINAL_MODEL, type = "est", show.values = TRUE, show.p = TRUE, 
                                    title = paste(exp_version, erp_name, "Coefficients")) + theme_bw()
@@ -346,13 +363,13 @@ run_regression_analysis <- function(data, erp_name, out_dir, exp_version, use_sv
 
   if(svo_survived) {
       pd <- as.data.frame(emmeans(FINAL_MODEL, ~ offer_type * emotion * SVO_Z, at = at_list))
-      pd$SVO_Group <- factor(pd$SVO_Z, labels=c("Low SVO", "High SVO"))
+      pd$SVO_Group <- factor(pd$SVO_Z, labels=c("Low SVO (-1SD)", "High SVO (+1SD)"))
       p_final <- ggplot(pd, aes(x = emotion, y = emmean, color = offer_type, group = offer_type)) +
            facet_wrap(~SVO_Group) + geom_line(linewidth=1.2, position=position_dodge(0.2)) + 
            geom_point(size=3, position=position_dodge(0.2)) +
            geom_errorbar(aes(ymin=emmean-SE, ymax=emmean+SE), width=0.2, position=position_dodge(0.2)) +
            scale_color_manual(values = colors_off, labels = labels_off) +
-           labs(title = paste(exp_version, erp_name, "by SVO"), y = "Amplitude (µV)")
+           labs(title = paste(exp_version, erp_name, "by SVO Moderation"), y = "Amplitude (µV)", x = "Emotion Condition")
   } else {
       pd <- as.data.frame(emmeans(FINAL_MODEL, ~ offer_type * emotion, at = list(Baseline_c = 0)))
       p_final <- ggplot(pd, aes(x = emotion, y = emmean, color = offer_type, group = offer_type)) +
@@ -360,16 +377,16 @@ run_regression_analysis <- function(data, erp_name, out_dir, exp_version, use_sv
            geom_point(size=3.5, shape=21, fill="white", stroke=2, position=position_dodge(0.2)) +
            geom_errorbar(aes(ymin=emmean-SE, ymax=emmean+SE), width=0.2, position=position_dodge(0.2)) +
            scale_color_manual(values = colors_off, labels = labels_off) + scale_x_discrete(labels = labels_emo) +
-           labs(title = paste(exp_version, erp_name, "Interaction Effect"), y = "Amplitude (µV)", x = NULL)
+           labs(title = paste(exp_version, erp_name, "Interaction Effect"), y = "Amplitude (µV)", x = "Emotion Condition")
   }
   ggsave(file.path(sub_dir, paste0("Plot_", exp_version, "_Main.png")), p_final, width = 8, height = 6)
   
-  cat("   >>> Analysis Finished.\n")
+  cat("   >>> Analysis Complete.\n")
 }
 
 ```
 
-``` {r execution}
+```{r execution}
 # ==============================================================================
 # Execution Phase
 # ==============================================================================
@@ -387,7 +404,7 @@ cat("--- Loading Covariates ---\n")
 df_covs <- load_covariates(path_cov)
 
 # ------------------------------------------------------------------------------
-# 1. Stimulus-Locked Analysis (Dynamic Loop)
+# Stimulus-Locked Analysis (Dynamic Loop)
 # ------------------------------------------------------------------------------
 if(file.exists(path_stim)) {
   cat("\n=== Processing Stimulus-Locked Components ===\n")
@@ -405,7 +422,7 @@ if(file.exists(path_stim)) {
 }
 
 # ------------------------------------------------------------------------------
-# 2. Response-Locked Analysis (Dynamic Loop)
+# Response-Locked Analysis (Dynamic Loop)
 # ------------------------------------------------------------------------------
 if(file.exists(path_resp) && file.exists(path_stim)) {
   cat("\n=== Processing Response-Locked Components ===\n")
