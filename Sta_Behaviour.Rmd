@@ -63,13 +63,14 @@ cat(sprintf(">>> INPUT PATH DETECTED: %s\n", path_input))
 cat(sprintf(">>> OUTPUT PATH: %s\n", path_out_root))
 
 
+
 ```
 
 # 1. Methodology
 
 This analysis employs **Linear Mixed-Effects Models (LMM)** for continuous response times and **Generalized Linear Mixed-Effects Models (GLMM)** for binary decision outcomes (e.g., Rejection Rates). The analysis is dynamically configured for **`r experiment_version`**.
 
-* **Random Effects Optimization**: To balance Type I error control and statistical power, we follow Matuschek et al. (2017) and Barr et al. (2013). Models are initialized with a strictly maximal random effects structure. The `buildmer` package is utilized to perform backward stepwise elimination via Likelihood Ratio Tests (LRT). Nonsignificant random slopes and covariance parameters are sequentially removed until a maximal-justifiable (parsimonious) and convergent structure is achieved. Fixed effects are strictly protected to preserve hypothesis testing integrity.
+* **Random Effects Optimization**: To balance Type I error control and statistical power, we follow Matuschek et al. (2017) and Barr et al. (2013). Models are initialized with a strictly maximal random effects structure utilizing Zero-Correlation Parameterization (ZCP) to prevent singular fits in complex factorial designs. The `buildmer` package is utilized to perform backward stepwise elimination via Likelihood Ratio Tests (LRT). Nonsignificant random slopes and covariance parameters are sequentially removed until a maximal-justifiable (parsimonious) and convergent structure is achieved. Fixed effects are strictly protected.
 * **Inferential Statistics**: For LMMs, we report Type III ANOVA $F$-statistics with Satterthwaite's approximation for degrees of freedom. For binomial GLMMs, we report Type III Wald $\chi^2$ statistics (infinite denominator degrees of freedom).
 * **Post-hoc Analysis**: Simple and main effects are adjusted using the False Discovery Rate (FDR) procedure. For high-dimensional exploratory models, asymptotic approximations ($z$-tests) are employed to prevent computational singularity.
 
@@ -184,6 +185,7 @@ format_coefs <- function(model) {
     as.data.frame(coef_df) %>% tibble::rownames_to_column("Predictor")
   })
 }
+
 
 ```
 
@@ -325,6 +327,7 @@ generate_report <- function(model, label, factors, data_used) {
   cat(paste0("      [Export] Final Excel Generated: ", basename(save_path), "\n"))
 }
 
+
 ```
 
 # 4. Data Import & Cleaning
@@ -385,11 +388,12 @@ contrasts(df_clean$offer_ratio) <- contr.sum
 
 cat("N Trials for Analysis:", nrow(df_clean), "\n")
 
+
 ```
 
 # 5. Confirmatory Analysis: Offer Type (Fair vs. Unfair)
 
-This section executes our primary hypothesis testing. The model initiates with the strictly maximal random structure `(1 + emotion * offer_type | participant_id)` and reduces iteratively. Because the parameter space is constrained ($5 \times 2$ matrix), full Satterthwaite degrees of freedom are computationally viable.
+This section executes our primary hypothesis testing. The model initiates with a maximal zero-correlation parameterization structure to ensure convergence while protecting critical random slopes.
 
 ```{r analysis-type}
 # Methodological Note: 
@@ -409,7 +413,8 @@ contrasts(df_type$emotion) <- contr.sum
 # --- 1. Rejection Rate (GLMM - Binomial) ---
 cat(sprintf("\n>>> Running: Confirmatory - Rejection Rate [%s] <<<\n", experiment_version))
 m_type_rej <- run_robust_model(
-  formula_str = "is_reject ~ emotion * offer_type + (1 + emotion * offer_type | participant_id)",
+  # Modified to Zero-Correlation Parameterization
+  formula_str = "is_reject ~ emotion * offer_type + (1 | participant_id) + (0 + emotion | participant_id) + (0 + offer_type | participant_id) + (0 + emotion:offer_type | participant_id)",
   data = df_type, 
   family_type = "binomial", 
   fixed_terms = ~ emotion * offer_type
@@ -419,7 +424,8 @@ generate_report(m_type_rej, "Type_Rejection_Rate", c("emotion", "offer_type"), d
 # --- 2. Response Time (LMM - Gaussian) ---
 cat(sprintf("\n>>> Running: Confirmatory - Response Time [%s] <<<\n", experiment_version))
 m_type_rt <- run_robust_model(
-  formula_str = "logRT ~ emotion * offer_type + (1 + emotion * offer_type | participant_id)",
+  # Modified to Zero-Correlation Parameterization
+  formula_str = "logRT ~ emotion * offer_type + (1 | participant_id) + (0 + emotion | participant_id) + (0 + offer_type | participant_id) + (0 + emotion:offer_type | participant_id)",
   data = df_type, 
   family_type = "gaussian", 
   fixed_terms = ~ emotion * offer_type
@@ -429,8 +435,6 @@ generate_report(m_type_rt, "Type_Response_Time", c("emotion", "offer_type"), df_
 # ------------------------------------------------------------------------------
 # --- 3. Robustness Check: Testing Sub-Maximal Structural Constraints ---
 # ------------------------------------------------------------------------------
-# Methodological Note: This section manually evaluates structural variations 
-# to explicitly test constraints that automated buildmer algorithms might resolve implicitly.
 cat(sprintf("\n>>> Running: Robustness Check (Explicit Model Comparison) [%s] <<<\n", experiment_version))
 robust_dir <- "Robustness_Check_Structural"
 
@@ -469,11 +473,12 @@ if(!is.null(m_forced_2)) {
   capture.output(print(lrt_results), file = lrt_out_path)
 }
 
+
 ```
 
 # 6. Exploratory Analysis: Offer Ratio (Full Spectrum)
 
-This section treats the 5-level continuous-like proxy (`offer_ratio`) strictly as a categorical interaction ($5 \times 5 = 25$ unique cells). Because precise variance-covariance matrix inversion across 25 factor combinations frequently triggers numerical singularity and memory exhaustion, we enforce asymptotic approximation algorithms ($z$-tests).
+This section treats the 5-level continuous-like proxy (`offer_ratio`) strictly as a categorical interaction ($5 \times 5 = 25$ unique cells). Because precise variance-covariance matrix inversion across 25 factor combinations frequently triggers numerical singularity and memory exhaustion, we enforce ZCP structures combined with asymptotic approximation algorithms ($z$-tests).
 
 ```{r analysis-ratio}
 # Methodological Note (Singularity Protection):
@@ -489,7 +494,8 @@ contrasts(df_ratio$emotion) <- contr.sum
 # --- 1. Rejection Rate ---
 cat(sprintf("\n>>> Running: Exploratory - Offer Ratio Rejection Rate [%s] <<<\n", experiment_version))
 m_ratio_rej <- run_robust_model(
-  formula_str = "is_reject ~ emotion * offer_ratio + (1 + emotion * offer_ratio | participant_id)",
+  # Modified to Zero-Correlation Parameterization for 5x5 design
+  formula_str = "is_reject ~ emotion * offer_ratio + (1 | participant_id) + (0 + emotion | participant_id) + (0 + offer_ratio | participant_id) + (0 + emotion:offer_ratio | participant_id)",
   data = df_ratio, 
   family_type = "binomial", 
   fixed_terms = ~ emotion * offer_ratio
@@ -499,12 +505,14 @@ generate_report(m_ratio_rej, "Ratio_Rejection_Rate", c("emotion", "offer_ratio")
 # --- 2. Response Time ---
 cat(sprintf("\n>>> Running: Exploratory - Offer Ratio Response Time [%s] <<<\n", experiment_version))
 m_ratio_rt <- run_robust_model(
-  formula_str = "logRT ~ emotion * offer_ratio + (1 + emotion * offer_ratio | participant_id)",
+  # Modified to Zero-Correlation Parameterization for 5x5 design
+  formula_str = "logRT ~ emotion * offer_ratio + (1 | participant_id) + (0 + emotion | participant_id) + (0 + offer_ratio | participant_id) + (0 + emotion:offer_ratio | participant_id)",
   data = df_ratio, 
   family_type = "gaussian", 
   fixed_terms = ~ emotion * offer_ratio
 )
 generate_report(m_ratio_rt, "Ratio_Response_Time", c("emotion", "offer_ratio"), df_ratio)
+
 
 ```
 
@@ -520,7 +528,8 @@ if(nrow(df_unfair) > 50) {
   
   cat(sprintf("\n>>> Running: Exploratory - Unfair Rejection RT [%s] <<<\n", experiment_version))
   m_unfair <- run_robust_model(
-    formula_str = "logRT ~ emotion + (1 + emotion | participant_id)",
+    # Modified to Zero-Correlation Parameterization
+    formula_str = "logRT ~ emotion + (1 | participant_id) + (0 + emotion | participant_id)",
     data = df_unfair,
     family_type = "gaussian",
     fixed_terms = ~ emotion
@@ -530,12 +539,14 @@ if(nrow(df_unfair) > 50) {
   cat(sprintf("Skipped Unfair Analysis for %s (Insufficient Data: Model untestable)\n", experiment_version))
 }
 
+
 ```
 
 # 8. Session Info
 
 ```{r session}
 sessionInfo()
+
 
 ```
 

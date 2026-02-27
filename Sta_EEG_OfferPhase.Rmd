@@ -13,7 +13,7 @@ output:
     fig_height: 6
 ---
 
-```{r setup, include=FALSE}
+``` {r setup, include=FALSE}
 # ==============================================================================
 # 1. Global Configuration & Environment
 # ==============================================================================
@@ -77,9 +77,10 @@ labels_off <- c('fair'='Fair', 'unfair'='Unfair')
 
 custom_control <- lmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 200000), calc.derivs = FALSE)
 
+
 ```
 
-```{r apa-module}
+``` {r apa-module}
 # ==============================================================================
 # Helper Function: Format ANOVA F-Table to APA String
 # ==============================================================================
@@ -159,9 +160,10 @@ format_coefs <- function(model) {
   })
 }
 
+
 ```
 
-```{r prep-functions}
+``` {r prep-functions}
 # ==============================================================================
 # Data Loading & Cleaning Functions
 # ==============================================================================
@@ -218,9 +220,10 @@ check_uniqueness <- function(df, context_name) {
     stop(sprintf("CRITICAL ERROR: Duplicate keys (ID+Index) found in %s", context_name))
 }
 
+
 ```
 
-```{r stats-engine}
+``` {r stats-engine}
 # ==============================================================================
 # Analytical Engine: Linear Mixed-Effects Modeling
 # ==============================================================================
@@ -235,9 +238,6 @@ run_regression_analysis <- function(data, erp_name, out_dir, exp_version, use_sv
   # ----------------------------------------------------------------------------
   # Baseline Logic & Fixed Effects Specification
   # ----------------------------------------------------------------------------
-  # Methodological definition:
-  # E1 incorporates baseline as an interaction term.
-  # E2 utilizes additive baseline correction.
   if (exp_version == "E1") {
     baseline_formula <- "+ emotion * Baseline_c" 
   } else if (exp_version == "E2") {
@@ -255,19 +255,25 @@ run_regression_analysis <- function(data, erp_name, out_dir, exp_version, use_sv
   # ----------------------------------------------------------------------------
   # Random Effects Structure Optimization (Data-Driven Maximal Approach)
   # ----------------------------------------------------------------------------
-  # Methodological definition:
-  # Initialized with maximum random effects structure (Barr et al., 2013).
-  # Reduced via backward stepwise elimination using LRT to prevent singular fits.
+  # Methodological definition: Zero-correlation parameterization strategy.
+  # Extracts random slopes without associated correlation parameters to prevent
+  # singular fits and inappropriate over-penalization of theoretically relevant
+  # variance components during backward LRT elimination.
   
-  cat("   [Phase 1] Optimizing Random Structure via backward LRT...\n")
+  cat("   [Phase 1] Optimizing Random Structure via backward LRT (Zero-Corr)...\n")
   
-  random_maximal <- "+ (1 + emotion * offer_type | participant_id)"
+  # Structural modification based on buildmer optimal practices:
+  # Exploding the covariance matrix prevents elimination of slopes due to 
+  # unestimable correlation terms.
+  random_maximal <- "+ (1 | participant_id) + (0 + emotion | participant_id) + (0 + offer_type | participant_id) + (0 + emotion:offer_type | participant_id)"
+  
   f_buildmer <- as.formula(paste(fixed_effects, random_maximal))
   
   bm_res <- buildmer::buildmer(
     formula = f_buildmer, 
     data = data,
     buildmerControl = buildmerControl(
+      # Retaining fixed effects during random structure optimization
       include = as.formula(paste("~", str_split(fixed_effects, "~")[[1]][2])),
       direction = c("order", "backward"), 
       crit = "LRT", 
@@ -384,9 +390,10 @@ run_regression_analysis <- function(data, erp_name, out_dir, exp_version, use_sv
   cat("   >>> Analysis Complete.\n")
 }
 
+
 ```
 
-```{r execution}
+``` {r execution}
 # ==============================================================================
 # Execution Phase
 # ==============================================================================
@@ -451,5 +458,5 @@ if(file.exists(path_resp) && file.exists(path_stim)) {
 
 cat(sprintf("\n========================================\n   %s Master Analysis Pipeline Completed.\n========================================\n", experiment_version))
 
-```
 
+```
