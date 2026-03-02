@@ -1,6 +1,6 @@
 ---
 title: "Exp 1 & 2 ERP Statistical Analysis: Regression-Based Baseline Correction"
-subtitle: "Method: LMM (F-Tests via Satterthwaite) with Data-Driven Maximal Random Structure & APA Reporting"
+subtitle: "Method: LMM (F-Tests via Satterthwaite) with Data-Driven Maximal Random Structure"
 author: "Project Research Team"
 date: "`r Sys.Date()`"
 output: 
@@ -25,19 +25,31 @@ options(scipen = 999, digits = 4)
 options(contrasts = c("contr.sum", "contr.poly"))
 
 # ------------------------------------------------------------------------------
-# Global Settings & Analysis Targets
+# Global Settings & Analysis Targets (SINGLE SOURCE OF TRUTH)
 # ------------------------------------------------------------------------------
-experiment_version <- "E2"  # Options: "E1" or "E2"
+# Toggle this to match the upstream preprocessing pipeline output you wish to analyze.
+experiment_version <- "E1"  # Options: "E1" or "E2"
 
-# Component definitions. Format: c("Component_Name" = Include_Covariate_Boolean)
-# Synchronized with preprocessing output (N170, FRN, P2, N400, LPP_offer).
-analyze_stim_components <- c(
-  "N170"      = TRUE,
-  "FRN"       = TRUE,
-  "P2"        = TRUE,
-  "N400"      = TRUE,
-  "LPP_offer" = TRUE
-)
+# Dynamic component definitions based on experimental design.
+# Format: c("Component_Name" = Include_Covariate_Boolean)
+if (experiment_version == "E1") {
+  analyze_stim_components <- c(
+    "EPN"       = TRUE,
+    "FRN"       = TRUE,
+    "N400"      = TRUE,
+    "LPP_offer" = TRUE
+  )
+} else if (experiment_version == "E2") {
+  analyze_stim_components <- c(
+    "N170"      = TRUE,
+    "EPN"       = TRUE,
+    "FRN"       = TRUE,
+    "N400"      = TRUE,
+    "LPP_offer" = TRUE
+  )
+} else {
+  stop("Configuration Error: Unknown experiment_version.")
+}
 
 analyze_resp_components <- c(
   "CPP"       = FALSE
@@ -59,11 +71,11 @@ pacman::p_load(
 # Configuration: Force calculation of Denominator DF
 emmeans::emm_options(lmerTest.limit = 50000, pbkrtest.limit = 50000)
 
-# Path definition: Dynamic Output Directory
+# Path definition: Dynamic Output Directory mapping to experiment_version
 out_root <- here("results", "EEG", paste0(experiment_version, "_Stats_Regression_Method"))
 if(!dir.exists(out_root)) dir.create(out_root, recursive = TRUE)
 
-cat(sprintf("Initializing pipeline for Experiment: %s\nOutput Directory: %s\n", 
+cat(sprintf("Initializing statistical pipeline for Experiment: %s\nOutput Directory: %s\n", 
             experiment_version, out_root))
 
 # Visual Theme & Palettes
@@ -77,10 +89,9 @@ labels_off <- c('fair'='Fair', 'unfair'='Unfair')
 
 custom_control <- lmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 200000), calc.derivs = FALSE)
 
-
 ```
 
-``` {r apa-module}
+```{r apa-module}
 # ==============================================================================
 # Helper Function: Format ANOVA F-Table to APA String
 # ==============================================================================
@@ -160,10 +171,9 @@ format_coefs <- function(model) {
   })
 }
 
-
 ```
 
-``` {r prep-functions}
+```{r prep-functions}
 # ==============================================================================
 # Data Loading & Cleaning Functions
 # ==============================================================================
@@ -220,10 +230,9 @@ check_uniqueness <- function(df, context_name) {
     stop(sprintf("CRITICAL ERROR: Duplicate keys (ID+Index) found in %s", context_name))
 }
 
-
 ```
 
-``` {r stats-engine}
+```{r stats-engine}
 # ==============================================================================
 # Analytical Engine: Linear Mixed-Effects Modeling
 # ==============================================================================
@@ -238,13 +247,9 @@ run_regression_analysis <- function(data, erp_name, out_dir, exp_version, use_sv
   # ----------------------------------------------------------------------------
   # Baseline Logic & Fixed Effects Specification
   # ----------------------------------------------------------------------------
-  if (exp_version == "E1") {
-    baseline_formula <- "+ emotion * Baseline_c" 
-  } else if (exp_version == "E2") {
-    baseline_formula <- "+ Baseline_c"
-  } else {
-    stop("Configuration Error: Unknown experiment_version. Must be 'E1' or 'E2'.")
-  }
+  # Strict adherence to standard ANCOVA assumptions: 
+  # Baseline amplitude acts as a constant additive covariate.
+  baseline_formula <- "+ Baseline_c"
 
   fixed_effects <- paste0(erp_name, " ~ emotion * offer_type ", baseline_formula)
   if(use_svo && "SVO_Z" %in% names(data)) {
@@ -255,16 +260,8 @@ run_regression_analysis <- function(data, erp_name, out_dir, exp_version, use_sv
   # ----------------------------------------------------------------------------
   # Random Effects Structure Optimization (Data-Driven Maximal Approach)
   # ----------------------------------------------------------------------------
-  # Methodological definition: Zero-correlation parameterization strategy.
-  # Extracts random slopes without associated correlation parameters to prevent
-  # singular fits and inappropriate over-penalization of theoretically relevant
-  # variance components during backward LRT elimination.
-  
   cat("   [Phase 1] Optimizing Random Structure via backward LRT (Zero-Corr)...\n")
   
-  # Structural modification based on buildmer optimal practices:
-  # Exploding the covariance matrix prevents elimination of slopes due to 
-  # unestimable correlation terms.
   random_maximal <- "+ (1 | participant_id) + (0 + emotion | participant_id) + (0 + offer_type | participant_id) + (0 + emotion:offer_type | participant_id)"
   
   f_buildmer <- as.formula(paste(fixed_effects, random_maximal))
@@ -273,7 +270,6 @@ run_regression_analysis <- function(data, erp_name, out_dir, exp_version, use_sv
     formula = f_buildmer, 
     data = data,
     buildmerControl = buildmerControl(
-      # Retaining fixed effects during random structure optimization
       include = as.formula(paste("~", str_split(fixed_effects, "~")[[1]][2])),
       direction = c("order", "backward"), 
       crit = "LRT", 
@@ -390,22 +386,25 @@ run_regression_analysis <- function(data, erp_name, out_dir, exp_version, use_sv
   cat("   >>> Analysis Complete.\n")
 }
 
-
 ```
 
-``` {r execution}
+```{r execution}
 # ==============================================================================
 # Execution Phase
 # ==============================================================================
-path_pipeline <- here("data", "02_Pipeline_Output")
+# Dynamically mapping upstream paths to align with Pipline_UG_OfferPhase.Rmd
+path_pipeline <- here("data", paste0("02_Pipeline_Output_", experiment_version))
+
 path_stim <- file.path(path_pipeline, "Method_Regression", "Stimulus_Locked", "trials.csv")
 path_resp <- file.path(path_pipeline, "Method_Regression", "Response_Locked", "trials.csv")
 
+# NOTE: Verify if the Covariates folder is also sandboxed per experiment in your actual file system.
+# In the updated pipeline, Covariates are saved inside 02_Pipeline_Output_E1/E2
 path_cov_csv <- file.path(path_pipeline, "Covariates", "SVO_PID5BF_PostRating.csv")
 path_cov_xlsx <- file.path(path_pipeline, "Covariates", "SVO_PID5BF_PostRating.xlsx")
 path_cov <- if(file.exists(path_cov_csv)) path_cov_csv else path_cov_xlsx
 
-if(!file.exists(path_stim)) stop("Stimulus file not found. Have you run the upstream preprocessing script?")
+if(!file.exists(path_stim)) stop(sprintf("Stimulus file not found at: %s\nHave you run the upstream preprocessing script for %s?", path_stim, experiment_version))
 
 cat("--- Loading Covariates ---\n")
 df_covs <- load_covariates(path_cov)
@@ -458,5 +457,5 @@ if(file.exists(path_resp) && file.exists(path_stim)) {
 
 cat(sprintf("\n========================================\n   %s Master Analysis Pipeline Completed.\n========================================\n", experiment_version))
 
-
 ```
+

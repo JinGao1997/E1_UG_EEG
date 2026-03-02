@@ -1,0 +1,268 @@
+---
+title: "Cross-Experiment ERP Analysis: Exp 1 vs. Exp 2 (Timing FX)"
+subtitle: "Method: 3-Way Mixed LMM (Exp x Emotion x Offer) with Additive Baseline"
+author: "Project Research Team"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+    theme: flatly
+    fig_width: 12
+    fig_height: 8
+---
+
+``` {r setup, include=FALSE}
+# ==============================================================================
+# 1. Global Configuration & Environment
+# ==============================================================================
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+options(scipen = 999, digits = 4)
+
+# Options configuration: Sum-to-zero contrasts for valid Type III ANOVA results 
+options(contrasts = c("contr.sum", "contr.poly"))
+
+# ------------------------------------------------------------------------------
+# Global Settings & Analysis Targets
+# ------------------------------------------------------------------------------
+analysis_name <- "CrossExp_E1_vs_E2"
+
+# Component definitions (Intersection of E1 and E2 valid components)
+# N170 is excluded because E1 does not have a valid Stimulus-Locked N170.
+shared_components <- c(
+  "EPN"       = TRUE,
+  "FRN"       = TRUE,
+  "N400"      = TRUE,
+  "LPP_offer" = TRUE
+)
+
+if(!require("pacman")) install.packages("pacman")
+pacman::p_load(
+  here, readr, readxl, dplyr, tidyr, stringr,  # Data Wrangling
+  lme4, lmerTest,                              # Modeling
+  car, parameters, performance,                # Diagnostics & APA Extraction
+  buildmer,                                    # Random Structure Optimization
+  emmeans, effectsize,                         # Statistical Inference
+  sjPlot, sjmisc,                              # Quick Visualization
+  ggplot2, ggpubr, gridExtra,                  # Publication Visualization
+  openxlsx                                     # Excel Reporting
+)
+
+emmeans::emm_options(lmerTest.limit = 50000, pbkrtest.limit = 50000)
+
+out_root <- here("results", "EEG", paste0(analysis_name, "_Stats_Regression"))
+if(!dir.exists(out_root)) dir.create(out_root, recursive = TRUE)
+
+theme_set(theme_bw(base_size = 14) + 
+          theme(panel.grid.minor = element_blank(), legend.position = "top"))
+
+colors_emo <- c('neu'="#8491B4",'aff'="#91D1C2",'dis'="#E64B35",'dom'="#F39B7F",'enj'="#3C5488")
+labels_emo <- c('neu'='Neutral','aff'='Affiliative','dis'='Disgust','dom'='Dominance','enj'='Reward')
+colors_off <- c('fair'="#2E86AB",'unfair'="#A23B72")
+labels_off <- c('fair'='Fair', 'unfair'='Unfair')
+
+custom_control <- lmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 200000), calc.derivs = FALSE)
+
+```
+
+```{r apa-module}
+# ==============================================================================
+# Helper Functions for APA Formatting
+# ==============================================================================
+format_anova_apa <- function(anova_obj) {
+  df_res <- as.data.frame(anova_obj) %>% tibble::rownames_to_column("Effect")
+  
+  es_df <- data.frame(Parameter = character(), Eta2_partial = numeric())
+  tryCatch({
+    es <- effectsize::eta_squared(anova_obj, partial = TRUE, ci = 0.95, verbose = FALSE)
+    es_df <- as.data.frame(es) %>% select(Parameter, Eta2_partial)
+  }, error = function(e) NULL)
+  
+  if(nrow(es_df) > 0) df_res <- left_join(df_res, es_df, by = c("Effect" = "Parameter")) else df_res$Eta2_partial <- NA
+  
+  get_col <- function(col_name) if(col_name %in% names(df_res)) df_res[[col_name]] else NA
+  
+  df_res %>%
+    mutate(
+      F_val  = get_col("F value"), NumDF  = get_col("NumDF"), DenDF  = get_col("DenDF"), p_val  = get_col("Pr(>F)"),
+      p_str = case_when(is.na(p_val) ~ "-", p_val < .001 ~ "< .001", TRUE ~ paste0("= ", sprintf("%.3f", p_val))),
+      Eta_str = ifelse(is.na(Eta2_partial), "-", sprintf("%.2f", Eta2_partial)),
+      APA_Report = case_when(!is.na(F_val) ~ sprintf("F(%s, %.2f) = %.2f, p %s, np2 = %s", NumDF, DenDF, F_val, p_str, Eta_str), TRUE ~ "Error")
+    ) %>% select(Effect, APA_Report, F_value = F_val, NumDF, DenDF, p_value = p_val, Eta2_partial)
+}
+
+format_posthoc_apa <- function(emm_df) {
+  df_clean <- as.data.frame(emm_df)
+  if("t.ratio" %in% names(df_clean)) {
+    df_clean <- df_clean %>%
+      mutate(
+        p_str = case_when(p.value < .001 ~ "< .001", TRUE ~ paste0("= ", sprintf("%.3f", p.value))),
+        t_str = sprintf("%.2f", t.ratio), df_str = sprintf("%.2f", df), 
+        estimate_col = if("estimate" %in% names(.)) estimate else if("response" %in% names(.)) response else NA,
+        estimate_str = sprintf("%.2f", estimate_col), se_str = sprintf("%.2f", SE),
+        Stats_String = sprintf("b = %s (SE=%s), t(%s) = %s, p %s", estimate_str, se_str, df_str, t_str, p_str)
+      )
+  }
+  return(df_clean)
+}
+
+```
+
+```{r prep-functions}
+# ==============================================================================
+# Data Loading & Cleaning Functions (Adapted for Cross-Experiment Merge)
+# ==============================================================================
+
+load_and_prep_single <- function(path_erp, erp_name, baseline_col, exp_label) {
+  if(!file.exists(path_erp)) return(NULL)
+  df <- read_csv(path_erp, show_col_types=FALSE)
+  if(!(erp_name %in% names(df))) return(NULL)
+  
+  # Non-destructive ID Generation & Standardization:
+  # Extracts only digits from original participant_id (ignoring 'VP' or 'Vp' inconsistencies).
+  # Creates a NEW column 'Subject_ID_Mega' to act as the universal clustering key.
+  df <- df %>%
+    filter(Offers_Other %in% c(5, 6, 8, 9)) %>%
+    mutate(
+      Numeric_ID = as.numeric(str_extract(participant_id, "\\d+")),
+      Subject_ID_Mega = sprintf("%s_Vp%04d", exp_label, Numeric_ID),
+      offer_type = factor(case_when(Offers_Other %in% c(5,6)~"fair", Offers_Other %in% c(8,9)~"unfair"), levels = c("fair", "unfair")),
+      emotion = factor(emotion, levels = c("neu", "aff", "dis", "dom", "enj")),
+      Exp = factor(exp_label, levels = c("E1", "E2"))
+    ) %>%
+    filter(abs(!!sym(erp_name)) < 200)
+  
+  if(!is.null(baseline_col) && baseline_col %in% names(df)) {
+    df$Baseline_Raw <- df[[baseline_col]]
+    df$Baseline_c <- df$Baseline_Raw - mean(df$Baseline_Raw, na.rm=TRUE)
+  } else { df$Baseline_c <- 0 }
+  
+  return(df)
+}
+
+```
+
+```{r stats-engine}
+# ==============================================================================
+# Analytical Engine: 3-Way Mixed-Effects Modeling
+# ==============================================================================
+run_crossexp_analysis <- function(data, erp_name, out_dir) {
+  
+  sub_dir <- file.path(out_dir, erp_name)
+  if(!dir.exists(sub_dir)) dir.create(sub_dir, recursive = TRUE)
+  
+  cat(sprintf("\n>>> Analyzing Component: %s [Cross-Experiment] (Total N = %d)\n", 
+              erp_name, n_distinct(data$Subject_ID_Mega)))
+  
+  # ----------------------------------------------------------------------------
+  # Fixed Effects: 3-Way Interaction
+  # ----------------------------------------------------------------------------
+  baseline_formula <- "+ Baseline_c"
+  fixed_effects <- paste0(erp_name, " ~ Exp * emotion * offer_type ", baseline_formula)
+
+  # ----------------------------------------------------------------------------
+  # Random Effects Structure Optimization
+  # Utilizing the newly created, safe 'Subject_ID_Mega' as the grouping factor.
+  # ----------------------------------------------------------------------------
+  cat("   [Phase 1] Optimizing Random Structure...\n")
+  random_maximal <- "+ (1 | Subject_ID_Mega) + (0 + emotion | Subject_ID_Mega) + (0 + offer_type | Subject_ID_Mega) + (0 + emotion:offer_type | Subject_ID_Mega)"
+  
+  f_buildmer <- as.formula(paste(fixed_effects, random_maximal))
+  
+  bm_res <- buildmer::buildmer(
+    formula = f_buildmer, data = data,
+    buildmerControl = buildmerControl(
+      include = as.formula(paste("~", str_split(fixed_effects, "~")[[1]][2])),
+      direction = c("order", "backward"), crit = "LRT", quiet = TRUE,
+      args = list(control = custom_control)
+    )
+  )
+  
+  cat("   [Phase 2] Fitting final 3-Way model...\n")
+  FINAL_MODEL <- lmer(formula(bm_res@model), data = data, REML = TRUE, control = custom_control)
+  
+  anova_res <- anova(FINAL_MODEL, type = 3, ddf = "Satterthwaite")
+  anova_apa <- format_anova_apa(anova_res)
+  print(anova_apa %>% select(Effect, APA_Report))
+
+  # ----------------------------------------------------------------------------
+  # Post-hoc Decompositions
+  # ----------------------------------------------------------------------------
+  list_of_tables <- list("ANOVA_Main" = anova_apa)
+  p_3way <- anova_res["Exp:emotion:offer_type", "Pr(>F)"]
+  
+  if (!is.na(p_3way) && p_3way < 0.05) {
+    cat("      -> Significant 3-Way Interaction detected! Decomposing by Experiment...\n")
+    list_of_tables[["Simple_Offer_by_Emo_Exp"]] <- format_posthoc_apa(
+      pairs(emmeans(FINAL_MODEL, as.formula("~ offer_type | emotion * Exp"), at = list(Baseline_c=0)), adjust="fdr")
+    )
+    list_of_tables[["Exp_Differences_by_Cond"]] <- format_posthoc_apa(
+      pairs(emmeans(FINAL_MODEL, as.formula("~ Exp | emotion * offer_type"), at = list(Baseline_c=0)), adjust="fdr")
+    )
+  } else {
+    cat("      -> No robust 3-Way interaction. Reporting 2-Way Interactions and Main Effects.\n")
+    list_of_tables[["2Way_Exp_Offer"]] <- format_posthoc_apa(pairs(emmeans(FINAL_MODEL, ~ offer_type | Exp), adjust="fdr"))
+    list_of_tables[["2Way_Emo_Offer"]] <- format_posthoc_apa(pairs(emmeans(FINAL_MODEL, ~ offer_type | emotion), adjust="fdr"))
+    list_of_tables[["Main_Effect_Exp"]] <- format_posthoc_apa(pairs(emmeans(FINAL_MODEL, ~ Exp), adjust="fdr"))
+  }
+
+  list_of_tables[["Descriptive_Means_SE"]] <- as.data.frame(emmeans(FINAL_MODEL, ~ Exp * offer_type * emotion, at = list(Baseline_c=0)))
+  
+  # ----------------------------------------------------------------------------
+  # Data Export & Visualization
+  # ----------------------------------------------------------------------------
+  wb <- createWorkbook()
+  for(sheet_name in names(list_of_tables)) {
+    addWorksheet(wb, substr(sheet_name, 1, 31))
+    writeData(wb, substr(sheet_name, 1, 31), list_of_tables[[sheet_name]])
+  }
+  saveWorkbook(wb, file.path(sub_dir, paste0("STATS_CrossExp_", erp_name, ".xlsx")), overwrite = TRUE)
+
+  pd <- as.data.frame(emmeans(FINAL_MODEL, ~ Exp * offer_type * emotion, at = list(Baseline_c = 0)))
+  p_final <- ggplot(pd, aes(x = emotion, y = emmean, color = offer_type, group = offer_type)) +
+       facet_wrap(~Exp, labeller = labeller(Exp = c("E1"="Exp 1: Sequential", "E2"="Exp 2: Simultaneous"))) +
+       geom_line(linewidth=1.2, position=position_dodge(0.2)) + 
+       geom_point(size=3.5, shape=21, fill="white", stroke=2, position=position_dodge(0.2)) +
+       geom_errorbar(aes(ymin=emmean-SE, ymax=emmean+SE), width=0.2, position=position_dodge(0.2)) +
+       scale_color_manual(values = colors_off, labels = labels_off) + scale_x_discrete(labels = labels_emo) +
+       labs(title = paste("Cross-Experiment:", erp_name, "Interaction"), y = "Amplitude (µV)", x = "Emotion Condition")
+  
+  ggsave(file.path(sub_dir, paste0("Plot_CrossExp_", erp_name, ".png")), p_final, width = 10, height = 6)
+  cat("   >>> Complete.\n")
+}
+
+```
+
+```{r execution}
+# ==============================================================================
+# Execution Phase
+# ==============================================================================
+root_E1 <- here("data", "02_Pipeline_Output_E1")
+root_E2 <- here("data", "02_Pipeline_Output_E2")
+
+path_E1 <- file.path(root_E1, "Method_Regression", "Stimulus_Locked", "trials.csv")
+path_E2 <- file.path(root_E2, "Method_Regression", "Stimulus_Locked", "trials.csv")
+
+if(file.exists(path_E1) && file.exists(path_E2)) {
+  cat("\n=== Processing Stimulus-Locked Components (Cross-Experiment) ===\n")
+  
+  for (comp_name in names(shared_components)) {
+    baseline_col_name <- paste0("Baseline_", comp_name)
+    
+    df_e1 <- load_and_prep_single(path_E1, comp_name, baseline_col_name, "E1")
+    df_e2 <- load_and_prep_single(path_E2, comp_name, baseline_col_name, "E2")
+    
+    if (!is.null(df_e1) && !is.null(df_e2)) {
+      df_combined <- bind_rows(df_e1, df_e2)
+      run_crossexp_analysis(df_combined, comp_name, out_root)
+    } else {
+      cat(sprintf("   [SKIP] Data missing for %s in one or both experiments.\n", comp_name))
+    }
+  }
+} else {
+  stop("CRITICAL ERROR: Could not find data files for E1 and/or E2. Please ensure both upstream pipelines have completed.")
+}
+
+```
+

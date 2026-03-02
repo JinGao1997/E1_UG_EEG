@@ -44,13 +44,13 @@ options(contrasts = c("contr.sum", "contr.poly"))
 # ------------------------------------------------------------------------------
 # Set this to "E1" or "E2" depending on which project folder you are running.
 # This ensures output reports and folders are cleanly isolated.
-experiment_version <- "E2"  
+experiment_version <- "E1"  
 DEBUG_MODE <- FALSE 
 # ------------------------------------------------------------------------------
 
 # 3. Path Configuration
-# [MATCHED WITH EEG PIPELINE]: Reads exactly from where the EEG script dumps the trials.
-path_input <- here("data", "02_Pipeline_Output", "Method_Regression", "Stimulus_Locked", "trials.csv")
+# [MATCHED WITH EEG PIPELINE]: Dynamically routes to the correct experiment output folder
+path_input <- here("data", paste0("02_Pipeline_Output_", experiment_version), "Method_Regression", "Stimulus_Locked", "trials.csv")
 
 # [UPGRADED]: Isolates output reporting by Experiment Version to prevent overwrite.
 dir_suffix <- if(DEBUG_MODE) "Debug_Output_Final" else "Pub_Output_Final"
@@ -61,7 +61,6 @@ if(!dir.exists(path_out_root)) dir.create(path_out_root, recursive = TRUE)
 cat(sprintf(">>> SYSTEM STATUS: Experiment = %s | DEBUG_MODE = %s\n", experiment_version, DEBUG_MODE))
 cat(sprintf(">>> INPUT PATH DETECTED: %s\n", path_input))
 cat(sprintf(">>> OUTPUT PATH: %s\n", path_out_root))
-
 
 
 ```
@@ -274,8 +273,6 @@ generate_report <- function(model, label, factors, data_used) {
   list_of_tables[["Model_Coefficients"]] <- format_coefs(model)
   
   # Type III ANOVA Extraction
-  # Note: glmmTMB models utilize Wald Chi-Square tests via car::Anova.
-  # Lmer models utilize Satterthwaite approximations.
   if(inherits(model, "glmmTMB") || inherits(model, "glm")) {
     anov <- car::Anova(model, type = 3)
   } else {
@@ -321,7 +318,6 @@ generate_report <- function(model, label, factors, data_used) {
     setColWidths(wb, safe_sheet_name, cols=1:ncol(list_of_tables[[sheet_name]]), widths="auto")
   }
   
-  # Dynamic naming with experiment version
   save_path <- file.path(out_dir, paste0("STATS_REPORT_", experiment_version, "_", label, ".xlsx"))
   saveWorkbook(wb, save_path, overwrite = TRUE)
   cat(paste0("      [Export] Final Excel Generated: ", basename(save_path), "\n"))
@@ -349,6 +345,7 @@ df_clean <- df_raw %>%
     participant_id = clean_id(participant_id),
     participant_id = factor(participant_id),
     
+    # ratio_val calculation is kept as it is a dependency for offer_type calculation
     ratio_val = Offers_You / (Offers_You + Offers_Other),
     offer_ratio = case_when(
       abs(ratio_val - 0.5) < 0.01 ~ "5:5",
@@ -374,8 +371,6 @@ df_clean <- df_raw %>%
   filter(!is.na(offer_ratio), !is.na(reaction), RT >= 150, RT <= 3000)
 
 if(DEBUG_MODE) {
-  # Warning: Aggressive subsetting restricts within-subject variance estimation.
-  # Random effects structures may collapse to intercept-only during debugging.
   subs <- unique(df_clean$participant_id)[1:5]
   df_clean <- df_clean %>% filter(participant_id %in% subs)
   cat(">>> DEBUG MODE: Subset to 5 subjects.\n")
@@ -384,7 +379,7 @@ if(DEBUG_MODE) {
 # CONTRASTS (CRITICAL)
 contrasts(df_clean$emotion) <- contr.sum
 contrasts(df_clean$offer_type) <- contr.sum
-contrasts(df_clean$offer_ratio) <- contr.sum
+# contrasts(df_clean$offer_ratio) <- contr.sum  # [COMMENTED OUT PER USER REQUEST]
 
 cat("N Trials for Analysis:", nrow(df_clean), "\n")
 
@@ -393,16 +388,10 @@ cat("N Trials for Analysis:", nrow(df_clean), "\n")
 
 # 5. Confirmatory Analysis: Offer Type (Fair vs. Unfair)
 
-This section executes our primary hypothesis testing. The model initiates with a maximal zero-correlation parameterization structure to ensure convergence while protecting critical random slopes.
-
 ```{r analysis-type}
-# Methodological Note: 
-# High degrees of freedom limits are enforced to guarantee exact Satterthwaite 
-# calculations for continuous RT data within computationally stable confines.
 emmeans::emm_options(lmerTest.limit = 50000, pbkrtest.limit = 50000)
 cat(">>> Configured emmeans: High precision DF enabled for Confirmatory Analysis.\n")
 
-# Subset Data & Re-apply Contrasts (Protection against droplevels)
 df_type <- df_clean %>% 
   filter(offer_type %in% c("Fair", "Unfair")) %>% 
   droplevels()
@@ -413,7 +402,6 @@ contrasts(df_type$emotion) <- contr.sum
 # --- 1. Rejection Rate (GLMM - Binomial) ---
 cat(sprintf("\n>>> Running: Confirmatory - Rejection Rate [%s] <<<\n", experiment_version))
 m_type_rej <- run_robust_model(
-  # Modified to Zero-Correlation Parameterization
   formula_str = "is_reject ~ emotion * offer_type + (1 | participant_id) + (0 + emotion | participant_id) + (0 + offer_type | participant_id) + (0 + emotion:offer_type | participant_id)",
   data = df_type, 
   family_type = "binomial", 
@@ -424,7 +412,6 @@ generate_report(m_type_rej, "Type_Rejection_Rate", c("emotion", "offer_type"), d
 # --- 2. Response Time (LMM - Gaussian) ---
 cat(sprintf("\n>>> Running: Confirmatory - Response Time [%s] <<<\n", experiment_version))
 m_type_rt <- run_robust_model(
-  # Modified to Zero-Correlation Parameterization
   formula_str = "logRT ~ emotion * offer_type + (1 | participant_id) + (0 + emotion | participant_id) + (0 + offer_type | participant_id) + (0 + emotion:offer_type | participant_id)",
   data = df_type, 
   family_type = "gaussian", 
@@ -476,46 +463,6 @@ if(!is.null(m_forced_2)) {
 
 ```
 
-# 6. Exploratory Analysis: Offer Ratio (Full Spectrum)
-
-This section treats the 5-level continuous-like proxy (`offer_ratio`) strictly as a categorical interaction ($5 \times 5 = 25$ unique cells). Because precise variance-covariance matrix inversion across 25 factor combinations frequently triggers numerical singularity and memory exhaustion, we enforce ZCP structures combined with asymptotic approximation algorithms ($z$-tests).
-
-```{r analysis-ratio}
-# Methodological Note (Singularity Protection):
-# Reducing the limit triggers asymptotic distributions (infinite DF) in `emmeans`, 
-# bypassing computationally explosive Satterthwaite matrix inversions in high-dimensional grids.
-emmeans::emm_options(lmerTest.limit = 3000, pbkrtest.limit = 3000)
-cat(">>> Configured emmeans: Asymptotic approximations enabled for Exploratory Analysis.\n")
-
-df_ratio <- df_clean %>% droplevels()
-contrasts(df_ratio$offer_ratio) <- contr.sum
-contrasts(df_ratio$emotion) <- contr.sum
-
-# --- 1. Rejection Rate ---
-cat(sprintf("\n>>> Running: Exploratory - Offer Ratio Rejection Rate [%s] <<<\n", experiment_version))
-m_ratio_rej <- run_robust_model(
-  # Modified to Zero-Correlation Parameterization for 5x5 design
-  formula_str = "is_reject ~ emotion * offer_ratio + (1 | participant_id) + (0 + emotion | participant_id) + (0 + offer_ratio | participant_id) + (0 + emotion:offer_ratio | participant_id)",
-  data = df_ratio, 
-  family_type = "binomial", 
-  fixed_terms = ~ emotion * offer_ratio
-)
-generate_report(m_ratio_rej, "Ratio_Rejection_Rate", c("emotion", "offer_ratio"), df_ratio)
-
-# --- 2. Response Time ---
-cat(sprintf("\n>>> Running: Exploratory - Offer Ratio Response Time [%s] <<<\n", experiment_version))
-m_ratio_rt <- run_robust_model(
-  # Modified to Zero-Correlation Parameterization for 5x5 design
-  formula_str = "logRT ~ emotion * offer_ratio + (1 | participant_id) + (0 + emotion | participant_id) + (0 + offer_ratio | participant_id) + (0 + emotion:offer_ratio | participant_id)",
-  data = df_ratio, 
-  family_type = "gaussian", 
-  fixed_terms = ~ emotion * offer_ratio
-)
-generate_report(m_ratio_rt, "Ratio_Response_Time", c("emotion", "offer_ratio"), df_ratio)
-
-
-```
-
 # 7. Exploratory Analysis III: Unfair Rejection RT
 
 ```{r analysis-unfair}
@@ -528,7 +475,6 @@ if(nrow(df_unfair) > 50) {
   
   cat(sprintf("\n>>> Running: Exploratory - Unfair Rejection RT [%s] <<<\n", experiment_version))
   m_unfair <- run_robust_model(
-    # Modified to Zero-Correlation Parameterization
     formula_str = "logRT ~ emotion + (1 | participant_id) + (0 + emotion | participant_id)",
     data = df_unfair,
     family_type = "gaussian",
@@ -546,7 +492,6 @@ if(nrow(df_unfair) > 50) {
 
 ```{r session}
 sessionInfo()
-
 
 ```
 
