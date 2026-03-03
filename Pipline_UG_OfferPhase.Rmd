@@ -37,7 +37,7 @@ experiment_version <- "E1"
 # -----------------------------------------------------------
 # TRUE  = Standard Method: Subtracts baseline mean from the epoch.
 # FALSE = Regression Method: No baseline subtraction (extracts baseline as covariate).
-use_baseline_correction <- FALSE   
+use_baseline_correction <- FALSE  
 
 # -----------------------------------------------------------
 # Baseline Parameters (Stimulus-Locked Only)
@@ -272,7 +272,7 @@ if (run_offer_phase) {
       ~comp_name,    ~t_min, ~t_max, ~roi_channels,
       "EPN",         0.250,  0.350,  c("PO7","PO8","P7","P8","O1","O2"),
       "FRN",         0.250,  0.300,  c("F3","Fz","F4","FC1","FC2","Cz"),
-      "N400",        0.350,  0.450,  c("Fz","Cz","CPz","Pz"),
+      "N400",        0.350,  0.450,  c("Cz","CPz","Pz"),
       "LPP_offer",   0.500,  0.800,  c("Pz","Cz","C1","C2","CP1","CP2")
     )
   } else if (experiment_version == "E2") {
@@ -283,7 +283,7 @@ if (run_offer_phase) {
       "N170",        0.150,  0.200,  c("P7","P8","PO7","PO8"),
       "EPN",         0.250,  0.350,  c("PO7","PO8","P7","P8","O1","O2"),
       "FRN",         0.200,  0.250,  c("F3","Fz","F4","FC1","FC2","Cz"), # Shifted earlier
-      "N400",        0.350,  0.450,  c("Fz","Cz","CPz","Pz"),
+      "N400",        0.350,  0.450,  c("Cz","CPz","Pz"),
       "LPP_offer",   0.500,  0.800,  c("Pz","Cz","C1","C2","CP1","CP2")
     )
   } else {
@@ -305,30 +305,34 @@ if (run_offer_phase) {
     roi  = final_config$roi_channels
   )
 
-  # Hierarchical statistical contrasts to test experimental hypotheses.
+# ==========================================================================
+  # Refined Statistical Contrasts for Temporal Window Definition
+  # ==========================================================================
+  # Methodological Update: 
+  # Replaced the original 13 exploratory contrasts with 2 strictly orthogonal
+  # main effects. This prevents severe Family-Wise Error Rate (FWER) inflation 
+  # during the mass-univariate permutation testing phase.
+  # 
+  # Purpose:
+  # These contrasts serve as functional localizers to data-drive the temporal 
+  # boundaries of the component overlap (e.g., isolating Face N170/EPN from Offer FRN).
+  # Complex interaction testing is delegated to downstream Linear Mixed Models (LMM).
+  
   perm_contrasts_list <- list(
-    # 1. Main Effect of Fairness (Validation of UG paradigm)
+    # 1. Isolate the Economic Fairness Effect (Expected: FRN, N400, LPP)
+    # Collapses across all emotional faces to computationally cancel out 
+    # visual and affective variance.
     c('Grand_Unfair', 'Grand_Fair'),
     
-    # 2. Main Effect of Emotion (Manipulation check for facial stimuli)
-    c('All_Dis', 'All_Neu'), 
-    c('All_Enj', 'All_Neu'), 
-    c('All_Dom', 'All_Neu'), 
-    c('All_Aff', 'All_Neu'),
-
-    # 3. Simple Effects: Emotional modulation within Unfair context
-    c('Face_dis_Unfair', 'Face_neu_Unfair'), 
-    c('Face_enj_Unfair', 'Face_neu_Unfair'),  
-    c('Face_dom_Unfair', 'Face_neu_Unfair'), 
-    c('Face_aff_Unfair', 'Face_neu_Unfair'),
-
-    # 4. Control Comparisons: Emotional modulation within Fair context
-    c('Face_dis_Fair', 'Face_neu_Fair'), 
-    c('Face_enj_Fair', 'Face_neu_Fair'),
-    c('Face_dom_Fair', 'Face_neu_Fair'), 
-    c('Face_aff_Fair', 'Face_neu_Fair')
+    # 2. Isolate the Facial Emotion Effect (Expected: N170, EPN)
+    # Collapses across all economic offers to computationally cancel out 
+    # fairness-related variance. 
+    # Note: 'All_Dis' vs 'All_Neu' is selected as the primary functional 
+    # localizer for negative valence processing.
+    c('All_Dis', 'All_Neu')
   )
 
+  # Proceed with the pipeline execution using the refined contrasts
   res_stim <- pipeline_mod$group_pipeline(
     raw_files        = stim_raw_files,   
     log_files        = path_csv_filtered,
@@ -347,7 +351,7 @@ if (run_offer_phase) {
     components       = components_arg, 
     average_by       = common_average_by,
     
-    perm_contrasts   = perm_contrasts_list,
+    perm_contrasts   = perm_contrasts_list, # Updated list passed here
     perm_tmin        = 0.150,  
     perm_tmax        = 0.800,  
     perm_channels    = NULL    

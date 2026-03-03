@@ -12,15 +12,14 @@ output:
     theme: flatly
 ---
 
-```{r setup, include=FALSE}
+``` {r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
-
 
 ```
 
 # 1. Configuration & Setup
 
-```{r init}
+``` {r init}
 # ==============================================================================
 # 1.1 GLOBAL DIRECTORY & PIPELINE CONFIGURATION
 # ==============================================================================
@@ -49,6 +48,9 @@ if (!require("eegUtils")) {
 # ==============================================================================
 # 1.3 COMPONENT & SPATIOTEMPORAL DEFINITIONS
 # ==============================================================================
+# Dynamic FRN window logic mirroring upstream Python architecture
+frn_window <- if (experiment_id == "E1") c(250, 300) else c(200, 250)
+
 # Synchronized with preprocessing and visualization parameters.
 component_specs <- list(
   
@@ -58,25 +60,25 @@ component_specs <- list(
     roi = c("P7", "P8", "PO7", "PO8"),
     source_comp = "N170"
   ),
+  EPN = list(
+    win_ms = c(250, 350),            
+    roi = c("PO7", "PO8", "P7", "P8", "O1", "O2"),
+    source_comp = "EPN"
+  ),
   FRN = list(
-    win_ms = c(250, 300),            
+    win_ms = frn_window,            
     roi = c("F3", "Fz", "F4", "FC1", "FC2", "Cz"),
     source_comp = "FRN"
   ),
-  P2 = list(
-    win_ms = c(200, 300),            
-    roi = c("PO3", "POz", "PO4", "O1", "Oz", "O2"),
-    source_comp = "P2"
-  ),
   N400 = list(
     win_ms = c(350, 450),            
-    roi = c("Fz", "Cz", "CPz", "Pz"),
+    roi = c("Cz", "CPz", "Pz"),
     source_comp = "N400"
   ),
-  LPP = list(
+  LPP_offer = list(
     win_ms = c(500, 800),            
     roi = c("Pz", "Cz", "C1", "C2", "CP1", "CP2"),
-    source_comp = "LPP"
+    source_comp = "LPP_offer"
   ),
   
   # --- Exploratory / Methodological Test Components ---
@@ -85,25 +87,25 @@ component_specs <- list(
     roi = c("P7", "P8", "PO7", "PO8"),
     source_comp = "N170"
   ),
+  testEPN = list(
+    win_ms = c(200, 400), 
+    roi = c("PO7", "PO8", "P7", "P8", "O1", "O2"),
+    source_comp = "EPN"
+  ),
   testFRN = list(
     win_ms = c(200, 250), 
     roi = c("F3", "Fz", "F4", "FC1", "FC2", "Cz"),
     source_comp = "FRN"
   ),
-  testP2 = list(
-    win_ms = c(200, 400), 
-    roi = c("PO3", "POz", "PO4", "O1", "Oz", "O2"),
-    source_comp = "P2"
-  ),
   testN400 = list(
     win_ms = c(300, 500), 
-    roi = c("Fz", "Cz", "CPz", "Pz"),
+    roi = c("Cz", "CPz", "Pz"),
     source_comp = "N400"
   ),
   testLPP = list(
     win_ms = c(400, 600), 
     roi = c("Pz", "Cz", "C1", "C2", "CP1", "CP2"),
-    source_comp = "LPP"
+    source_comp = "LPP_offer"
   )
 )
 
@@ -118,7 +120,7 @@ cat(sprintf("Pipeline Initialized.\nTarget Experiment: %s\nData Root: %s\n", exp
 
 # 2. Methodological Helper Functions
 
-```{r helpers}
+``` {r helpers}
 # ==============================================================================
 # Dynamic Scale Limit Computation (Robust Quantile Method)
 # ==============================================================================
@@ -180,7 +182,7 @@ plot_topo_unified <- function(dat_long, chan_locs, roi,
 
 # 3. Component Processing & Visualization Engine
 
-```{r main_pipeline}
+``` {r main_pipeline}
 for (comp_name in names(component_specs)) {
   
   spec <- component_specs[[comp_name]]
@@ -573,7 +575,6 @@ for (comp_name in names(component_specs)) {
   closeAllConnections()
   gc(verbose = FALSE)
 }
-
 
 ```
 
