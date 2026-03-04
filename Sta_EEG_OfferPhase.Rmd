@@ -28,7 +28,7 @@ options(contrasts = c("contr.sum", "contr.poly"))
 # Global Settings & Analysis Targets (SINGLE SOURCE OF TRUTH)
 # ------------------------------------------------------------------------------
 # Toggle this to match the upstream preprocessing pipeline output you wish to analyze.
-experiment_version <- "E2"  # Options: "E1" or "E2"
+experiment_version <- "E1"  # Options: "E1" or "E2"
 
 # Dynamic component definitions based on experimental design.
 # Format: c("Component_Name" = Include_Covariate_Boolean)

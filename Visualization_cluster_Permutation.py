@@ -6,6 +6,7 @@ from pathlib import Path
 import warnings
 
 def set_publication_style():
+    """Applies a clean, academic style to matplotlib."""
     plt.rcParams.update({
         'font.size': 11, 'axes.labelsize': 11, 'axes.titlesize': 13,
         'legend.fontsize': 10, 'xtick.labelsize': 10, 'ytick.labelsize': 10,
@@ -89,7 +90,9 @@ def plot_ultimate_meyer_clusters(
         c_df = df_sig[df_sig['cluster'] == cluster_id]
         tmin_c, tmax_c, p_val_c = c_df['time'].min(), c_df['time'].max(), c_df['p_val'].iloc[0]
         
+        # ==============================================================
         # ABSOLUTE PEAK DETECTION (Strictly Data-Driven)
+        # ==============================================================
         peak_row = c_df.loc[c_df['t_obs'].abs().idxmax()]
         peak_channel, peak_time, peak_t_val = peak_row['channel'], peak_row['time'], peak_row['t_obs']
         
@@ -123,7 +126,7 @@ def plot_ultimate_meyer_clusters(
             ax_erp.invert_yaxis(); ax_erp.legend(loc='best', frameon=False)
             
         # --------------------------------------------------------------
-        # PANEL B: Overall Effect Size Topography (WITH CHANNEL NAMES)
+        # PANEL B: Overall Effect Size Topography
         # --------------------------------------------------------------
         ax_stat = fig.add_subplot(gs_top[1])
         safe_tmin, safe_tmax = max(tmin_c, stat_map.times[0]), min(tmax_c, stat_map.times[-1])
@@ -141,19 +144,18 @@ def plot_ultimate_meyer_clusters(
         
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            # Added `names=ch_names_stat` to plot labels, and `extrapolate='local'` to prevent color spillage
+            # Golden Recipe: extrapolate='head' (smooth) + sphere='eeglab' (no spillage)
             im_stat, _ = mne.viz.plot_topomap(
                 stat_data, stat_map.info, axes=ax_stat, cmap='RdBu_r', vlim=(-vmax_stat, vmax_stat), 
                 mask=mask_stat, mask_params=dict(marker='*', markerfacecolor='black', markeredgecolor='white', linewidth=0, markersize=10), 
-                contours=6, extrapolate='local', names=ch_names_stat, show=False
+                contours=6, extrapolate='head', sphere='eeglab', names=ch_names_stat, show=False
             )
             
-        # Post-processing text properties to prevent visual clutter
+        # Refined text layout for Panel B
         for txt in ax_stat.texts:
-            txt.set_fontsize(6)          # Very small, neat font size
-            txt.set_alpha(0.7)           # Slightly transparent so it blends into the background
+            txt.set_fontsize(6)          
+            txt.set_alpha(0.7)           
             pos = txt.get_position()
-            # Shift text slightly upwards (0.02 units) so it doesn't overlap the electrode dot/star
             txt.set_position((pos[0], pos[1] + 0.02)) 
             
         ax_stat.set_title(f"B. Cluster Effect Size ({tmin_c*1000:.0f} - {tmax_c*1000:.0f} ms)", fontweight='bold')
@@ -188,12 +190,20 @@ def plot_ultimate_meyer_clusters(
             
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
-                # extrapolate='local' guarantees crisp boundaries without spillage
+                # Golden Recipe for Dynamic Panels
                 im_dyn, _ = mne.viz.plot_topomap(
                     topo_data, evoked_diff.info, axes=ax_topo, cmap='RdBu_r', vlim=symmetric_vlim, 
                     mask=mask_dyn, mask_params=dict(marker='*', markerfacecolor='black', markeredgecolor='white', linewidth=0, markersize=8), 
-                    contours=6, extrapolate='local', show=False
+                    contours=6, extrapolate='head', sphere='eeglab', names=ch_names_evoked, show=False
                 )
+            
+            # Refined text layout for Panel C (Smaller plots)
+            for txt in ax_topo.texts:
+                txt.set_fontsize(5)      
+                txt.set_alpha(0.6)       
+                pos = txt.get_position()
+                txt.set_position((pos[0], pos[1] + 0.02)) 
+                
             if i == 0:
                 ax_topo.set_title(f"C. Dynamic Voltage Map\n{bins[i]*1000:.0f}-{bins[i+1]*1000:.0f} ms", fontsize=11, fontweight='bold')
             else:
@@ -249,7 +259,7 @@ if __name__ == "__main__":
                         grand_ave_csv_path=INPUT_DATA_DIR / "grand_ave.csv",
                         contrast_name=contrast,
                         p_threshold=0.05,
-                        topo_step=0.1, 
+                        topo_step=0.1,  # <--- 修改这里可以改变底层切片的地形图数量！(如改为0.05即为50ms一图)
                         n_subjects=N_SUBJECTS,
                         save_dir=OUTPUT_PLOT_DIR
                     )
