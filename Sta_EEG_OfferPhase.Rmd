@@ -20,14 +20,14 @@ output:
 knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
 options(scipen = 999, digits = 4)
 
-# Options configuration: Sum-to-zero contrasts for valid Type III ANOVA results 
+# Configuration: Sum-to-zero contrasts for valid Type III ANOVA results 
 # and valid zero-correlation parameterizations.
 options(contrasts = c("contr.sum", "contr.poly"))
 
 # ------------------------------------------------------------------------------
 # Global Settings & Analysis Targets (SINGLE SOURCE OF TRUTH)
 # ------------------------------------------------------------------------------
-# Toggle this to match the upstream preprocessing pipeline output you wish to analyze.
+# Configuration: Set experiment version to match upstream preprocessing pipeline output.
 experiment_version <- "E1"  # Options: "E1" or "E2"
 
 # Dynamic component definitions based on experimental design.
@@ -68,7 +68,7 @@ pacman::p_load(
   openxlsx                                     # Excel Reporting
 )
 
-# Configuration: Force calculation of Denominator DF
+# Configuration: Force calculation of Denominator DF parameters
 emmeans::emm_options(lmerTest.limit = 50000, pbkrtest.limit = 50000)
 
 # Path definition: Dynamic Output Directory mapping to experiment_version
@@ -88,6 +88,7 @@ colors_off <- c('fair'="#2E86AB",'unfair'="#A23B72")
 labels_off <- c('fair'='Fair', 'unfair'='Unfair')
 
 custom_control <- lmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 200000), calc.derivs = FALSE)
+
 
 ```
 
@@ -125,6 +126,8 @@ format_anova_apa <- function(anova_obj) {
       APA_Report = case_when(
         !is.na(F_val) & !is.na(NumDF) & !is.na(DenDF) ~ 
           sprintf("F(%s, %.2f) = %.2f, p %s, np2 = %s", NumDF, DenDF, F_val, p_str, Eta_str),
+        !is.na(F_val) & !is.na(NumDF) & is.na(DenDF) ~ 
+          sprintf("F(%s, -) = %.2f, p %s, np2 = %s", NumDF, F_val, p_str, Eta_str),
         TRUE ~ "Format not supported"
       )
     ) %>%
@@ -170,6 +173,7 @@ format_coefs <- function(model) {
     return(coef_df)
   })
 }
+
 
 ```
 
@@ -218,7 +222,8 @@ load_and_prep <- function(path_erp, df_covariates, erp_name, baseline_col) {
   
   if(!is.null(baseline_col) && baseline_col %in% names(df)) {
     df$Baseline_Raw <- df[[baseline_col]]
-    df$Baseline_c <- df$Baseline_Raw - mean(df$Baseline_Raw, na.rm=TRUE)
+    # Robust Standardization: Z-scoring the baseline stabilizes optimizer and Satterthwaite approximations.
+    df$Baseline_c <- as.numeric(scale(df$Baseline_Raw, center=TRUE, scale=TRUE))
   } else { df$Baseline_c <- 0 }
   
   if(!is.null(df_covariates)) df <- left_join(df, df_covariates, by = "participant_id")
@@ -229,6 +234,7 @@ check_uniqueness <- function(df, context_name) {
   if(nrow(df) != n_distinct(select(df, participant_id, index))) 
     stop(sprintf("CRITICAL ERROR: Duplicate keys (ID+Index) found in %s", context_name))
 }
+
 
 ```
 
@@ -386,25 +392,25 @@ run_regression_analysis <- function(data, erp_name, out_dir, exp_version, use_sv
   cat("   >>> Analysis Complete.\n")
 }
 
+
 ```
 
 ```{r execution}
 # ==============================================================================
 # Execution Phase
 # ==============================================================================
-# Dynamically mapping upstream paths to align with Pipline_UG_OfferPhase.Rmd
+# Dynamic path mapping to align with upstream preprocessing script.
 path_pipeline <- here("data", paste0("02_Pipeline_Output_", experiment_version))
 
 path_stim <- file.path(path_pipeline, "Method_Regression", "Stimulus_Locked", "trials.csv")
 path_resp <- file.path(path_pipeline, "Method_Regression", "Response_Locked", "trials.csv")
 
-# NOTE: Verify if the Covariates folder is also sandboxed per experiment in your actual file system.
-# In the updated pipeline, Covariates are saved inside 02_Pipeline_Output_E1/E2
+# Note: Verify covariate folder structure synchronization with upstream pipeline.
 path_cov_csv <- file.path(path_pipeline, "Covariates", "SVO_PID5BF_PostRating.csv")
 path_cov_xlsx <- file.path(path_pipeline, "Covariates", "SVO_PID5BF_PostRating.xlsx")
 path_cov <- if(file.exists(path_cov_csv)) path_cov_csv else path_cov_xlsx
 
-if(!file.exists(path_stim)) stop(sprintf("Stimulus file not found at: %s\nHave you run the upstream preprocessing script for %s?", path_stim, experiment_version))
+if(!file.exists(path_stim)) stop(sprintf("Stimulus file not found at: %s\nVerify upstream preprocessing completion for %s.", path_stim, experiment_version))
 
 cat("--- Loading Covariates ---\n")
 df_covs <- load_covariates(path_cov)
@@ -448,7 +454,8 @@ if(file.exists(path_resp) && file.exists(path_stim)) {
       if(sum(is.na(df_comp_merged$Baseline_LPP_offer)) > 0) warning(sprintf("%s: Missing baseline matches.", comp_name))
       
       df_comp_merged$Baseline_Raw <- df_comp_merged$Baseline_LPP_offer
-      df_comp_merged$Baseline_c <- as.numeric(scale(df_comp_merged$Baseline_Raw, center=TRUE, scale=FALSE))
+      # Robust Standardization for Response-Locked phase
+      df_comp_merged$Baseline_c <- as.numeric(scale(df_comp_merged$Baseline_Raw, center=TRUE, scale=TRUE))
       
       run_regression_analysis(df_comp_merged %>% filter(!is.na(Baseline_c)), comp_name, out_root, experiment_version, use_svo = use_cov)
     }
@@ -456,6 +463,7 @@ if(file.exists(path_resp) && file.exists(path_stim)) {
 }
 
 cat(sprintf("\n========================================\n   %s Master Analysis Pipeline Completed.\n========================================\n", experiment_version))
+
 
 ```
 
