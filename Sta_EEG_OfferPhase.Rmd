@@ -13,7 +13,7 @@ output:
     fig_height: 6
 ---
 
-``` {r setup, include=FALSE}
+```{r setup, include=FALSE}
 # ==============================================================================
 # 1. Global Configuration & Environment
 # ==============================================================================
@@ -94,14 +94,64 @@ custom_control <- lmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 2000
 
 ```{r apa-module}
 # ==============================================================================
-# Helper Function: Format ANOVA F-Table to APA String
+# Helper: Universal Type Conversion, Missing Value Handler & Column Purger
 # ==============================================================================
-format_anova_apa <- function(anova_obj) {
+kill_scipen <- function(df) {
+  df_clean <- df %>% 
+    # Type Cast Constraint: Prevent base R ifelse() from stripping factor labels.
+    mutate(across(where(is.factor), as.character)) %>%
+    mutate(across(everything(), ~ {
+      vec <- .
+      if(is.numeric(vec)) {
+        vec <- format(round(vec, 4), scientific = FALSE, trim = TRUE)
+      }
+      vec <- ifelse(vec == "Inf" | vec == "-Inf" | is.infinite(vec), "Inf", vec)
+      vec <- ifelse(is.na(vec) | vec == "NA", "-", as.character(vec))
+      vec
+    }))
+  
+  df_clean <- df_clean %>% select(where(~ !all(. == "-")))
+  return(df_clean)
+}
+
+# ==============================================================================
+# Helper: Significance Stars Generator
+# ==============================================================================
+add_sig_stars <- function(p) {
+  case_when(
+    is.na(p) ~ "-",
+    p < 0.001 ~ "***",
+    p < 0.01  ~ "**",
+    p < 0.05  ~ "*",
+    p < 0.1   ~ ".",
+    TRUE      ~ "ns"
+  )
+}
+
+# ==============================================================================
+# Helper: Map Sum-Coding Suffixes back to Actual Factor Levels globally
+# ==============================================================================
+beautify_labels <- function(df) {
+  dict <- c(
+    "\\bemotion1\\b" = "emotion[neu]",
+    "\\bemotion2\\b" = "emotion[aff]",
+    "\\bemotion3\\b" = "emotion[dis]",
+    "\\bemotion4\\b" = "emotion[dom]",
+    "\\boffer_type1\\b" = "offer_type[fair]",
+    "\\boffer_type2\\b" = "offer_type[unfair]"
+  )
+  df %>% mutate(across(where(is.character), ~ stringr::str_replace_all(., dict)))
+}
+
+# ==============================================================================
+# Helper: Format ANOVA Table to APA String 
+# ==============================================================================
+format_anova_apa <- function(anova_obj, model) {
   df_res <- as.data.frame(anova_obj) %>% tibble::rownames_to_column("Effect")
   
   es_df <- data.frame(Parameter = character(), Eta2_partial = numeric())
   tryCatch({
-    es <- effectsize::eta_squared(anova_obj, partial = TRUE, ci = 0.95, verbose = FALSE)
+    es <- effectsize::eta_squared(model, partial = TRUE, ci = 0.95, verbose = FALSE)
     es_df <- as.data.frame(es) %>% select(Parameter, Eta2_partial)
   }, error = function(e) NULL)
   
@@ -115,63 +165,77 @@ format_anova_apa <- function(anova_obj) {
   
   df_res <- df_res %>%
     mutate(
-      F_val  = get_col("F value"), NumDF  = get_col("NumDF"),
-      DenDF  = get_col("DenDF"),   p_val  = get_col("Pr(>F)"),
+      F_val  = get_col("F value"), 
+      NumDF  = get_col("NumDF"), 
+      DenDF  = get_col("DenDF"), 
+      Df_val = get_col("Df"),
+      p_val  = get_col("Pr(>F)"),
+      Sig = add_sig_stars(p_val),
       p_str = case_when(
-        is.na(p_val) ~ "-",
-        p_val < .001 ~ "< .001",
-        TRUE ~ paste0("= ", sprintf("%.3f", p_val))
+        is.na(p_val) ~ "-", 
+        p_val < .001 ~ "< .001", 
+        TRUE ~ paste0("= ", format(round(p_val, 3), scientific=FALSE, trim=TRUE))
       ),
-      Eta_str = ifelse(is.na(Eta2_partial), "-", sprintf("%.2f", Eta2_partial)),
+      Eta_str = ifelse(is.na(Eta2_partial), "-", format(round(Eta2_partial, 2), scientific=FALSE, trim=TRUE)),
+      
       APA_Report = case_when(
-        !is.na(F_val) & !is.na(NumDF) & !is.na(DenDF) ~ 
-          sprintf("F(%s, %.2f) = %.2f, p %s, np2 = %s", NumDF, DenDF, F_val, p_str, Eta_str),
-        !is.na(F_val) & !is.na(NumDF) & is.na(DenDF) ~ 
-          sprintf("F(%s, -) = %.2f, p %s, np2 = %s", NumDF, F_val, p_str, Eta_str),
-        TRUE ~ "Format not supported"
+        !is.na(F_val) & !is.na(NumDF) & !is.na(DenDF) ~ sprintf("F(%s, %.2f) = %.2f, p %s, np2 = %s", NumDF, DenDF, F_val, p_str, Eta_str),
+        !is.na(F_val) & !is.na(NumDF) & is.na(DenDF) ~ sprintf("F(%s, -) = %.2f, p %s, np2 = %s", NumDF, F_val, p_str, Eta_str),
+        !is.na(F_val) & !is.na(Df_val) ~ sprintf("F(%s) = %.2f, p %s, np2 = %s", Df_val, F_val, p_str, Eta_str),
+        TRUE ~ "Format error: Unrecognized test statistic"
       )
-    ) %>%
-    select(Effect, APA_Report, F_value = F_val, NumDF, DenDF, p_value = p_val, Eta2_partial)
+    ) %>% 
+    select(Effect, APA_Report, Sig, F_val, NumDF, DenDF, Df_val, Eta2_partial, p_val)
   
-  return(df_res)
+  return(beautify_labels(kill_scipen(df_res)))
 }
 
 # ==============================================================================
-# Helper Function: Format Post-hoc tests (with CI)
+# Helper: Format Post-hoc tests 
 # ==============================================================================
 format_posthoc_apa <- function(emm_df) {
   df_clean <- as.data.frame(emm_df)
+  
+  est_col <- intersect(names(df_clean), c("estimate", "response", "odds.ratio", "emmean"))
+  if(length(est_col) == 0) est_col <- names(df_clean)[2] 
+  
+  df_clean <- df_clean %>% 
+    mutate(
+      Sig = add_sig_stars(p.value),
+      p_str = case_when(p.value < .001 ~ "< .001", TRUE ~ paste0("= ", format(round(p.value, 3), scientific=FALSE, trim=TRUE)))
+    )
+  
   if("t.ratio" %in% names(df_clean)) {
-    df_clean <- df_clean %>%
-      mutate(
-        p_str = case_when(p.value < .001 ~ "< .001", TRUE ~ paste0("= ", sprintf("%.3f", p.value))),
-        t_str = sprintf("%.2f", t.ratio), df_str = sprintf("%.2f", df), 
-        estimate_col = if("estimate" %in% names(.)) estimate else if("response" %in% names(.)) response else NA,
-        estimate_str = sprintf("%.2f", estimate_col), se_str = sprintf("%.2f", SE),
-        Stats_String = sprintf("b = %s (SE=%s), t(%s) = %s, p %s", estimate_str, se_str, df_str, t_str, p_str)
-      )
+    df_clean <- df_clean %>% mutate(
+      Stats_String = sprintf("b = %.2f (SE = %.2f), t(%s) = %.2f, p %s", !!sym(est_col[1]), SE, ifelse(is.infinite(df), "Inf", round(df, 2)), t.ratio, p_str)
+    )
+  } else if("z.ratio" %in% names(df_clean)) {
+    df_clean <- df_clean %>% mutate(
+      Stats_String = sprintf("b = %.2f (SE = %.2f), z = %.2f, p %s", !!sym(est_col[1]), SE, z.ratio, p_str)
+    )
   }
-  return(df_clean)
+  
+  df_clean <- df_clean %>% select(-p_str) %>% relocate(Sig, .after = Stats_String)
+  return(beautify_labels(kill_scipen(df_clean)))
 }
 
 # ==============================================================================
-# Helper Function: Format Raw Coefficients 
+# Helper: Format Raw Coefficients and Map Contrast Names
 # ==============================================================================
 format_coefs <- function(model) {
-  tryCatch({
-    params <- parameters::model_parameters(model, ci = 0.95, effects = "fixed")
-    df_params <- as.data.frame(params)
-    
+  df_out <- tryCatch({
+    df_params <- as.data.frame(parameters::model_parameters(model, ci = 0.95, effects = "fixed"))
     stat_col <- if("t" %in% names(df_params)) "t" else if("z" %in% names(df_params)) "z" else "Statistic"
     
     df_params %>% mutate(
-      p_str = case_when(p < .001 ~ "< .001", TRUE ~ paste0("= ", sprintf("%.3f", p))),
+      Sig = add_sig_stars(p),
+      p_str = case_when(p < .001 ~ "< .001", TRUE ~ paste0("= ", format(round(p, 3), scientific=FALSE, trim=TRUE))),
       Report = sprintf("b = %.2f, SE = %.2f, %s = %.2f, p %s", Coefficient, SE, stat_col, !!sym(stat_col), p_str)
-    )
-  }, error = function(e) {
-    coef_df <- as.data.frame(summary(model)$coefficients) %>% tibble::rownames_to_column("Predictor")
-    return(coef_df)
-  })
+    ) %>% select(-p_str) %>% relocate(Sig, .after = Report)
+    
+  }, error = function(e) as.data.frame(summary(model)$coefficients) %>% tibble::rownames_to_column("Predictor"))
+  
+  return(beautify_labels(kill_scipen(df_out)))
 }
 
 
@@ -296,7 +360,7 @@ run_regression_analysis <- function(data, erp_name, out_dir, exp_version, use_sv
   cat("\n   [FINAL MODEL FORMULA]:\n   ", str_squish(formula_str), "\n\n")
 
   anova_res <- anova(FINAL_MODEL, type = 3, ddf = "Satterthwaite")
-  anova_apa <- format_anova_apa(anova_res)
+  anova_apa <- format_anova_apa(anova_res, FINAL_MODEL)
   print(anova_apa %>% select(Effect, APA_Report))
 
   # ----------------------------------------------------------------------------
@@ -348,7 +412,9 @@ run_regression_analysis <- function(data, erp_name, out_dir, exp_version, use_sv
     }
   }
 
-  list_of_tables[["Descriptive_Means_SE"]] <- as.data.frame(emmeans(FINAL_MODEL, ~ offer_type * emotion, at = list(Baseline_c = 0)))
+  list_of_tables[["Descriptive_Means_SE"]] <- beautify_labels(kill_scipen(
+    as.data.frame(emmeans(FINAL_MODEL, as.formula(paste("~ offer_type * emotion", if(svo_survived) "* SVO_Z" else "")), at = at_list))
+  ))
   
   # ----------------------------------------------------------------------------
   # Data Export & Visualization
