@@ -13,11 +13,9 @@ Description:
       by the upstream hierarchical statistical gating mechanism.
     - Multi-source data fusion: Accommodates both single-experiment and 
       cross-experiment concatenated raw data (trials.csv) for diagnostic plotting.
-    - Faceted rendering: Maps visualization grids dynamically based on experimental 
-      batch identifiers to prevent coordinate overlap in pooled datasets.
-    - Publication Standards: Ensures independent Y-axis tick marks across shared
-      scales and generates clean, presentation-ready academic titles (e.g., 
-      expanding 'E1' to 'Experiment 1' to avoid semantic redundancy).
+    - Publication Standards: Implements strict APA-7th typographic conventions, 
+      maximizing data-ink ratio by removing title/axis redundancies and utilizing
+      concise academic abbreviations (e.g., 'Exp. 1', 'Rejection Rate').
 
 Date: 2026-03-05
 ================================================================================
@@ -38,7 +36,7 @@ import matplotlib.colors as mcolors
 # ==============================================================================
 # 1) Global Configuration
 # ==============================================================================
-EXPERIMENT_VERSION = "CrossExp_E1_vs_E2"  # CLI arguments override this default
+EXPERIMENT_VERSION = "E1" #"CrossExp_E1_vs_E2" or "E1" or "E2"
 ERROR_BAR_TYPE = "SE"
 CI_MULTIPLIER = 1.96
 RT_Y_MIN = 600
@@ -59,7 +57,6 @@ COLOR_MAP = {
     "aff": "#91D1C2", "enj": "#3C5488"
 }
 
-# Target prefixes for Post-Hoc sheets exported from R.
 POSTHOC_SHEET_PREFIXES = (
     "PostHoc_", 
     "SimpleSimple_", 
@@ -79,13 +76,8 @@ def detect_project_root(start: Path) -> Path | None:
 
 def choose_output_root(project_root: Path, exp_version: str, prefer_debug: bool = False) -> Path:
     beh_root = project_root / "results" / "Behavioral"
-    
     if exp_version == "CrossExp_E1_vs_E2":
-        cross_dirs = [
-            beh_root / "CrossExp_E1_vs_E2_Pub_Output_Final", 
-            beh_root / "CrossExp_E1_vs_E2_Pub_Output", 
-            beh_root / "CrossExp_E1_vs_E2_Debug_Output"
-        ]
+        cross_dirs = [beh_root / "CrossExp_E1_vs_E2_Pub_Output_Final", beh_root / "CrossExp_E1_vs_E2_Pub_Output", beh_root / "CrossExp_E1_vs_E2_Debug_Output"]
         for d in cross_dirs:
             if d.exists(): return d
         raise FileNotFoundError(f"CrossExp output directory not found in {beh_root}.")
@@ -106,10 +98,8 @@ def choose_output_root(project_root: Path, exp_version: str, prefer_debug: bool 
 def find_trials_csv(project_root: Path, exp_version: str) -> list[Path]:
     all_trials = list(project_root.rglob("trials.csv"))
     if not all_trials: return []
-    
     if exp_version == "CrossExp_E1_vs_E2":
         return [p for p in all_trials if "Method_Regression" in str(p) and ("E1" in str(p) or "E2" in str(p))]
-        
     strict = [p for p in all_trials if exp_version in str(p) and "Method_Regression" in str(p)]
     if strict: return strict
     vers = [p for p in all_trials if exp_version in str(p)]
@@ -138,7 +128,7 @@ def _nice_ylim(values: pd.Series, lower_q=0.01, upper_q=0.99, pad_ratio=0.08):
 # ==============================================================================
 # 3) Plotting: GLMM Interactions (Line & Bar) & Forest Plots
 # ==============================================================================
-def plot_interaction_line(df, y_col, lower_col, upper_col, ylabel, title, filename):
+def plot_interaction_line(df, y_col, lower_col, upper_col, ylabel, main_title, filename):
     x_axis = "offer_type" if "offer_type" in df.columns else ("offer_ratio" if "offer_ratio" in df.columns else None)
     if not x_axis: return
     
@@ -161,20 +151,28 @@ def plot_interaction_line(df, y_col, lower_col, upper_col, ylabel, title, filena
         ax.tick_params(labelleft=True)
         ax.set_ylabel(ylabel, fontsize=12)
         
-        # Format "E1" to "Experiment 1" dynamically
-        exp_str = f"Experiment {exp[1:]}" if isinstance(exp, str) and exp.startswith("E") and exp[1:].isdigit() else str(exp)
-        display_title = f"{title} ({exp_str})" if has_exp else title
-        ax.set_title(display_title, fontweight="bold", fontsize=14, pad=12)
-        
+        if has_exp:
+            exp_val = str(exp).replace("E", "") if str(exp).startswith("E") else str(exp)
+            ax.set_title(f"Exp. {exp_val}", fontweight="bold", fontsize=14, pad=12)
+        else:
+            ax.set_title(main_title, fontweight="bold", fontsize=14, pad=12)
+            
         if "Time" in ylabel or "ms" in ylabel:
             if RT_Y_MIN: ax.set_ylim(bottom=RT_Y_MIN)
         else: ax.set_ylim(0, 1.05)
         sns.despine(ax=ax)
         
-    axes[-1].legend(bbox_to_anchor=(1.02, 1), loc="upper left", frameon=False)
-    plt.tight_layout(); plt.savefig(filename, dpi=300); plt.close(fig)
+    handles, labels = axes[0].get_legend_handles_labels()
+    axes[-1].legend(handles, labels, bbox_to_anchor=(1.02, 1), loc="upper left", frameon=False, title="Emotion Context", title_fontproperties={'weight':'bold'})
+    
+    if has_exp:
+        fig.suptitle(main_title, fontsize=16, fontweight="bold", y=1.05)
+        
+    plt.tight_layout()
+    plt.savefig(filename, dpi=300, bbox_inches='tight')
+    plt.close(fig)
 
-def plot_interaction_bar(df, y_col, lower_col, upper_col, ylabel, title, filename):
+def plot_interaction_bar(df, y_col, lower_col, upper_col, ylabel, main_title, filename):
     x_axis = "offer_type" if "offer_type" in df.columns else ("offer_ratio" if "offer_ratio" in df.columns else None)
     if not x_axis: return
     has_exp = "Exp" in df.columns
@@ -205,19 +203,26 @@ def plot_interaction_bar(df, y_col, lower_col, upper_col, ylabel, title, filenam
         ax.tick_params(labelleft=True)
         ax.set_ylabel(ylabel, fontsize=12)
         
-        exp_str = f"Experiment {exp[1:]}" if isinstance(exp, str) and exp.startswith("E") and exp[1:].isdigit() else str(exp)
-        display_title = f"{title} ({exp_str})" if has_exp else title
-        ax.set_title(display_title, fontweight="bold", fontsize=14, pad=12)
-        
+        if has_exp:
+            exp_val = str(exp).replace("E", "") if str(exp).startswith("E") else str(exp)
+            ax.set_title(f"Exp. {exp_val}", fontweight="bold", fontsize=14, pad=12)
+        else:
+            ax.set_title(main_title, fontweight="bold", fontsize=14, pad=12)
+            
         if "Time" in ylabel or "ms" in ylabel:
             if RT_Y_MIN: ax.set_ylim(bottom=RT_Y_MIN)
         else: ax.set_ylim(0, 1.05)
         sns.despine(ax=ax)
         
     handles, labels = axes[0].get_legend_handles_labels()
-    axes[-1].legend(handles, labels, bbox_to_anchor=(1.02, 1), loc="upper left", frameon=False)
+    axes[-1].legend(handles, labels, bbox_to_anchor=(1.02, 1), loc="upper left", frameon=False, title="Emotion Context", title_fontproperties={'weight':'bold'})
     
-    plt.tight_layout(); plt.savefig(filename, dpi=300); plt.close(fig)
+    if has_exp:
+        fig.suptitle(main_title, fontsize=16, fontweight="bold", y=1.05)
+        
+    plt.tight_layout()
+    plt.savefig(filename, dpi=300, bbox_inches='tight')
+    plt.close(fig)
 
 def plot_forest_from_posthoc(df: pd.DataFrame, title: str, filename: Path, mode: str):
     if df.empty: return
@@ -227,11 +232,22 @@ def plot_forest_from_posthoc(df: pd.DataFrame, title: str, filename: Path, mode:
     contrast_col = "contrast" if "contrast" in df.columns else None
     if not est_col or not p_col: return
 
-    labels = df[contrast_col].astype(str) if contrast_col else df.index.astype(str)
-    
+    labels = pd.Series(df[contrast_col].astype(str) if contrast_col else df.index.astype(str))
+    labels = labels.str.replace("fair", "Fair").str.replace("unfair", "Unfair")
+    for k, v in LABEL_MAP.items():
+        labels = labels.str.replace(fr'\b{k}\b', v, regex=True)
+        
     for col in ["Exp", "emotion", "offer_type"]:
         if col in df.columns and col != contrast_col: 
-            labels = df[col].astype(str) + " | " + labels
+            prefix = df[col].astype(str)
+            if col == "Exp":
+                prefix = prefix.replace({"E1": "Exp. 1", "E2": "Exp. 2"})
+            elif col == "offer_type":
+                prefix = prefix.str.capitalize()
+            elif col == "emotion":
+                prefix = prefix.map(lambda x: LABEL_MAP.get(x, x))
+            
+            labels = prefix + " | " + labels
             
     df_plot = df.copy().reset_index(drop=True)
     df_plot["label"] = labels
@@ -262,19 +278,19 @@ def plot_forest_from_posthoc(df: pd.DataFrame, title: str, filename: Path, mode:
     ax.set_yticklabels(df_plot["label"])
     ax.axvline(ref, color="black", linestyle=":", lw=1)
     ax.set_xlabel(xlab)
-    ax.set_title(title, pad=15, fontweight="bold", fontsize=15)
+    ax.set_title(title, pad=15, fontweight="bold", fontsize=14)
     
-    sns.despine(); plt.tight_layout(); plt.savefig(filename, dpi=300); plt.close(fig)
+    sns.despine(); plt.tight_layout()
+    plt.savefig(filename, dpi=300, bbox_inches='tight')
+    plt.close(fig)
 
 # ==============================================================================
 # 4) Raw Data Loading & Advanced Raincloud Plotting
 # ==============================================================================
 def load_and_clean_trials(trials_paths: list[Path]) -> pd.DataFrame:
     df_list = []
-    
     for path in trials_paths:
         df = pd.read_csv(path)
-        
         path_str = str(path)
         exp_label = "E1" if "E1" in path_str else ("E2" if "E2" in path_str else "E_UNK")
         df["Exp"] = exp_label
@@ -305,7 +321,6 @@ def load_and_clean_trials(trials_paths: list[Path]) -> pd.DataFrame:
             df = df[(df["RT"] >= 150) & (df["RT"] <= 3000)].copy()
             
         df_list.append(df)
-        
     return pd.concat(df_list, ignore_index=True) if df_list else pd.DataFrame()
 
 def plot_facet_paired_box_violin(
@@ -313,7 +328,7 @@ def plot_facet_paired_box_violin(
     output_path_png: Path, subject_col: str = "participant_id", 
     emotion_col: str = "emotion", offer_col: str = "offer_type", 
     offer_order=("fair", "unfair"), label_map=None, color_map=None,
-    violin_alpha=0.25, box_alpha=0.45, point_alpha=0.75, point_size=28,
+    violin_alpha=0.35, box_alpha=0.90, point_alpha=0.85, point_size=28,
     jitter=0.12, pair_gap=0.55, group_gap=0.95, bw_adjust=0.85
 ):
     if label_map is None: label_map = {}
@@ -373,7 +388,8 @@ def plot_facet_paired_box_violin(
                 ax.plot(x_right, y_grid, color=_rgba(color, 0.65), linewidth=1.2, zorder=2)
             except: pass
 
-        ax.set_title("Fair" if offer == "fair" else "Unfair", fontsize=15, fontweight="bold")
+        offer_label = "Fair Offers" if offer == "fair" else "Unfair Offers"
+        ax.set_title(offer_label, fontsize=15, fontweight="bold", pad=10)
         ax.set_xticks(tick_positions)
         ax.set_xticklabels([label_map.get(e, e) for e in EMOTION_ORDER])
         ax.set_xlim(positions[0][0] - 0.75, positions[-1][1] + 0.75)
@@ -383,8 +399,8 @@ def plot_facet_paired_box_violin(
         ax.set_ylabel(y_label, fontsize=13, fontweight="bold")
         sns.despine(ax=ax)
 
-    fig.suptitle(title, fontsize=18, fontweight="bold", y=1.03)
-    plt.tight_layout(rect=[0, 0, 1, 0.95])
+    fig.suptitle(title, fontsize=18, fontweight="bold", y=1.05)
+    plt.tight_layout()
     plt.savefig(output_path_png, dpi=300, bbox_inches="tight")
     plt.close(fig)
 
@@ -412,9 +428,11 @@ def plot_individual_heatmap(df_raw: pd.DataFrame, val_col: str, val_label: str, 
     ax.set_title(title, fontsize=15, fontweight="bold", pad=20)
     ax.set_ylabel("Participant ID", fontsize=12)
     plt.xticks(rotation=45, ha="right")
-    plt.tight_layout(); plt.savefig(output_path, dpi=300); plt.close(fig)
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=300, bbox_inches='tight')
+    plt.close(fig)
 
-def plot_diagnostic_fairness_scatter(df_raw: pd.DataFrame, output_path: Path):
+def plot_diagnostic_fairness_scatter(df_raw: pd.DataFrame, output_path: Path, title: str):
     if "rejection_rate" not in df_raw.columns: return
     df_agg = df_raw.groupby(["participant_id", "offer_type"], as_index=False)["rejection_rate"].mean()
     df_pivot = df_agg.pivot(index="participant_id", columns="offer_type", values="rejection_rate").fillna(0)
@@ -432,13 +450,15 @@ def plot_diagnostic_fairness_scatter(df_raw: pd.DataFrame, output_path: Path):
         if (f_rej > 25) or (u_rej < 60) or ((u_rej - f_rej) < 20):
             ax.annotate(subj, (f_rej, u_rej), xytext=(5, 5), textcoords="offset points", fontsize=8, color="#E64B35", fontweight="bold", bbox=dict(boxstyle="round", fc="white", ec="none", alpha=0.7))
 
-    ax.set_title("Diagnostic: Offer Fairness Sensitivity", fontweight="bold", fontsize=15)
+    ax.set_title(title, fontweight="bold", fontsize=15, pad=12)
     ax.set_xlabel("Rejection Rate on FAIR Offers (%)"); ax.set_ylabel("Rejection Rate on UNFAIR Offers (%)")
     ax.set_xlim(-5, 105); ax.set_ylim(-5, 105)
     ax.legend(loc="lower right", frameon=True)
-    sns.despine(); plt.tight_layout(); plt.savefig(output_path, dpi=300); plt.close(fig)
+    sns.despine(); plt.tight_layout()
+    plt.savefig(output_path, dpi=300, bbox_inches='tight')
+    plt.close(fig)
 
-def plot_diagnostic_emotion_scatter(df_raw: pd.DataFrame, output_path: Path):
+def plot_diagnostic_emotion_scatter(df_raw: pd.DataFrame, output_path: Path, title: str):
     if "rejection_rate" not in df_raw.columns: return
     df_emo = df_raw.groupby(["participant_id", "emotion"], as_index=False)["rejection_rate"].mean()
     df_range = df_emo.groupby("participant_id")["rejection_rate"].agg(emo_range=lambda x: x.max()-x.min(), mean_rej="mean").reset_index()
@@ -451,11 +471,13 @@ def plot_diagnostic_emotion_scatter(df_raw: pd.DataFrame, output_path: Path):
         if row["emo_range"] > 50:
             ax.annotate(row["participant_id"], (row["mean_rej"], row["emo_range"]), xytext=(5, 5), textcoords="offset points", fontsize=8, color="#E64B35", fontweight="bold")
 
-    ax.set_title("Diagnostic: Global Emotion Volatility", fontweight="bold", fontsize=15)
-    ax.set_xlabel("Overall Average Rejection Rate (%)"); ax.set_ylabel("Emotion-driven Volatility (Max - Min %)")
+    ax.set_title(title, fontweight="bold", fontsize=15, pad=12)
+    ax.set_xlabel("Overall Average Rejection Rate (%)"); ax.set_ylabel("Emotion-Driven Volatility (Max - Min %)")
     ax.set_xlim(-5, 105); ax.set_ylim(-5, 105)
     ax.legend(loc="upper right", frameon=True)
-    sns.despine(); plt.tight_layout(); plt.savefig(output_path, dpi=300); plt.close(fig)
+    sns.despine(); plt.tight_layout()
+    plt.savefig(output_path, dpi=300, bbox_inches='tight')
+    plt.close(fig)
 
 # ==============================================================================
 # 6) Automated Documentation Generation
@@ -512,14 +534,45 @@ justification for sensitivity analyses.
 # ==============================================================================
 # 7) Main Execution Pipeline
 # ==============================================================================
+def format_academic_sheet_name(sheet: str) -> str:
+    """Translates raw R variable sheet names into professional academic titles."""
+    s = sheet.replace("PostHoc_Main_", "Main Effect: ")
+    s = s.replace("PostHoc_", "Pairwise: ")
+    s = s.replace("SimpleSimple_", "Simple Simple: ")
+    s = s.replace("Simple_", "Simple: ")
+    s = s.replace("Interaction_Contrast", "Interaction Contrasts")
+    s = s.replace("Joint_2Way_", "Joint 2-Way: ")
+    s = s.replace("_", " ").strip()
+    
+    replacements = {
+        "offer type": "Offer Fairness",
+        "emotion": "Emotion",
+        "Exp": "Experiment",
+        "Emo": "Emotion",
+        "by": "across"
+    }
+    for old, new in replacements.items():
+        s = s.replace(old, new)
+    return s
+
 def process_label_folder(label_dir: Path, figures_dir: Path, exp_version: str):
     print(f"\n>>> Processing Label: {label_dir.name} [{exp_version}]")
     excel_candidates = list(label_dir.glob(f"STATS_REPORT_*.xlsx"))
     if not excel_candidates: return
     xls = pd.ExcelFile(excel_candidates[0])
 
-    metric_name = "Rejection Rate" if "Rejection" in label_dir.name else "Reaction Time"
-    interaction_title = f"Interaction Effects on {metric_name}"
+    is_cross_exp = "CrossExp" in exp_version
+    if exp_version.startswith("E") and exp_version[1:].isdigit():
+        global_exp_str = f"Exp. {exp_version[1:]}"
+    elif is_cross_exp:
+        global_exp_str = "Cross-Experiment"
+    else:
+        global_exp_str = str(exp_version)
+
+    if is_cross_exp:
+        interaction_title = "Emotion \u00D7 Offer Fairness"
+    else:
+        interaction_title = f"Emotion \u00D7 Offer Fairness ({global_exp_str})"
 
     if "Descriptive_Means_SE" in xls.sheet_names:
         df_desc = pd.read_excel(xls, sheet_name="Descriptive_Means_SE")
@@ -540,7 +593,7 @@ def process_label_folder(label_dir: Path, figures_dir: Path, exp_version: str):
                     se_ms = df_desc["RT_ms"] * df_desc[se_col].astype(float)
                     mult = 1.0 if ERROR_BAR_TYPE == "SE" else CI_MULTIPLIER
                     df_desc["lower_ms"], df_desc["upper_ms"] = df_desc["RT_ms"] - (mult * se_ms), df_desc["RT_ms"] + (mult * se_ms)
-                    y_use, l_use, u_use, ylab = "RT_ms", "lower_ms", "upper_ms", f"Reaction Time (ms) ({ERROR_BAR_TYPE})"
+                    y_use, l_use, u_use, ylab = "RT_ms", "lower_ms", "upper_ms", f"Reaction Time (ms, \u00B1 {ERROR_BAR_TYPE})"
                 else:
                     if ERROR_BAR_TYPE == "SE":
                         df_desc["__LCL_SE"], df_desc["__UCL_SE"] = df_desc[y_col] - df_desc[se_col], df_desc[y_col] + df_desc[se_col]
@@ -548,7 +601,7 @@ def process_label_folder(label_dir: Path, figures_dir: Path, exp_version: str):
                     else:
                         df_desc["__LCL"], df_desc["__UCL"] = df_desc[y_col] - CI_MULTIPLIER * df_desc[se_col], df_desc[y_col] + CI_MULTIPLIER * df_desc[se_col]
                         l_use, u_use = lower_col if lower_col else "__LCL", upper_col if upper_col else "__UCL"
-                    y_use, ylab = y_col, f"Rejection Probability ({ERROR_BAR_TYPE})"
+                    y_use, ylab = y_col, f"Rejection Rate (\u00B1 {ERROR_BAR_TYPE})"
 
                 tag = f"{exp_version}_{label_dir.name}"
                 plot_interaction_line(df_desc, y_use, l_use, u_use, ylab, interaction_title, figures_dir / f"{tag}_Interaction_Line.png")
@@ -559,8 +612,8 @@ def process_label_folder(label_dir: Path, figures_dir: Path, exp_version: str):
             df_ph = pd.read_excel(xls, sheet_name=sheet)
             if "emotion" in df_ph.columns: df_ph["emotion"] = df_ph["emotion"].apply(normalize_emotion)
             
-            clean_sheet_name = sheet.replace("_", " ").strip()
-            forest_title = f"Post-Hoc Contrasts: {clean_sheet_name}"
+            clean_sheet_name = format_academic_sheet_name(sheet)
+            forest_title = f"{clean_sheet_name} ({global_exp_str})"
             
             plot_forest_from_posthoc(df_ph, forest_title, figures_dir / f"{exp_version}_{label_dir.name}_{sheet}_Forest.png", "rejection" if "Rejection" in label_dir.name else "rt")
         except Exception as e:
@@ -585,28 +638,31 @@ def plot_distributions_from_trials(trials_paths: list[Path], figures_dir: Path, 
     for exp in exps:
         print(f"   -> Generating sub-renderings for batch: {exp}")
         df_exp = df_trials[df_trials["Exp"] == exp].copy()
-        
         tag = f"CrossExp_{exp}" if exp_version == "CrossExp_E1_vs_E2" else exp_version
         
-        # Format string intelligently to avoid redundancy (e.g., E1 -> Experiment 1)
-        exp_display = f"Experiment {exp[1:]}" if isinstance(exp, str) and exp.startswith("E") and exp[1:].isdigit() else (str(exp) if exp else "Overall")
+        # Rigorous translation for maximum conciseness
+        exp_display = f"Exp. {exp[1:]}" if isinstance(exp, str) and exp.startswith("E") and exp[1:].isdigit() else (str(exp) if exp else "Overall")
+        title_suffix = f" ({exp_display})"
         
         if "RT" in df_exp.columns: 
-            rain_title = f"Distribution of Reaction Time ({exp_display})"
+            rain_title = f"Reaction Time{title_suffix}"
             plot_facet_paired_box_violin(df_exp, "RT", "Reaction Time (ms)", rain_title, rain_dir / f"Dist_{tag}_RT_Raincloud.png", color_map=COLOR_MAP, label_map=LABEL_MAP)
             
-            heat_title = f"Subject Diagnostic: Reaction Time Matrix ({exp_display})"
+            heat_title = f"Diagnostic: RT Matrix{title_suffix}"
             plot_individual_heatmap(df_exp, "RT", "Mean RT (ms)", heat_title, heat_dir / f"Diag_{tag}_RT_Heatmap.png")
             
         if "rejection_rate" in df_exp.columns: 
-            rain_title = f"Distribution of Rejection Rate ({exp_display})"
+            rain_title = f"Rejection Rate{title_suffix}"
             plot_facet_paired_box_violin(df_exp, "rejection_rate", "Rejection Rate (%)", rain_title, rain_dir / f"Dist_{tag}_Rejection_Raincloud.png", color_map=COLOR_MAP, label_map=LABEL_MAP)
             
-            heat_title = f"Subject Diagnostic: Rejection Rate Matrix ({exp_display})"
+            heat_title = f"Diagnostic: Rejection Rate Matrix{title_suffix}"
             plot_individual_heatmap(df_exp, "rejection_rate", "Rejection Rate (%)", heat_title, heat_dir / f"Diag_{tag}_Rejection_Heatmap.png")
             
-            plot_diagnostic_fairness_scatter(df_exp, heat_dir / f"Diag_{tag}_Fairness_Scatter.png")
-            plot_diagnostic_emotion_scatter(df_exp, heat_dir / f"Diag_{tag}_Emotion_Scatter.png")
+            fair_title = f"Diagnostic: Fairness Sensitivity{title_suffix}"
+            plot_diagnostic_fairness_scatter(df_exp, heat_dir / f"Diag_{tag}_Fairness_Scatter.png", fair_title)
+            
+            emo_title = f"Diagnostic: Emotion Volatility{title_suffix}"
+            plot_diagnostic_emotion_scatter(df_exp, heat_dir / f"Diag_{tag}_Emotion_Scatter.png", emo_title)
 
 if __name__ == "__main__":
     run_version = EXPERIMENT_VERSION
