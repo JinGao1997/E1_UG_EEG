@@ -12,12 +12,15 @@ Description:
     - Data-driven visualization mapping: Dynamically parses Excel sheets generated 
       by the upstream hierarchical statistical gating mechanism.
     - Multi-source data fusion: Accommodates both single-experiment and 
-      cross-experiment concatenated raw data (trials.csv) for diagnostic plotting.
+      cross-experiment concatenated raw data (trials.csv).
     - Publication Standards: Implements strict APA-7th typographic conventions, 
-      maximizing data-ink ratio by removing title/axis redundancies and utilizing
-      concise academic abbreviations (e.g., 'Exp. 1', 'Rejection Rate').
+      including standard error bar caps (I-bars) for traditional academic compliance.
+    - Faceted Rain-on-Cloud: Deploys Trellis/Facet design (1x2 grid) to fully separate 
+      Fair and Unfair offers. Restores the high-density "Rain-in-Cloud" overlay.
+    - Dynamic Bounding Box Layout: Utilizes tight_layout with restricted rect bounds
+      to perfectly isolate global legends and suptitles from facet titles.
 
-Date: 2026-03-05
+Date: 2026-03-13
 ================================================================================
 """
 
@@ -32,14 +35,16 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import seaborn as sns
 import matplotlib.colors as mcolors
+import matplotlib.patches as mpatches
+import matplotlib.lines as mlines
 
 # ==============================================================================
 # 1) Global Configuration
 # ==============================================================================
 EXPERIMENT_VERSION = "E1" #"CrossExp_E1_vs_E2" or "E1" or "E2"
 ERROR_BAR_TYPE = "SE"
-CI_MULTIPLIER = 1.96
-RT_Y_MIN = 600
+CI_MULTIPLIER = 1.0  
+RT_Y_MIN = 400
 RT_Y_MAX = None 
 
 LABELS = [
@@ -146,7 +151,7 @@ def plot_interaction_line(df, y_col, lower_col, upper_col, ylabel, main_title, f
             if sub.empty: continue
             sub = sub.set_index(x_axis).reindex([l for l in x_levels if l in sub[x_axis].values]).reset_index()
             y, yerr = sub[y_col], [sub[y_col] - sub[lower_col], sub[upper_col] - sub[y_col]]
-            ax.errorbar(sub[x_axis], y, yerr=yerr, marker="o", label=LABEL_MAP.get(emo, emo), color=COLOR_MAP.get(emo, "black"), capsize=4, lw=2, markersize=6)
+            ax.errorbar(sub[x_axis], y, yerr=yerr, marker="o", label=LABEL_MAP.get(emo, emo), color=COLOR_MAP.get(emo, "black"), capsize=4, capthick=1.5, lw=2, markersize=6)
             
         ax.tick_params(labelleft=True)
         ax.set_ylabel(ylabel, fontsize=12)
@@ -285,7 +290,7 @@ def plot_forest_from_posthoc(df: pd.DataFrame, title: str, filename: Path, mode:
     plt.close(fig)
 
 # ==============================================================================
-# 4) Raw Data Loading & Advanced Raincloud Plotting
+# 4) Statistical Extraction & Advanced Raincloud Plotting
 # ==============================================================================
 def load_and_clean_trials(trials_paths: list[Path]) -> pd.DataFrame:
     df_list = []
@@ -323,84 +328,177 @@ def load_and_clean_trials(trials_paths: list[Path]) -> pd.DataFrame:
         df_list.append(df)
     return pd.concat(df_list, ignore_index=True) if df_list else pd.DataFrame()
 
-def plot_facet_paired_box_violin(
-    df_raw: pd.DataFrame, y_var: str, y_label: str, title: str,
-    output_path_png: Path, subject_col: str = "participant_id", 
-    emotion_col: str = "emotion", offer_col: str = "offer_type", 
-    offer_order=("fair", "unfair"), label_map=None, color_map=None,
-    violin_alpha=0.35, box_alpha=0.90, point_alpha=0.85, point_size=28,
-    jitter=0.12, pair_gap=0.55, group_gap=0.95, bw_adjust=0.85
-):
-    if label_map is None: label_map = {}
-    if color_map is None: color_map = {}
-    df_agg = df_raw.groupby([subject_col, emotion_col, offer_col], as_index=False)[y_var].mean()
-    df_agg = df_agg[df_agg[offer_col].isin(list(offer_order))].copy()
+def fetch_lmm_stats(out_root: Path, exp_version: str, y_var: str) -> pd.DataFrame | None:
+    label_prefix = "Response_Time" if "RT" in y_var else "Rejection_Rate"
+    label_dir_name = f"CrossExp_{label_prefix}" if "CrossExp" in exp_version else f"Type_{label_prefix}"
+    label_dir = out_root / label_dir_name
+    
+    if not label_dir.exists(): return None
+    excel_files = list(label_dir.glob("STATS_REPORT_*.xlsx"))
+    if not excel_files: return None
+    
+    try:
+        df = pd.read_excel(excel_files[0], sheet_name="Descriptive_Means_SE")
+        if "emotion" in df.columns: 
+            df["emotion"] = df["emotion"].apply(normalize_emotion)
+            
+        y_col = get_first_col(df, ["emmean", "Mean", "prob", "response"])
+        se_col = get_first_col(df, ["SE", "std.error"])
+        lower_col = get_first_col(df, ["lower.CL", "asymp.LCL", "lower", "LCL"])
+        upper_col = get_first_col(df, ["upper.CL", "asymp.UCL", "upper", "UCL"])
+        
+        if not y_col: return None
+        
+        res = df.copy()
+        res["offer_type"] = res.get("offer_type", res.get("offer_ratio", "")).astype(str).str.lower()
+        
+        mean_numeric = pd.to_numeric(res[y_col], errors="coerce").mean()
+        
+        if "RT" in y_var and mean_numeric < 20 and se_col:
+            res["mean_val"] = np.exp(res[y_col].astype(float))
+            se_ms = res["mean_val"] * res[se_col].astype(float)
+            res["lower_val"] = res["mean_val"] - (CI_MULTIPLIER * se_ms)
+            res["upper_val"] = res["mean_val"] + (CI_MULTIPLIER * se_ms)
+        else:
+            res["mean_val"] = res[y_col].astype(float)
+            if lower_col and upper_col and CI_MULTIPLIER > 1.0:
+                res["lower_val"] = res[lower_col].astype(float)
+                res["upper_val"] = res[upper_col].astype(float)
+            elif se_col:
+                res["lower_val"] = res["mean_val"] - CI_MULTIPLIER * res[se_col].astype(float)
+                res["upper_val"] = res["mean_val"] + CI_MULTIPLIER * res[se_col].astype(float)
+            else:
+                res["lower_val"] = res["mean_val"]
+                res["upper_val"] = res["mean_val"]
+                
+        is_rejection = "rejection" in y_var.lower() or "rate" in y_var.lower()
+        if is_rejection and res["mean_val"].max() <= 1.05:
+            res["mean_val"] *= 100.0
+            res["lower_val"] *= 100.0
+            res["upper_val"] *= 100.0
+            
+        return res
+    except Exception as e:
+        print(f"   [Warn] Could not extract LMM emmeans for {y_var}. Falling back to arithmetic means. Details: {e}")
+        return None
 
+def plot_faceted_raincloud(
+    df_raw: pd.DataFrame, y_var: str, y_label: str, title: str,
+    output_path_png: Path, lmm_stats: pd.DataFrame | None = None,
+    subject_col: str = "participant_id", emotion_col: str = "emotion", offer_col: str = "offer_type"
+):
+    df_agg = df_raw.groupby([subject_col, emotion_col, offer_col], as_index=False)[y_var].mean()
+    
     is_0_100 = ("rejection" in y_label.lower()) or (y_var.lower() == "rejection_rate")
     is_rt = ("ms" in y_label.lower() or y_var.lower() == "rt")
     
-    if is_0_100: y_min, y_max = 0.0, 100.0
-    elif is_rt and RT_Y_MIN is not None and RT_Y_MAX is not None: y_min, y_max = float(RT_Y_MIN), float(RT_Y_MAX)
+    if is_0_100: 
+        y_min, y_max = 0.0, 100.0
+    elif is_rt and RT_Y_MIN is not None and RT_Y_MAX is not None: 
+        y_min, y_max = float(RT_Y_MIN), float(RT_Y_MAX)
     else:
         ylim = _nice_ylim(df_agg[y_var])
         if ylim is None: return
         y_min, y_max = float(ylim[0]), float(ylim[1])
 
-    y_grid = np.linspace(y_min, y_max, 250)
-    positions, tick_positions, x = [], [], 0.0
-    for _ in EMOTION_ORDER:
-        positions.append((x, x + pair_gap))
-        tick_positions.append(x + pair_gap/2)
-        x = x + pair_gap + group_gap
+    # 1. Height increased to 5.5 to compensate for the top safe-zone, maintaining exact plumpness
+    fig, axes = plt.subplots(1, 2, figsize=(16.0, 5.5), sharey=True)
 
-    fig, axes = plt.subplots(1, 2, figsize=(14.8, 5.3), sharey=True)
-    axes = np.array(axes).ravel()
+    max_dens_width = 0.42        
+    pt_size = 22
+    kde_base_offset = 0.0        
+    stat_offset = 0.10           
 
-    for ax_i, offer in enumerate(offer_order):
+    offers = ["fair", "unfair"]
+    titles = ["Fair Offers", "Unfair Offers"]
+    
+    for ax_i, offer in enumerate(offers):
         ax = axes[ax_i]
-        sub_offer = df_agg[df_agg[offer_col] == offer].copy()
-        if sub_offer.empty: continue
-        ax.grid(axis="y", linestyle=":", linewidth=0.6, alpha=0.35, zorder=0)
+        ax.grid(axis="y", linestyle=":", linewidth=0.6, alpha=0.4, zorder=0)
 
         for emo_idx, emo in enumerate(EMOTION_ORDER):
-            box_pos, vio_pos = positions[emo_idx]
-            sub_emo = sub_offer[sub_offer[emotion_col] == emo]
-            y_vals = pd.to_numeric(sub_emo[y_var], errors="coerce").dropna().values
-            if len(y_vals) < 2: continue
-            color = color_map.get(emo, "#808080")
+            color = COLOR_MAP.get(emo, "#808080")
+            x_center = float(emo_idx)
 
-            ax.boxplot(y_vals, positions=[box_pos], widths=0.42, patch_artist=True, showfliers=False,
-                       boxprops=dict(facecolor=_rgba(color, box_alpha), edgecolor="#3A3A3A", linewidth=1.25),
-                       medianprops=dict(color="#1F1F1F", linewidth=1.7), zorder=2)
-            
-            ax.scatter(box_pos + np.random.uniform(-jitter, jitter, size=len(y_vals)), y_vals, 
-                       s=point_size, c=[_rgba(color, point_alpha)], edgecolors="white", linewidths=0.75, zorder=3)
-                       
-            kde_data = np.concatenate([y_vals, -y_vals, 200.0 - y_vals]) if is_0_100 else y_vals
+            sub = df_agg[(df_agg[emotion_col] == emo) & (df_agg[offer_col] == offer)]
+            y_vals = pd.to_numeric(sub[y_var], errors="coerce").dropna().values
+            if len(y_vals) < 3: continue
+
+            matched_lmm = False
+            if lmm_stats is not None:
+                mask = (lmm_stats["emotion"] == emo) & (lmm_stats["offer_type"] == offer)
+                if mask.any():
+                    row = lmm_stats[mask].iloc[0]
+                    mean_val = row["mean_val"]
+                    lower_val = row["lower_val"]
+                    upper_val = row["upper_val"]
+                    matched_lmm = True
+                    
+            if not matched_lmm:
+                mean_val = np.mean(y_vals)
+                se_val = np.std(y_vals, ddof=1) / np.sqrt(len(y_vals))
+                lower_val, upper_val = mean_val - CI_MULTIPLIER * se_val, mean_val + CI_MULTIPLIER * se_val
+
+            kde_fc = _rgba(color, 0.15) if offer == "fair" else _rgba(color, 0.75)
+            kde_ec = color if offer == "fair" else "none"
+            scat_fc = "none" if offer == "fair" else color
+            scat_ec = color if offer == "fair" else "white"            
+            stat_mfc = "white" if offer == "fair" else color
+
             try:
-                kde = gaussian_kde(kde_data[(kde_data >= -50)&(kde_data <= 150)] if is_0_100 else kde_data, bw_method="scott")
-                kde.set_bandwidth(kde.factor * bw_adjust)
-                dens = kde(y_grid)
-                dens = dens / dens.max() if dens.max() > 0 else dens
-                x_right = vio_pos + dens * 0.55
-                ax.fill(np.concatenate([np.full_like(x_right, vio_pos), x_right[::-1]]), 
-                        np.concatenate([y_grid, y_grid[::-1]]), facecolor=_rgba(color, violin_alpha), zorder=1)
-                ax.plot(x_right, y_grid, color=_rgba(color, 0.65), linewidth=1.2, zorder=2)
-            except: pass
+                y_min_sub, y_max_sub = y_vals.min(), y_vals.max()
+                y_range = y_max_sub - y_min_sub if y_max_sub > y_min_sub else 1.0
+                eval_min = max(y_min, y_min_sub - y_range * 0.15)
+                eval_max = min(y_max, y_max_sub + y_range * 0.15)
+                y_grid_sub = np.linspace(eval_min, eval_max, 200)
 
-        offer_label = "Fair Offers" if offer == "fair" else "Unfair Offers"
-        ax.set_title(offer_label, fontsize=15, fontweight="bold", pad=10)
-        ax.set_xticks(tick_positions)
-        ax.set_xticklabels([label_map.get(e, e) for e in EMOTION_ORDER])
-        ax.set_xlim(positions[0][0] - 0.75, positions[-1][1] + 0.75)
-        ax.set_ylim(y_min, y_max)
+                kde = gaussian_kde(y_vals, bw_method="scott")
+                kde.set_bandwidth(kde.factor * 0.85) 
+                
+                dens = kde(y_grid_sub)
+                dens = (dens / dens.max()) * max_dens_width
+                
+                x_base_line = x_center + kde_base_offset
+                x_curve = x_base_line + dens
+                
+                ax.fill_betweenx(y_grid_sub, x_base_line, x_curve, facecolor=kde_fc, edgecolor=kde_ec, linewidth=1.5, zorder=2)
+            except np.linalg.LinAlgError: pass
+
+            jitter = np.random.uniform(0.02, max_dens_width - 0.04, size=len(y_vals))
+            x_scatter = x_center + jitter
+            ax.scatter(x_scatter, y_vals, s=pt_size, facecolors=scat_fc, edgecolors=scat_ec, alpha=0.9, linewidths=0.9, zorder=3)
+
+            x_stat = x_center - stat_offset
+            y_err_lower, y_err_upper = [[mean_val - lower_val]], [[upper_val - mean_val]]
+            ax.errorbar(x_stat, mean_val, yerr=[y_err_lower[0], y_err_upper[0]], fmt='o',
+                        mfc=stat_mfc, mec=color, ecolor=color, capsize=4, capthick=1.5, elinewidth=1.8, markersize=7, zorder=5)
+
+        ax.set_xticks(range(len(EMOTION_ORDER)))
+        ax.set_xticklabels([LABEL_MAP.get(e, e) for e in EMOTION_ORDER], fontsize=15, fontweight="bold")
         
-        ax.tick_params(labelleft=True)
-        ax.set_ylabel(y_label, fontsize=13, fontweight="bold")
+        ax.set_xlim(-0.45, len(EMOTION_ORDER) - 0.35)
+        ax.set_ylim(y_min, y_max)
+        ax.set_title(titles[ax_i], fontsize=20, fontweight="bold", pad=15)
+        
+        if ax_i == 0:
+            ax.set_ylabel(y_label, fontsize=16, fontweight="bold")
         sns.despine(ax=ax)
 
-    fig.suptitle(title, fontsize=18, fontweight="bold", y=1.05)
-    plt.tight_layout()
+    # 2. Main Title placement
+    fig.suptitle(title, fontsize=24, fontweight="bold", y=0.98) 
+    
+    # 3. Legend placement safely below Suptitle but well above Facet Titles
+    legend_elements = [
+        mpatches.Patch(facecolor=_rgba("#808080", 0.15), edgecolor="#808080", label="Fair Offer", linewidth=1.5),
+        mpatches.Patch(facecolor=_rgba("#808080", 0.75), edgecolor="none", label="Unfair Offer"),
+        mlines.Line2D([], [], color='#808080', marker='o', linestyle='-', linewidth=1.5, markersize=7, mfc='black', mec='black', label="Estimated Marginal Mean \u00B1 1 SE")
+    ]
+    fig.legend(handles=legend_elements, bbox_to_anchor=(0.5, 0.89), loc="center", ncol=3, frameon=False, fontsize=14)
+    
+    # 4. [THE MAGIC SHIELD]: Forces the entire subplot grid (including "Fair/Unfair Offers" titles)
+    # to stay strictly below the 84% height line. This guarantees zero overlap forever.
+    plt.tight_layout(rect=[0, 0.0, 1.0, 0.84])
+    
     plt.savefig(output_path_png, dpi=300, bbox_inches="tight")
     plt.close(fig)
 
@@ -535,7 +633,6 @@ justification for sensitivity analyses.
 # 7) Main Execution Pipeline
 # ==============================================================================
 def format_academic_sheet_name(sheet: str) -> str:
-    """Translates raw R variable sheet names into professional academic titles."""
     s = sheet.replace("PostHoc_Main_", "Main Effect: ")
     s = s.replace("PostHoc_", "Pairwise: ")
     s = s.replace("SimpleSimple_", "Simple Simple: ")
@@ -543,16 +640,8 @@ def format_academic_sheet_name(sheet: str) -> str:
     s = s.replace("Interaction_Contrast", "Interaction Contrasts")
     s = s.replace("Joint_2Way_", "Joint 2-Way: ")
     s = s.replace("_", " ").strip()
-    
-    replacements = {
-        "offer type": "Offer Fairness",
-        "emotion": "Emotion",
-        "Exp": "Experiment",
-        "Emo": "Emotion",
-        "by": "across"
-    }
-    for old, new in replacements.items():
-        s = s.replace(old, new)
+    replacements = {"offer type": "Offer Fairness", "emotion": "Emotion", "Exp": "Experiment", "Emo": "Emotion", "by": "across"}
+    for old, new in replacements.items(): s = s.replace(old, new)
     return s
 
 def process_label_folder(label_dir: Path, figures_dir: Path, exp_version: str):
@@ -569,10 +658,7 @@ def process_label_folder(label_dir: Path, figures_dir: Path, exp_version: str):
     else:
         global_exp_str = str(exp_version)
 
-    if is_cross_exp:
-        interaction_title = "Emotion \u00D7 Offer Fairness"
-    else:
-        interaction_title = f"Emotion \u00D7 Offer Fairness ({global_exp_str})"
+    interaction_title = "Emotion \u00D7 Offer Fairness" if is_cross_exp else f"Emotion \u00D7 Offer Fairness ({global_exp_str})"
 
     if "Descriptive_Means_SE" in xls.sheet_names:
         df_desc = pd.read_excel(xls, sheet_name="Descriptive_Means_SE")
@@ -611,58 +697,38 @@ def process_label_folder(label_dir: Path, figures_dir: Path, exp_version: str):
         try:
             df_ph = pd.read_excel(xls, sheet_name=sheet)
             if "emotion" in df_ph.columns: df_ph["emotion"] = df_ph["emotion"].apply(normalize_emotion)
-            
-            clean_sheet_name = format_academic_sheet_name(sheet)
-            forest_title = f"{clean_sheet_name} ({global_exp_str})"
-            
-            plot_forest_from_posthoc(df_ph, forest_title, figures_dir / f"{exp_version}_{label_dir.name}_{sheet}_Forest.png", "rejection" if "Rejection" in label_dir.name else "rt")
+            plot_forest_from_posthoc(df_ph, f"{format_academic_sheet_name(sheet)} ({global_exp_str})", figures_dir / f"{exp_version}_{label_dir.name}_{sheet}_Forest.png", "rejection" if "Rejection" in label_dir.name else "rt")
         except Exception as e:
-            print(f"      [Warning] Forest plot generation failed for {sheet}: {e}")
+            pass
 
-def plot_distributions_from_trials(trials_paths: list[Path], figures_dir: Path, exp_version: str):
+def plot_distributions_from_trials(trials_paths: list[Path], figures_dir: Path, exp_version: str, out_root: Path):
     print(f"\n>>> Processing Raw Data for Rainclouds & Diagnostics [{exp_version}]...")
     df_trials = load_and_clean_trials(trials_paths)
-    if df_trials.empty:
-        print("   [Skip] Dataframe empty after loading.")
-        return
+    if df_trials.empty: return
         
     exps = df_trials["Exp"].unique()
-    
-    rain_dir = figures_dir / "Raincloud"
-    rain_dir.mkdir(parents=True, exist_ok=True)
-    
-    heat_dir = figures_dir / "Diagnostics"
-    heat_dir.mkdir(parents=True, exist_ok=True)
+    rain_dir, heat_dir = figures_dir / "Raincloud", figures_dir / "Diagnostics"
+    rain_dir.mkdir(parents=True, exist_ok=True); heat_dir.mkdir(parents=True, exist_ok=True)
     generate_diagnostics_readme(heat_dir)
     
     for exp in exps:
         print(f"   -> Generating sub-renderings for batch: {exp}")
         df_exp = df_trials[df_trials["Exp"] == exp].copy()
         tag = f"CrossExp_{exp}" if exp_version == "CrossExp_E1_vs_E2" else exp_version
-        
-        # Rigorous translation for maximum conciseness
         exp_display = f"Exp. {exp[1:]}" if isinstance(exp, str) and exp.startswith("E") and exp[1:].isdigit() else (str(exp) if exp else "Overall")
         title_suffix = f" ({exp_display})"
         
         if "RT" in df_exp.columns: 
-            rain_title = f"Reaction Time{title_suffix}"
-            plot_facet_paired_box_violin(df_exp, "RT", "Reaction Time (ms)", rain_title, rain_dir / f"Dist_{tag}_RT_Raincloud.png", color_map=COLOR_MAP, label_map=LABEL_MAP)
-            
-            heat_title = f"Diagnostic: RT Matrix{title_suffix}"
-            plot_individual_heatmap(df_exp, "RT", "Mean RT (ms)", heat_title, heat_dir / f"Diag_{tag}_RT_Heatmap.png")
+            lmm_stats = fetch_lmm_stats(out_root, exp_version, "RT")
+            plot_faceted_raincloud(df_exp, "RT", "Reaction Time (ms)", f"Reaction Time{title_suffix}", rain_dir / f"Dist_{tag}_RT_SplitRain.png", lmm_stats=lmm_stats)
+            plot_individual_heatmap(df_exp, "RT", "Mean RT (ms)", f"Diagnostic: RT Matrix{title_suffix}", heat_dir / f"Diag_{tag}_RT_Heatmap.png")
             
         if "rejection_rate" in df_exp.columns: 
-            rain_title = f"Rejection Rate{title_suffix}"
-            plot_facet_paired_box_violin(df_exp, "rejection_rate", "Rejection Rate (%)", rain_title, rain_dir / f"Dist_{tag}_Rejection_Raincloud.png", color_map=COLOR_MAP, label_map=LABEL_MAP)
-            
-            heat_title = f"Diagnostic: Rejection Rate Matrix{title_suffix}"
-            plot_individual_heatmap(df_exp, "rejection_rate", "Rejection Rate (%)", heat_title, heat_dir / f"Diag_{tag}_Rejection_Heatmap.png")
-            
-            fair_title = f"Diagnostic: Fairness Sensitivity{title_suffix}"
-            plot_diagnostic_fairness_scatter(df_exp, heat_dir / f"Diag_{tag}_Fairness_Scatter.png", fair_title)
-            
-            emo_title = f"Diagnostic: Emotion Volatility{title_suffix}"
-            plot_diagnostic_emotion_scatter(df_exp, heat_dir / f"Diag_{tag}_Emotion_Scatter.png", emo_title)
+            lmm_stats = fetch_lmm_stats(out_root, exp_version, "rejection_rate")
+            plot_faceted_raincloud(df_exp, "rejection_rate", "Rejection Rate (%)", f"Rejection Rate{title_suffix}", rain_dir / f"Dist_{tag}_Rejection_SplitRain.png", lmm_stats=lmm_stats)
+            plot_individual_heatmap(df_exp, "rejection_rate", "Rejection Rate (%)", f"Diagnostic: Rejection Rate Matrix{title_suffix}", heat_dir / f"Diag_{tag}_Rejection_Heatmap.png")
+            plot_diagnostic_fairness_scatter(df_exp, heat_dir / f"Diag_{tag}_Fairness_Scatter.png", f"Diagnostic: Fairness Sensitivity{title_suffix}")
+            plot_diagnostic_emotion_scatter(df_exp, heat_dir / f"Diag_{tag}_Emotion_Scatter.png", f"Diagnostic: Emotion Volatility{title_suffix}")
 
 if __name__ == "__main__":
     run_version = EXPERIMENT_VERSION
@@ -686,7 +752,7 @@ if __name__ == "__main__":
     
     trials_paths = find_trials_csv(root, exp_version=run_version)
     if trials_paths:
-        try: plot_distributions_from_trials(trials_paths, figures_dir, exp_version=run_version)
+        try: plot_distributions_from_trials(trials_paths, figures_dir, run_version, out_root)
         except Exception as e: print(f"   [Warn] Distribution pipeline failed: {e}")
     else: print("\n>>> [Skip] trials.csv not found.")
 

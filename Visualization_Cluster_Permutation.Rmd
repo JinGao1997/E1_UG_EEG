@@ -1,0 +1,304 @@
+---
+title: "Visualization_cluster_Permutation_Ultimate.R"
+date: "2026-03-12"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+```{r }
+# ==============================================================================
+# Script: Visualization_cluster_Permutation_Ultimate.R
+# Purpose: Publication-ready rendering of Cluster-based Permutation Test results.
+#          Integrates MNE-Python statistical outputs with R's eegUtils engine.
+#          Ensures full-cap spatial representation with native highlighting.
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# 1. Environment & Dependency Initialization
+# ------------------------------------------------------------------------------
+if(!require("pacman")) install.packages("pacman")
+pacman::p_load(tidyverse, eegUtils, patchwork, cowplot, scales, fs)
+
+# ------------------------------------------------------------------------------
+# 2. Methodological Helper Functions
+# ------------------------------------------------------------------------------
+
+#' Calculates optimal, symmetric limits for color scales to prevent visual saturation.
+compute_limits <- function(values, symmetric = TRUE, prob_thresh = 0.99) {
+  if (all(is.na(values))) return(c(-0.1, 0.1))
+  
+  if (symmetric) {
+    max_val <- quantile(abs(values), probs = prob_thresh, na.rm = TRUE)
+    if (is.infinite(max_val) || max_val == 0) return(c(-0.1, 0.1))
+    
+    if (max_val <= 0.5) step <- 0.05
+    else if (max_val <= 1.0) step <- 0.1
+    else if (max_val <= 2.5) step <- 0.25
+    else step <- 0.5
+    
+    max_val <- ceiling(max_val / step) * step
+    if (max_val == 0) max_val <- step 
+    
+    return(c(-max_val, max_val))
+  } else {
+    return(quantile(values, probs = c(1 - prob_thresh, prob_thresh), na.rm = TRUE))
+  }
+}
+
+# ------------------------------------------------------------------------------
+# 3. Core Visualization Engine
+# ------------------------------------------------------------------------------
+
+#' Generates and exports the 3-panel Ultimate Meyer cluster plot.
+plot_ultimate_cluster <- function(df_grand, df_stats, contrast_name, cluster_id, 
+                                  topo_step_ms = 100, out_dir = NULL) {
+  
+  # df_c contains ONLY the spatiotemporal points that passed the significance threshold
+  df_c <- df_stats %>% 
+    filter(contrast == contrast_name, cluster == cluster_id) %>%
+    mutate(time_ms = round(time * 1000))
+  
+  if(nrow(df_c) == 0) {
+    warning("Cluster data empty. Halting render process.")
+    return(NULL)
+  }
+  
+  p_val <- unique(df_c$p_val)[1]
+  tmin_c <- min(df_c$time_ms)
+  tmax_c <- max(df_c$time_ms)
+  
+  conds <- str_split(contrast_name, "\\s*-\\s*", simplify = TRUE)[1, ]
+  cond1 <- conds[1]
+  cond2 <- conds[2]
+  
+  peak_row <- df_c %>% filter(abs(t_obs) == max(abs(t_obs))) %>% slice(1)
+  peak_channel <- peak_row$channel
+  peak_time <- peak_row$time_ms
+  sig_chans <- unique(df_c$channel) # Channels to be highlighted
+  
+  # ==========================================================================
+  # DATA CLEANSING
+  # ==========================================================================
+  non_eeg_cols <- c("N170", "EPN", "FRN", "N400", "LPP_offer", "query")
+  
+  df_erp <- df_grand %>% 
+    filter(label %in% c(cond1, cond2)) %>%
+    mutate(time_ms = round(time * 1000)) %>%
+    select(-any_of(non_eeg_cols), -starts_with("Baseline_"))
+  
+  if (!(peak_channel %in% names(df_erp))) {
+    stop(sprintf("Peak channel '%s' absent in grand average dataset.", peak_channel))
+  }
+  
+  # ==========================================================================
+  # PANEL A: ERP Waveforms at Peak Channel
+  # ==========================================================================
+  df_erp_peak <- df_erp %>%
+    select(time_ms, label, amplitude = all_of(peak_channel))
+  
+  p_A <- ggplot() +
+    annotate("rect", xmin = tmin_c, xmax = tmax_c, ymin = -Inf, ymax = Inf, 
+             fill = "grey80", alpha = 0.4) +
+    geom_vline(xintercept = 0, linetype = "solid", color = "black", linewidth = 0.5) +
+    geom_hline(yintercept = 0, linetype = "solid", color = "black", linewidth = 0.5) +
+    geom_vline(xintercept = peak_time, linetype = "dashed", color = "grey30") +
+    geom_line(data = df_erp_peak, aes(x = time_ms, y = amplitude, color = label), linewidth = 1.2) +
+    scale_color_manual(values = c("#0077B6", "#D62828")) +
+    scale_y_continuous(labels = scales::number_format(accuracy = 0.1)) + 
+    labs(title = sprintf("A. Waveforms at Peak Channel (%s)", peak_channel),
+         x = "Time (ms)", y = "Amplitude (\u03BCV)", color = "Condition") +
+    theme_classic() +
+    theme(plot.title = element_text(face = "bold", size = 14),
+          legend.position = c(0.85, 0.85),
+          legend.background = element_blank(),
+          axis.title = element_text(size = 12),
+          axis.text = element_text(size = 11))
+  
+  # ==========================================================================
+  # PANEL B: Statistical Effect Size Topography (Full-Cap Native Highlights)
+  # ==========================================================================
+  # Extract true mean t-values for ALL channels within the cluster's temporal window
+  # to guarantee complete spatial rendering and accurate interpolation.
+  df_stat_topo <- df_stats %>%
+    filter(contrast == contrast_name) %>%
+    mutate(time_ms = round(time * 1000)) %>%
+    filter(time_ms >= tmin_c & time_ms <= tmax_c) %>%
+    group_by(channel) %>%
+    summarise(t_val = mean(t_obs, na.rm = TRUE), .groups = "drop") %>%
+    rename(electrode = channel)
+  
+  stat_limits <- compute_limits(df_stat_topo$t_val)
+  
+  p_B <- topoplot(df_stat_topo, quantity = "t_val", interp_limit = "head", 
+                  contour = TRUE, limits = stat_limits, palette = "RdBu",
+                  points = TRUE, highlights = sig_chans) +
+    labs(title = sprintf("B. Cluster Effect Size (%d - %d ms)", tmin_c, tmax_c)) +
+    theme(plot.title = element_text(face = "bold", size = 14, hjust = 0.5)) +
+    guides(fill = guide_colorbar(title = "t-value", barheight = 5, barwidth = 0.6))
+  
+  # ==========================================================================
+  # PANEL C: Dynamic Voltage Maps (Native Highlights per slice)
+  # ==========================================================================
+  df_diff <- df_erp %>%
+    pivot_longer(cols = -c(time, time_ms, label), names_to = "electrode", values_to = "amplitude") %>%
+    pivot_wider(names_from = label, values_from = amplitude) %>%
+    mutate(amplitude = !!sym(cond1) - !!sym(cond2)) %>%
+    select(time, time_ms, electrode, amplitude)
+  
+  bins <- seq(tmin_c, tmax_c, by = topo_step_ms)
+  if (max(bins) < tmax_c) bins <- c(bins, tmax_c)
+  if (length(bins) < 2) bins <- c(tmin_c, tmax_c)
+  
+  df_diff_cluster <- df_diff %>% filter(time_ms >= min(bins) & time_ms <= max(bins))
+  dyn_limits <- compute_limits(df_diff_cluster$amplitude)
+  
+  dyn_plots <- list()
+  for (i in 1:(length(bins)-1)) {
+    b_min <- bins[i]
+    b_max <- bins[i+1]
+    
+    df_slice <- df_diff %>%
+      filter(time_ms >= b_min & time_ms < b_max) %>%
+      group_by(electrode) %>%
+      summarise(amplitude = mean(amplitude, na.rm = TRUE), .groups = "drop")
+    
+    slice_sig_chans <- df_c %>% 
+      filter(time_ms >= b_min & time_ms < b_max) %>% 
+      pull(channel) %>% unique()
+    
+    hl_chans <- if(length(slice_sig_chans) > 0) slice_sig_chans else NULL
+    
+    p_dyn <- topoplot(df_slice, quantity = "amplitude", interp_limit = "head", 
+                      contour = FALSE, limits = dyn_limits, palette = "RdBu",
+                      points = TRUE, highlights = hl_chans) +
+      labs(title = sprintf("%d-%d ms", round(b_min), round(b_max))) +
+      theme(plot.title = element_text(size = 11, hjust = 0.5, face = "plain"),
+            legend.position = "none") 
+    
+    dyn_plots[[length(dyn_plots) + 1]] <- p_dyn
+  }
+  
+  dummy_p <- topoplot(df_diff_cluster %>% slice(1:2), quantity = "amplitude", limits = dyn_limits, palette = "RdBu") +
+    guides(fill = guide_colorbar(title = "Diff (\u03BCV)", barheight = 5, barwidth = 0.6))
+  dyn_legend <- get_legend(dummy_p)
+  
+  p_C_row <- wrap_plots(dyn_plots, nrow = 1) + 
+    plot_annotation(title = sprintf("C. Dynamic Voltage Map (%s - %s)", cond1, cond2), 
+                    theme = theme(plot.title = element_text(face = "bold", size = 14)))
+  
+  # ==========================================================================
+  # MASTER ASSEMBLY & EXPORT
+  # ==========================================================================
+  top_row <- p_A | p_B
+  bottom_row <- p_C_row | dyn_legend
+  
+  final_plot <- top_row / bottom_row + 
+    plot_layout(heights = c(1, 0.6)) +
+    plot_annotation(
+      title = sprintf("Cluster-based Permutation Test: %s", contrast_name),
+      subtitle = sprintf("Cluster ID: %s | p-value = %.4f", cluster_id, p_val),
+      theme = theme(plot.title = element_text(size = 18, face = "bold"),
+                    plot.subtitle = element_text(size = 14, color = "grey30"))
+    )
+  
+  if (!is.null(out_dir)) {
+    dir_create(out_dir, recurse = TRUE) 
+    
+    safe_contrast <- str_replace_all(contrast_name, " ", "")
+    file_name <- sprintf("Ultimate_Meyer2021_%s_%s.png", cluster_id, safe_contrast)
+    out_file <- file.path(out_dir, file_name)
+    
+    ggsave(out_file, final_plot, width = 12, height = 9, dpi = 300, bg = "white")
+    cat(sprintf("[Export] Saved %s visualization to: %s\n", cluster_id, out_file))
+  }
+  
+  return(final_plot)
+}
+
+# ------------------------------------------------------------------------------
+# 4. Execution Entry Point (Strict Diagnostics)
+# ------------------------------------------------------------------------------
+
+exp_version <- "E2"            
+analysis_method <- "Method_Standard" 
+topo_step_resolution <- 100 
+
+project_root <- "C:/Code/UG_ERP_Project" 
+
+input_dir <- file.path(project_root, "data", paste0("02_Pipeline_Output_", exp_version), analysis_method, "Stimulus_Locked")
+output_dir <- file.path(project_root, "results", "Permutation_Visualization", exp_version, analysis_method)
+
+cat(sprintf("\n[Environment Setup] Experiment: %s | Method: %s\n", exp_version, analysis_method))
+cat(sprintf("Target Input Directory: %s\n", input_dir))
+
+if (!dir.exists(input_dir)) stop(sprintf("\n[Fatal Error] Directory does NOT exist:\n%s\n", input_dir))
+
+possible_stats_files <- c("clusters.csv", "perm.csv")
+stats_file <- NULL
+
+for (fname in possible_stats_files) {
+  if (file.exists(file.path(input_dir, fname))) {
+    stats_file <- file.path(input_dir, fname)
+    break
+  }
+}
+
+grand_file <- file.path(input_dir, "grand_ave.csv")
+missing_flags <- FALSE
+
+if (is.null(stats_file)) {
+  cat("\n[Diagnostic Error] Cannot find statistical output ('clusters.csv' or 'perm.csv').\n")
+  missing_flags <- TRUE
+}
+
+if (!file.exists(grand_file)) {
+  cat("\n[Diagnostic Error] Cannot find ERP waveform data ('grand_ave.csv').\n")
+  missing_flags <- TRUE
+}
+
+if (!missing_flags) {
+  cat(sprintf("[Status] Essential files verified. Target statistical file: %s\n", basename(stats_file)))
+  
+  df_stats <- read_csv(stats_file, show_col_types = FALSE)
+  df_grand <- read_csv(grand_file, show_col_types = FALSE)
+  
+  df_sig_clusters <- df_stats %>% filter(p_val < 0.05)
+  
+  if (nrow(df_sig_clusters) > 0) {
+    unique_combos <- df_sig_clusters %>% distinct(contrast, cluster)
+    cat(sprintf("[Status] Detected %d distinct statistical contrast/cluster combinations. Initiating batch rendering...\n", nrow(unique_combos)))
+    
+    for (i in 1:nrow(unique_combos)) {
+      tgt_contrast <- unique_combos$contrast[i]
+      tgt_cluster  <- unique_combos$cluster[i]
+      
+      cat(sprintf("\n---> Processing Contrast: %s | Cluster: %s <---\n", tgt_contrast, tgt_cluster))
+      
+      tryCatch({
+        plot_ultimate_cluster(
+          df_grand = df_grand,
+          df_stats = df_stats,
+          contrast_name = tgt_contrast,
+          cluster_id = tgt_cluster,
+          topo_step_ms = topo_step_resolution, 
+          out_dir = output_dir
+        )
+      }, error = function(e) {
+        cat(sprintf("     [Warning] Could not render %s. Reason: %s\n", tgt_contrast, e$message))
+      })
+    }
+    cat("\n[Success] Batch processing complete! All plots successfully written to disk.\n")
+  } else {
+    cat("\n[Status] No significant clusters (p < 0.05) detected. Execution terminated normally.\n")
+  }
+} else {
+  cat("\n[Debug Info] Here are the actual files currently present in your directory:\n")
+  print(list.files(input_dir))
+  stop("Execution halted due to missing upstream files.")
+}
+```
+

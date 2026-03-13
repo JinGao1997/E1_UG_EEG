@@ -43,7 +43,7 @@ options(contrasts = c("contr.sum", "contr.poly"))
 # ------------------------------------------------------------------------------
 # [SYSTEM CONFIGURATION] Primary Analysis Target
 # ------------------------------------------------------------------------------
-experiment_version <- "E1"  
+experiment_version <- "E2"  
 DEBUG_MODE <- FALSE 
 # ------------------------------------------------------------------------------
 
