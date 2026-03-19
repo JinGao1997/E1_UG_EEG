@@ -41,7 +41,7 @@ import matplotlib.lines as mlines
 # ==============================================================================
 # 1) Global Configuration
 # ==============================================================================
-EXPERIMENT_VERSION = "E1" #"CrossExp_E1_vs_E2" or "E1" or "E2"
+EXPERIMENT_VERSION = "CrossExp_E1_vs_E2" #"CrossExp_E1_vs_E2" or "E1" or "E2"
 ERROR_BAR_TYPE = "SE"
 CI_MULTIPLIER = 1.0  
 RT_Y_MIN = 400
@@ -497,7 +497,7 @@ def plot_faceted_raincloud(
     
     # 4. [THE MAGIC SHIELD]: Forces the entire subplot grid (including "Fair/Unfair Offers" titles)
     # to stay strictly below the 84% height line. This guarantees zero overlap forever.
-    plt.tight_layout(rect=[0, 0.0, 1.0, 0.84])
+    plt.tight_layout(rect=[0, 0.0, 1.0, 0.92])
     
     plt.savefig(output_path_png, dpi=300, bbox_inches="tight")
     plt.close(fig)
