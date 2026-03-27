@@ -37,7 +37,7 @@ experiment_version <- "E2"
 # -----------------------------------------------------------
 # TRUE  = Standard Method: Subtracts baseline mean from the epoch.
 # FALSE = Regression Method: No baseline subtraction (extracts baseline as covariate).
-use_baseline_correction <- TRUE 
+use_baseline_correction <- FALSE 
 
 # -----------------------------------------------------------
 # Baseline Parameters (Stimulus-Locked Only)
@@ -178,62 +178,62 @@ common_average_by <- list(
     # -------------------------------------------------------------------------
     # A. Raw Cell Conditions (5 Emotions x 5 Offers)
     # -------------------------------------------------------------------------
-    Face_enj_5_5 = "emotion=='enj' & Offers_Other==5 & reaction>0 & RT >= 150 & RT <= 3000",
-    Face_dis_5_5 = "emotion=='dis' & Offers_Other==5 & reaction>0 & RT >= 150 & RT <= 3000",
-    Face_dom_5_5 = "emotion=='dom' & Offers_Other==5 & reaction>0 & RT >= 150 & RT <= 3000",
-    Face_neu_5_5 = "emotion=='neu' & Offers_Other==5 & reaction>0 & RT >= 150 & RT <= 3000",
-    Face_aff_5_5 = "emotion=='aff' & Offers_Other==5 & reaction>0 & RT >= 150 & RT <= 3000",
+    Face_enj_5_5 = "emotion=='enj' & Offers_Other==5 & reaction>0 & RT >= 300 & RT <= 3000",
+    Face_dis_5_5 = "emotion=='dis' & Offers_Other==5 & reaction>0 & RT >= 300 & RT <= 3000",
+    Face_dom_5_5 = "emotion=='dom' & Offers_Other==5 & reaction>0 & RT >= 300 & RT <= 3000",
+    Face_neu_5_5 = "emotion=='neu' & Offers_Other==5 & reaction>0 & RT >= 300 & RT <= 3000",
+    Face_aff_5_5 = "emotion=='aff' & Offers_Other==5 & reaction>0 & RT >= 300 & RT <= 3000",
     
-    Face_enj_6_4 = "emotion=='enj' & Offers_Other==6 & reaction>0 & RT >= 150 & RT <= 3000",
-    Face_dis_6_4 = "emotion=='dis' & Offers_Other==6 & reaction>0 & RT >= 150 & RT <= 3000",
-    Face_dom_6_4 = "emotion=='dom' & Offers_Other==6 & reaction>0 & RT >= 150 & RT <= 3000",
-    Face_neu_6_4 = "emotion=='neu' & Offers_Other==6 & reaction>0 & RT >= 150 & RT <= 3000",
-    Face_aff_6_4 = "emotion=='aff' & Offers_Other==6 & reaction>0 & RT >= 150 & RT <= 3000",
+    Face_enj_6_4 = "emotion=='enj' & Offers_Other==6 & reaction>0 & RT >= 300 & RT <= 3000",
+    Face_dis_6_4 = "emotion=='dis' & Offers_Other==6 & reaction>0 & RT >= 300 & RT <= 3000",
+    Face_dom_6_4 = "emotion=='dom' & Offers_Other==6 & reaction>0 & RT >= 300 & RT <= 3000",
+    Face_neu_6_4 = "emotion=='neu' & Offers_Other==6 & reaction>0 & RT >= 300 & RT <= 3000",
+    Face_aff_6_4 = "emotion=='aff' & Offers_Other==6 & reaction>0 & RT >= 300 & RT <= 3000",
     
-    Face_enj_7_3 = "emotion=='enj' & Offers_Other==7 & reaction>0 & RT >= 150 & RT <= 3000",
-    Face_dis_7_3 = "emotion=='dis' & Offers_Other==7 & reaction>0 & RT >= 150 & RT <= 3000",
-    Face_dom_7_3 = "emotion=='dom' & Offers_Other==7 & reaction>0 & RT >= 150 & RT <= 3000",
-    Face_neu_7_3 = "emotion=='neu' & Offers_Other==7 & reaction>0 & RT >= 150 & RT <= 3000",
-    Face_aff_7_3 = "emotion=='aff' & Offers_Other==7 & reaction>0 & RT >= 150 & RT <= 3000",
+    Face_enj_7_3 = "emotion=='enj' & Offers_Other==7 & reaction>0 & RT >= 300 & RT <= 3000",
+    Face_dis_7_3 = "emotion=='dis' & Offers_Other==7 & reaction>0 & RT >= 300 & RT <= 3000",
+    Face_dom_7_3 = "emotion=='dom' & Offers_Other==7 & reaction>0 & RT >= 300 & RT <= 3000",
+    Face_neu_7_3 = "emotion=='neu' & Offers_Other==7 & reaction>0 & RT >= 300 & RT <= 3000",
+    Face_aff_7_3 = "emotion=='aff' & Offers_Other==7 & reaction>0 & RT >= 300 & RT <= 3000",
     
-    Face_enj_8_2 = "emotion=='enj' & Offers_Other==8 & reaction>0 & RT >= 150 & RT <= 3000",
-    Face_dis_8_2 = "emotion=='dis' & Offers_Other==8 & reaction>0 & RT >= 150 & RT <= 3000",
-    Face_dom_8_2 = "emotion=='dom' & Offers_Other==8 & reaction>0 & RT >= 150 & RT <= 3000",
-    Face_neu_8_2 = "emotion=='neu' & Offers_Other==8 & reaction>0 & RT >= 150 & RT <= 3000",
-    Face_aff_8_2 = "emotion=='aff' & Offers_Other==8 & reaction>0 & RT >= 150 & RT <= 3000",
+    Face_enj_8_2 = "emotion=='enj' & Offers_Other==8 & reaction>0 & RT >= 300 & RT <= 3000",
+    Face_dis_8_2 = "emotion=='dis' & Offers_Other==8 & reaction>0 & RT >= 300 & RT <= 3000",
+    Face_dom_8_2 = "emotion=='dom' & Offers_Other==8 & reaction>0 & RT >= 300 & RT <= 3000",
+    Face_neu_8_2 = "emotion=='neu' & Offers_Other==8 & reaction>0 & RT >= 300 & RT <= 3000",
+    Face_aff_8_2 = "emotion=='aff' & Offers_Other==8 & reaction>0 & RT >= 300 & RT <= 3000",
     
-    Face_enj_9_1 = "emotion=='enj' & Offers_Other==9 & reaction>0 & RT >= 150 & RT <= 3000",
-    Face_dis_9_1 = "emotion=='dis' & Offers_Other==9 & reaction>0 & RT >= 150 & RT <= 3000",
-    Face_dom_9_1 = "emotion=='dom' & Offers_Other==9 & reaction>0 & RT >= 150 & RT <= 3000",
-    Face_neu_9_1 = "emotion=='neu' & Offers_Other==9 & reaction>0 & RT >= 150 & RT <= 3000",
-    Face_aff_9_1 = "emotion=='aff' & Offers_Other==9 & reaction>0 & RT >= 150 & RT <= 3000",
+    Face_enj_9_1 = "emotion=='enj' & Offers_Other==9 & reaction>0 & RT >= 300 & RT <= 3000",
+    Face_dis_9_1 = "emotion=='dis' & Offers_Other==9 & reaction>0 & RT >= 300 & RT <= 3000",
+    Face_dom_9_1 = "emotion=='dom' & Offers_Other==9 & reaction>0 & RT >= 300 & RT <= 3000",
+    Face_neu_9_1 = "emotion=='neu' & Offers_Other==9 & reaction>0 & RT >= 300 & RT <= 3000",
+    Face_aff_9_1 = "emotion=='aff' & Offers_Other==9 & reaction>0 & RT >= 300 & RT <= 3000",
 
     # -------------------------------------------------------------------------
     # B. Main Effect Pooling (Orthogonal Dimensions)
     # -------------------------------------------------------------------------
-    Grand_Fair   = "(emotion=='enj' | emotion=='dis' | emotion=='dom' | emotion=='neu' | emotion=='aff') & (Offers_Other==5 | Offers_Other==6) & reaction>0 & RT >= 150 & RT <= 3000",
-    Grand_Unfair = "(emotion=='enj' | emotion=='dis' | emotion=='dom' | emotion=='neu' | emotion=='aff') & (Offers_Other==8 | Offers_Other==9) & reaction>0 & RT >= 150 & RT <= 3000",
+    Grand_Fair   = "(emotion=='enj' | emotion=='dis' | emotion=='dom' | emotion=='neu' | emotion=='aff') & (Offers_Other==5 | Offers_Other==6) & reaction>0 & RT >= 300 & RT <= 3000",
+    Grand_Unfair = "(emotion=='enj' | emotion=='dis' | emotion=='dom' | emotion=='neu' | emotion=='aff') & (Offers_Other==8 | Offers_Other==9) & reaction>0 & RT >= 300 & RT <= 3000",
 
-    All_Neu = "emotion=='neu' & reaction>0 & RT >= 150 & RT <= 3000",
-    All_Dis = "emotion=='dis' & reaction>0 & RT >= 150 & RT <= 3000",
-    All_Enj = "emotion=='enj' & reaction>0 & RT >= 150 & RT <= 3000",
-    All_Dom = "emotion=='dom' & reaction>0 & RT >= 150 & RT <= 3000",
-    All_Aff = "emotion=='aff' & reaction>0 & RT >= 150 & RT <= 3000",
+    All_Neu = "emotion=='neu' & reaction>0 & RT >= 300 & RT <= 3000",
+    All_Dis = "emotion=='dis' & reaction>0 & RT >= 300 & RT <= 3000",
+    All_Enj = "emotion=='enj' & reaction>0 & RT >= 300 & RT <= 3000",
+    All_Dom = "emotion=='dom' & reaction>0 & RT >= 300 & RT <= 3000",
+    All_Aff = "emotion=='aff' & reaction>0 & RT >= 300 & RT <= 3000",
 
     # -------------------------------------------------------------------------
     # C. Simple Effect Pooling (Emotion within Fairness Contexts)
     # -------------------------------------------------------------------------
-    Face_dis_Unfair = "emotion=='dis' & (Offers_Other==8 | Offers_Other==9) & reaction>0 & RT >= 150 & RT <= 3000",
-    Face_neu_Unfair = "emotion=='neu' & (Offers_Other==8 | Offers_Other==9) & reaction>0 & RT >= 150 & RT <= 3000",
-    Face_enj_Unfair = "emotion=='enj' & (Offers_Other==8 | Offers_Other==9) & reaction>0 & RT >= 150 & RT <= 3000",
-    Face_dom_Unfair = "emotion=='dom' & (Offers_Other==8 | Offers_Other==9) & reaction>0 & RT >= 150 & RT <= 3000",
-    Face_aff_Unfair = "emotion=='aff' & (Offers_Other==8 | Offers_Other==9) & reaction>0 & RT >= 150 & RT <= 3000",
+    Face_dis_Unfair = "emotion=='dis' & (Offers_Other==8 | Offers_Other==9) & reaction>0 & RT >= 300 & RT <= 3000",
+    Face_neu_Unfair = "emotion=='neu' & (Offers_Other==8 | Offers_Other==9) & reaction>0 & RT >= 300 & RT <= 3000",
+    Face_enj_Unfair = "emotion=='enj' & (Offers_Other==8 | Offers_Other==9) & reaction>0 & RT >= 300 & RT <= 3000",
+    Face_dom_Unfair = "emotion=='dom' & (Offers_Other==8 | Offers_Other==9) & reaction>0 & RT >= 300 & RT <= 3000",
+    Face_aff_Unfair = "emotion=='aff' & (Offers_Other==8 | Offers_Other==9) & reaction>0 & RT >= 300 & RT <= 3000",
 
-    Face_dis_Fair = "emotion=='dis' & (Offers_Other==5 | Offers_Other==6) & reaction>0 & RT >= 150 & RT <= 3000",
-    Face_neu_Fair = "emotion=='neu' & (Offers_Other==5 | Offers_Other==6) & reaction>0 & RT >= 150 & RT <= 3000",
-    Face_enj_Fair = "emotion=='enj' & (Offers_Other==5 | Offers_Other==6) & reaction>0 & RT >= 150 & RT <= 3000",
-    Face_dom_Fair = "emotion=='dom' & (Offers_Other==5 | Offers_Other==6) & reaction>0 & RT >= 150 & RT <= 3000",
-    Face_aff_Fair = "emotion=='aff' & (Offers_Other==5 | Offers_Other==6) & reaction>0 & RT >= 150 & RT <= 3000"
+    Face_dis_Fair = "emotion=='dis' & (Offers_Other==5 | Offers_Other==6) & reaction>0 & RT >= 300 & RT <= 3000",
+    Face_neu_Fair = "emotion=='neu' & (Offers_Other==5 | Offers_Other==6) & reaction>0 & RT >= 300 & RT <= 3000",
+    Face_enj_Fair = "emotion=='enj' & (Offers_Other==5 | Offers_Other==6) & reaction>0 & RT >= 300 & RT <= 3000",
+    Face_dom_Fair = "emotion=='dom' & (Offers_Other==5 | Offers_Other==6) & reaction>0 & RT >= 300 & RT <= 3000",
+    Face_aff_Fair = "emotion=='aff' & (Offers_Other==5 | Offers_Other==6) & reaction>0 & RT >= 300 & RT <= 3000"
 )
 
 copy_trials_csv <- function(src_dir, dest_dir, new_filename = "trials.csv") {
