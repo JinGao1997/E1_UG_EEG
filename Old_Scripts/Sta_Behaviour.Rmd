@@ -1,0 +1,581 @@
+---
+title: "Master Behavioral Statistical Analysis Report"
+subtitle: "Single-Experiment Confirmatory & Cross-Experiment Exploratory (GLMM/LMM)"
+author: "Data Analysis Team"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_depth: 3
+    code_folding: show
+    theme: flatly
+    df_print: paged
+---
+
+``` {r setup, include=FALSE}
+# ==============================================================================
+# SECTION 0: ENVIRONMENT & CONFIGURATION
+# ==============================================================================
+
+# 1. Package Management
+if(!require("pacman")) install.packages("pacman")
+pacman::p_load(
+  here,             # Project-relative paths
+  tidyverse,        # Data wrangling
+  buildmer,         # Maximal random effects optimization via LRT
+  glmmTMB,          # Robust GLMM (Binomial outcomes)
+  lme4, lmerTest,   # LMM (Gaussian outcomes)
+  emmeans,          # Marginal means & Post-hoc
+  car,              # Type III ANOVA (Wald tests for GLMM)
+  effectsize,       # Partial Eta Squared
+  parameters,       # Standardized reporting
+  performance,      # Model checking
+  openxlsx          # Excel Reporting
+)
+
+# 2. Global Settings
+options(scipen = 999) 
+
+# [CRITICAL] Set Sum Coding for valid Type III ANOVA.
+# Mandatory for unbiased main effects in the presence of interactions.
+options(contrasts = c("contr.sum", "contr.poly"))
+
+# ------------------------------------------------------------------------------
+# [SYSTEM CONFIGURATION] Primary Analysis Target
+# ------------------------------------------------------------------------------
+experiment_version <- "E2"  
+DEBUG_MODE <- FALSE 
+# ------------------------------------------------------------------------------
+
+# 3. Path Configuration
+path_input <- here("data", paste0("02_Pipeline_Output_", experiment_version), "Method_Regression", "Stimulus_Locked", "trials.csv")
+
+dir_suffix <- if(DEBUG_MODE) "Debug_Output" else "Pub_Output"
+path_out_root <- here("results", "Behavioral", paste0(experiment_version, "_", dir_suffix))
+
+if(!dir.exists(path_out_root)) dir.create(path_out_root, recursive = TRUE)
+
+cat(sprintf(">>> SYSTEM STATUS: Primary Exp = %s | DEBUG_MODE = %s\n", experiment_version, DEBUG_MODE))
+cat(sprintf(">>> OUTPUT PATH: %s\n", path_out_root))
+
+```
+
+# 1. Methodology
+
+This analysis employs **Linear Mixed-Effects Models (LMM)** for continuous response times and **Generalized Linear Mixed-Effects Models (GLMM)** for binary decision outcomes (e.g., Rejection Rates).
+
+* **Primary Focus**: The interaction between emotional context (`emotion`) and the fairness of the offer (`offer_type`). Fine-grained analysis based on specific offer ratios is omitted to maximize statistical power for the binary fairness contrast (Fair vs. Unfair).
+* **Random Effects Optimization**: Models are initialized with a strictly maximal random effects structure. Backward stepwise elimination via Likelihood Ratio Tests (LRT) is performed using `buildmer` if necessary. Advanced optimizers (`bobyqa`) are utilized to handle complex variance components and prevent convergence warnings.
+* **Asymptotic Inference**: Given the massive sample size (N > 20,000 trials), Satterthwaite degrees of freedom approximations are superseded by asymptotic $z$-tests (infinite degrees of freedom) during marginal mean extraction. This mathematically equivalent procedure prevents Hessian matrix inversion failures at random effect boundaries (Bates et al., 2015).
+* **Exploratory Cross-Experiment Analysis**: A dedicated section appends a 3-way mixed model design (`Exp * emotion * offer_type`) to investigate temporal presentation effects (Sequential vs. Simultaneous).
+
+# 2. APA Formatting Module
+
+``` {r apa-module}
+# ==============================================================================
+# Helper: Universal Type Conversion, Missing Value Handler & Column Purger
+# ==============================================================================
+kill_scipen <- function(df) {
+  df_clean <- df %>% 
+    # Convert factors to characters BEFORE applying ifelse() to preserve labels.
+    mutate(across(where(is.factor), as.character)) %>%
+    mutate(across(everything(), ~ {
+      vec <- .
+      if(is.numeric(vec)) {
+        vec <- format(round(vec, 4), scientific = FALSE, trim = TRUE)
+      }
+      vec <- ifelse(vec == "Inf" | vec == "-Inf" | is.infinite(vec), "Inf", vec)
+      vec <- ifelse(is.na(vec) | vec == "NA", "-", as.character(vec))
+      vec
+    }))
+  
+  df_clean <- df_clean %>% select(where(~ !all(. == "-")))
+  return(df_clean)
+}
+
+# ==============================================================================
+# Helper: Significance Stars Generator
+# ==============================================================================
+add_sig_stars <- function(p) {
+  case_when(
+    is.na(p) ~ "-",
+    p < 0.001 ~ "***",
+    p < 0.01  ~ "**",
+    p < 0.05  ~ "*",
+    p < 0.1   ~ ".",
+    TRUE      ~ "ns"
+  )
+}
+
+# ==============================================================================
+# Helper: Factor Level Mapping for Export
+# ==============================================================================
+beautify_labels <- function(df) {
+  dict <- c(
+    "\\bemotion1\\b" = "emotion[neu]",
+    "\\bemotion2\\b" = "emotion[aff]",
+    "\\bemotion3\\b" = "emotion[dis]",
+    "\\bemotion4\\b" = "emotion[dom]",
+    "\\boffer_type1\\b" = "offer_type[Fair]",
+    "\\boffer_type2\\b" = "offer_type[Unfair]",
+    "\\bExp1\\b" = "Exp[E1]"
+  )
+  df %>% mutate(across(where(is.character), ~ stringr::str_replace_all(., dict)))
+}
+
+# ==============================================================================
+# Helper: Format ANOVA Table to APA String 
+# ==============================================================================
+format_anova_apa <- function(anova_obj, model) {
+  df_res <- as.data.frame(anova_obj) %>% tibble::rownames_to_column("Effect")
+  
+  es_df <- data.frame(Parameter = character(), Eta2_partial = numeric())
+  is_binomial <- inherits(model, "glmmTMB") && family(model)$family == "binomial"
+  
+  if(!is_binomial) {
+    tryCatch({
+      es <- effectsize::eta_squared(model, partial = TRUE, ci = 0.95, verbose = FALSE)
+      es_df <- as.data.frame(es) %>% select(Parameter, Eta2_partial)
+    }, error = function(e) NULL)
+  }
+  
+  if(nrow(es_df) > 0) {
+    df_res <- left_join(df_res, es_df, by = c("Effect" = "Parameter")) 
+  } else {
+    df_res$Eta2_partial <- NA
+  }
+  
+  get_col <- function(col_name) if(col_name %in% names(df_res)) df_res[[col_name]] else NA
+  
+  df_res <- df_res %>%
+    mutate(
+      F_val  = get_col("F value"), 
+      NumDF  = get_col("NumDF"), 
+      DenDF  = get_col("DenDF"), 
+      Df_val = get_col("Df"), 
+      Chisq  = get_col("Chisq"),
+      p_val  = case_when(
+        !is.na(get_col("Pr(>F)")) ~ get_col("Pr(>F)"),
+        !is.na(get_col("Pr(>Chisq)")) ~ get_col("Pr(>Chisq)"),
+        TRUE ~ NA_real_
+      ),
+      Sig = add_sig_stars(p_val),
+      p_str = case_when(
+        is.na(p_val) ~ "-", 
+        p_val < .001 ~ "< .001", 
+        TRUE ~ paste0("= ", format(round(p_val, 3), scientific=FALSE, trim=TRUE))
+      ),
+      Eta_str = ifelse(is.na(Eta2_partial), "-", format(round(Eta2_partial, 2), scientific=FALSE, trim=TRUE)),
+      
+      APA_Report = case_when(
+        !is.na(F_val) & !is.na(NumDF) & !is.na(DenDF) ~ sprintf("F(%s, %.2f) = %.2f, p %s, np2 = %s", NumDF, DenDF, F_val, p_str, Eta_str),
+        !is.na(F_val) & !is.na(Df_val) ~ sprintf("F(%s) = %.2f, p %s, np2 = %s", Df_val, F_val, p_str, Eta_str),
+        !is.na(Chisq) & !is.na(Df_val) ~ sprintf("Chi2(%s) = %.2f, p %s", Df_val, Chisq, p_str),
+        TRUE ~ "Format error: Unrecognized test statistic"
+      )
+    ) %>% 
+    select(Effect, APA_Report, Sig, F_val, NumDF, DenDF, Df_val, Chisq, Eta2_partial, p_val)
+  
+  return(beautify_labels(kill_scipen(df_res)))
+}
+
+# ==============================================================================
+# Helper: Format Post-hoc tests 
+# ==============================================================================
+format_posthoc_apa <- function(emm_df) {
+  df_clean <- as.data.frame(emm_df)
+  
+  est_col <- intersect(names(df_clean), c("estimate", "response", "odds.ratio", "emmean"))
+  if(length(est_col) == 0) est_col <- names(df_clean)[2] 
+  
+  df_clean <- df_clean %>% 
+    mutate(
+      Sig = add_sig_stars(p.value),
+      p_str = case_when(p.value < .001 ~ "< .001", TRUE ~ paste0("= ", format(round(p.value, 3), scientific=FALSE, trim=TRUE)))
+    )
+  
+  if("t.ratio" %in% names(df_clean)) {
+    df_clean <- df_clean %>% mutate(
+      Stats_String = sprintf("b = %.2f (SE = %.2f), t(%s) = %.2f, p %s", !!sym(est_col[1]), SE, ifelse(is.infinite(df), "Inf", round(df, 2)), t.ratio, p_str)
+    )
+  } else if("z.ratio" %in% names(df_clean)) {
+    df_clean <- df_clean %>% mutate(
+      Stats_String = sprintf("b = %.2f (SE = %.2f), z = %.2f, p %s", !!sym(est_col[1]), SE, z.ratio, p_str)
+    )
+  }
+  
+  df_clean <- df_clean %>% select(-p_str) %>% relocate(Sig, .after = Stats_String)
+  return(beautify_labels(kill_scipen(df_clean)))
+}
+
+# ==============================================================================
+# Helper: Extract Raw Model Coefficients and Map Contrast Names
+# ==============================================================================
+format_coefs <- function(model) {
+  df_out <- tryCatch({
+    df_params <- as.data.frame(parameters::model_parameters(model, ci = 0.95, effects = "fixed"))
+    stat_col <- if("t" %in% names(df_params)) "t" else if("z" %in% names(df_params)) "z" else "Statistic"
+    
+    df_params %>% mutate(
+      Sig = add_sig_stars(p),
+      p_str = case_when(p < .001 ~ "< .001", TRUE ~ paste0("= ", format(round(p, 3), scientific=FALSE, trim=TRUE))),
+      Report = sprintf("b = %.2f, SE = %.2f, %s = %.2f, p %s", Coefficient, SE, stat_col, !!sym(stat_col), p_str)
+    ) %>% select(-p_str) %>% relocate(Sig, .after = Report)
+    
+  }, error = function(e) as.data.frame(summary(model)$coefficients) %>% tibble::rownames_to_column("Predictor"))
+  
+  return(beautify_labels(kill_scipen(df_out)))
+}
+
+```
+
+# 3. Model Engine & Output Generation
+
+``` {r functions}
+# ------------------------------------------------------------------------------
+# FUNCTION 1: ROBUST MODELING ENGINE (Data-Driven Maximal Optimization)
+# ------------------------------------------------------------------------------
+run_robust_model <- function(formula_str, data, family_type, fixed_terms, random_fallback_str) {
+  f <- as.formula(formula_str)
+  
+  lmm_ctrl <- lmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 100000))
+  glmm_ctrl <- glmmTMBControl(optCtrl = list(iter.max = 10000, eval.max = 10000))
+  
+  if(DEBUG_MODE) {
+    cat("   [DEBUG] Fitting base model; bypassing maximal optimization.\n")
+    if(family_type == "binomial") {
+      return(glmmTMB(f, data = data, family = binomial(), control = glmm_ctrl))
+    } else {
+      return(lmer(f, data = data, REML = TRUE, control = lmm_ctrl))
+    }
+  } else {
+    cat("   [PRODUCTION] Optimizing Random Effects via buildmer (Backward LRT)...\n")
+    
+    ctrl <- buildmerControl(
+      include = fixed_terms, 
+      direction = c("order", "backward"), 
+      crit = "LRT", 
+      quiet = TRUE,
+      args = list(control = if(family_type == "binomial") glmm_ctrl else lmm_ctrl)
+    )
+    
+    final_model <- tryCatch({
+      if(family_type == "binomial") {
+        buildglmmTMB(f, data = data, family = binomial(), buildmerControl = ctrl)@model
+      } else {
+        buildmer(f, data = data, buildmerControl = ctrl)@model
+      }
+    }, error = function(e) NULL)
+    
+    is_valid_mixed <- suppressWarnings({
+      if(!is.null(final_model)) !is.null(lme4::findbars(formula(final_model))) else FALSE
+    })
+    
+    if(!is_valid_mixed) {
+      cat("   [WARNING] Maximal structure non-convergent. Fallback protocol engaged.\n")
+      fixed_only <- as.character(as.formula(paste(deparse(fixed_terms), collapse=" ")))[2]
+      dep_var <- as.character(f)[2]
+      new_f <- as.formula(paste(dep_var, "~", fixed_only, random_fallback_str))
+      
+      if(family_type == "binomial") {
+        return(glmmTMB(new_f, data = data, family = binomial(), control = glmm_ctrl))
+      } else {
+        return(lmer(new_f, data = data, REML = TRUE, control = lmm_ctrl))
+      }
+    } else {
+      cat("   [SUCCESS] Data-driven maximal random structure identified.\n")
+      return(final_model)
+    }
+  }
+}
+
+# ------------------------------------------------------------------------------
+# FUNCTION 2: STANDARDIZED REPORTING (Excel Integration with Hierarchical Gating)
+# ------------------------------------------------------------------------------
+generate_report <- function(model, label, factors, data_used, out_root_path) {
+  out_dir <- file.path(out_root_path, label)
+  if(!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
+  
+  list_of_tables <- list()
+  list_of_tables[["Model_Formula"]] <- data.frame(Formula = paste(deparse(formula(model)), collapse=" "))
+  list_of_tables[["Model_Coefficients"]] <- format_coefs(model)
+  
+  anov <- suppressWarnings(
+    if(inherits(model, "glmmTMB") || inherits(model, "glm")) {
+      car::Anova(model, type = 3)
+    } else {
+      anova(model, type = 3, ddf = "Satterthwaite")
+    }
+  )
+  list_of_tables[["ANOVA_Main"]] <- format_anova_apa(anov, model)
+  
+  em_df <- as.data.frame(emmeans(model, as.formula(paste("~", paste(factors, collapse="*"))), type="response", data = data_used))
+  list_of_tables[["Descriptive_Means_SE"]] <- beautify_labels(kill_scipen(em_df))
+  
+  p_col <- grep("Pr", names(anov), value = TRUE)[1]
+  
+  # Helper: Verify statistical significance of specified terms from ANOVA output.
+  check_sig <- function(t1, t2=NULL) {
+    if(is.null(t2)) {
+      if(t1 %in% rownames(anov)) return(isTRUE(anov[t1, p_col] < 0.05))
+    } else {
+      term_a <- paste(t1, t2, sep=":")
+      term_b <- paste(t2, t1, sep=":")
+      if(term_a %in% rownames(anov)) return(isTRUE(anov[term_a, p_col] < 0.05))
+      if(term_b %in% rownames(anov)) return(isTRUE(anov[term_b, p_col] < 0.05))
+    }
+    return(FALSE)
+  }
+  
+  # ----------------------------------------------------------------------------
+  # Strict Hierarchical Post-Hoc Decomposition
+  # ----------------------------------------------------------------------------
+  if (length(factors) == 3) {
+    int_3way <- paste(factors, collapse=":")
+    is_3way_sig <- isTRUE(if(int_3way %in% rownames(anov)) anov[int_3way, p_col] < 0.05 else FALSE)
+    
+    if(is_3way_sig) {
+      cat("      [Condition] 3-Way interaction significant. Initiating comprehensive 3-Way contrast extraction.\n")
+      tryCatch({ list_of_tables[["Joint_2Way_by_Exp"]] <- beautify_labels(kill_scipen(as.data.frame(emmeans::joint_tests(model, by = factors[1])))) }, error=function(e) NULL)
+      list_of_tables[["SimpleSimple_Factor3"]] <- format_posthoc_apa(pairs(emmeans(model, as.formula(paste("~", factors[3], "|", factors[2], "*", factors[1])), data=data_used), adjust="fdr"))
+      list_of_tables[["Simple_Exp_by_Emo_Offer"]] <- format_posthoc_apa(pairs(emmeans(model, as.formula(paste("~", factors[1], "|", factors[2], "*", factors[3])), data=data_used), adjust="fdr"))
+      list_of_tables[["Interaction_Contrast"]] <- format_posthoc_apa(contrast(emmeans(model, as.formula(paste("~", factors[1], "*", factors[3], "|", factors[2])), data=data_used), interaction = "pairwise", adjust="fdr"))
+      
+    } else {
+      cat("      [Condition] 3-Way interaction non-significant. Initiating iterative 2-Way interaction evaluation.\n")
+      tryCatch({ list_of_tables[["Joint_Tests_Omnibus"]] <- beautify_labels(kill_scipen(as.data.frame(emmeans::joint_tests(model)))) }, error=function(e) NULL)
+      
+      sig_factors_in_2way <- c()
+      
+      # Evaluate pairwise 2-way interactions.
+      pairs_to_check <- list(c(factors[1], factors[2]), c(factors[2], factors[3]), c(factors[1], factors[3]))
+      for(p in pairs_to_check) {
+        if(check_sig(p[1], p[2])) {
+          cat(sprintf("         -> [Process] 2-Way interaction [%s : %s] significant. Extracting corresponding simple effects.\n", p[1], p[2]))
+          list_of_tables[[paste0("PostHoc_", p[1], "_by_", p[2])]] <- format_posthoc_apa(pairs(emmeans(model, as.formula(paste("~", p[1], "|", p[2])), data=data_used), adjust="fdr"))
+          list_of_tables[[paste0("PostHoc_", p[2], "_by_", p[1])]] <- format_posthoc_apa(pairs(emmeans(model, as.formula(paste("~", p[2], "|", p[1])), data=data_used), adjust="fdr"))
+          sig_factors_in_2way <- unique(c(sig_factors_in_2way, p[1], p[2]))
+        }
+      }
+      
+      # Evaluate Main Effects exclusively for factors absent from significant 2-way interactions.
+      for(f in factors) {
+        if(f %in% sig_factors_in_2way) {
+          cat(sprintf("         -> [Log] Factor '%s' integrated within significant 2-way interaction. Main effect evaluation suppressed.\n", f))
+        } else if(check_sig(f)) {
+          cat(sprintf("         -> [Process] Main effect [%s] significant. Extracting corresponding marginal contrasts.\n", f))
+          list_of_tables[[paste0("PostHoc_Main_", f)]] <- format_posthoc_apa(pairs(emmeans(model, as.formula(paste("~", f)), data=data_used), adjust="fdr"))
+        }
+      }
+    }
+    
+  } else if (length(factors) == 2) {
+    if(check_sig(factors[1], factors[2])) {
+      cat("      [Condition] 2-Way interaction significant. Initiating simple effect extraction.\n")
+      list_of_tables[[paste0("PostHoc_", factors[1], "_by_", factors[2])]] <- format_posthoc_apa(pairs(emmeans(model, as.formula(paste("~", factors[1], "|", factors[2])), data=data_used), adjust="fdr"))
+      list_of_tables[[paste0("PostHoc_", factors[2], "_by_", factors[1])]] <- format_posthoc_apa(pairs(emmeans(model, as.formula(paste("~", factors[2], "|", factors[1])), data=data_used), adjust="fdr"))
+    } else {
+      cat("      [Condition] 2-Way interaction non-significant. Initiating main effect evaluation.\n")
+      for(f in factors) {
+        if(check_sig(f)) list_of_tables[[paste0("PostHoc_Main_", f)]] <- format_posthoc_apa(pairs(emmeans(model, as.formula(paste("~", f)), data=data_used), adjust="fdr"))
+      }
+    }
+  } else {
+    if(check_sig(factors[1])) {
+      cat("      [Condition] Single factor effect significant. Initiating main effect extraction.\n")
+      list_of_tables[[paste0("PostHoc_Main_", factors[1])]] <- format_posthoc_apa(pairs(emmeans(model, as.formula(paste("~", factors[1])), data=data_used), adjust="fdr"))
+    }
+  }
+  
+  # Serialization protocol via openxlsx.
+  wb <- createWorkbook()
+  if(length(list_of_tables) > 0) {
+    for(sheet_name in names(list_of_tables)) {
+      safe_sheet_name <- substr(gsub("[^A-Za-z0-9_]", "_", sheet_name), 1, 31)
+      addWorksheet(wb, safe_sheet_name)
+      writeData(wb, safe_sheet_name, list_of_tables[[sheet_name]])
+      addStyle(wb, safe_sheet_name, createStyle(textDecoration="bold", border="Bottom"), rows=1, cols=1:ncol(list_of_tables[[sheet_name]]))
+    }
+    save_path <- file.path(out_dir, paste0("STATS_REPORT_", label, ".xlsx"))
+    saveWorkbook(wb, save_path, overwrite = TRUE)
+    cat(paste0("      [Export Task Complete] Data serialized to: ", basename(save_path), "\n"))
+  }
+}
+
+```
+
+# 4. Data Import & Cleaning (Single Experiment)
+
+``` {r data-load}
+if(!file.exists(path_input)) stop("System Error: Data file not found at ", path_input)
+
+cat(sprintf("\n>>> Executing Data Import Protocol [%s]...\n", experiment_version))
+
+df_raw <- read_csv(path_input, show_col_types = FALSE)
+
+df_clean <- df_raw %>%
+  mutate(
+    participant_id = factor(sprintf("Vp%04d", as.numeric(str_extract(participant_id, "\\d+")))),
+    
+    offer_type = case_when(
+      Offers_Other %in% c(5, 6) ~ "Fair",
+      Offers_Other %in% c(8, 9) ~ "Unfair",
+      TRUE ~ "Other"
+    ),
+    offer_type = factor(offer_type, levels = c("Fair", "Unfair", "Other")),
+    
+    is_reject = if_else(reaction == 2, 1L, 0L),
+    logRT = log(RT),
+    emotion = factor(emotion, levels = c("neu", "aff", "dis", "dom", "enj"))
+  ) %>%
+  filter(offer_type != "Other", !is.na(reaction), RT >= 150, RT <= 3000) %>%
+  droplevels()
+
+if(DEBUG_MODE) df_clean <- df_clean %>% filter(participant_id %in% unique(participant_id)[1:5])
+
+contrasts(df_clean$emotion) <- contr.sum
+contrasts(df_clean$offer_type) <- contr.sum
+
+cat("Operational Sample Size (Trials):", nrow(df_clean), "\n")
+
+```
+
+# 5. Confirmatory Analysis: Offer Type (Fair vs. Unfair)
+
+``` {r analysis-type}
+emmeans::emm_options(
+  lmerTest.limit = 50000, 
+  pbkrtest.limit = 50000, 
+  lmer.df = "asymptotic"
+)
+cat(">>> Emmeans Configuration: Asymptotic DF enabled for massive datasets.\n")
+
+fallback_rnd <- "+ (1 | participant_id) + (0 + emotion | participant_id) + (0 + offer_type | participant_id)"
+
+# --- 1. Rejection Rate (GLMM - Binomial) ---
+cat(sprintf("\n>>> Initialization: Confirmatory Pipeline - Rejection Rate [%s] <<<\n", experiment_version))
+m_type_rej <- run_robust_model(
+  formula_str = paste("is_reject ~ emotion * offer_type", fallback_rnd, "+ (0 + emotion:offer_type | participant_id)"),
+  data = df_clean, family_type = "binomial", fixed_terms = ~ emotion * offer_type, random_fallback_str = "+ (1 | participant_id)"
+)
+if(!is.null(m_type_rej)) generate_report(m_type_rej, "Type_Rejection_Rate", c("emotion", "offer_type"), df_clean, path_out_root)
+
+# --- 2. Response Time (LMM - Gaussian) ---
+cat(sprintf("\n>>> Initialization: Confirmatory Pipeline - Response Time [%s] <<<\n", experiment_version))
+m_type_rt <- run_robust_model(
+  formula_str = paste("logRT ~ emotion * offer_type", fallback_rnd, "+ (0 + emotion:offer_type | participant_id)"),
+  data = df_clean, family_type = "gaussian", fixed_terms = ~ emotion * offer_type, random_fallback_str = "+ (1 | participant_id)"
+)
+if(!is.null(m_type_rt)) generate_report(m_type_rt, "Type_Response_Time", c("emotion", "offer_type"), df_clean, path_out_root)
+
+```
+
+# 6. Robustness Check: Structural Constraints
+
+``` {r robustness-check}
+cat(sprintf("\n>>> Initialization: Robustness Verification Protocol [%s] <<<\n", experiment_version))
+robust_dir <- file.path(path_out_root, "Robustness_Check_Structural")
+if(!dir.exists(robust_dir)) dir.create(robust_dir, recursive=TRUE)
+
+m_forced_1 <- glmmTMB(is_reject ~ emotion * offer_type + (1 + offer_type | participant_id), data = df_clean, family = binomial())
+generate_report(m_forced_1, "Model_A_Structure", c("emotion", "offer_type"), df_clean, robust_dir)
+
+m_forced_2 <- tryCatch({
+  glmmTMB(is_reject ~ emotion * offer_type + (1 + emotion + offer_type | participant_id), data = df_clean, family = binomial())
+}, warning = function(w) {
+  glmmTMB(is_reject ~ emotion * offer_type + (1 | participant_id) + (0 + emotion | participant_id) + (0 + offer_type | participant_id), data = df_clean, family = binomial())
+}, error = function(e) NULL)
+
+if(!is.null(m_forced_2)) {
+  generate_report(m_forced_2, "Model_B_Structure", c("emotion", "offer_type"), df_clean, robust_dir)
+  lrt_results <- anova(m_forced_1, m_forced_2)
+  capture.output(print(lrt_results), file = file.path(robust_dir, paste0("LRT_Model_Comparison_", experiment_version, ".txt")))
+}
+
+```
+
+# 7. Exploratory Analysis I: Unfair Rejection RT
+
+``` {r analysis-unfair}
+df_unfair <- df_clean %>% filter(offer_type == "Unfair", is_reject == 1) %>% droplevels()
+
+if(nrow(df_unfair) > 50) {
+  contrasts(df_unfair$emotion) <- contr.sum
+  cat(sprintf("\n>>> Initialization: Exploratory Pipeline - Unfair Rejection RT [%s] <<<\n", experiment_version))
+  m_unfair <- run_robust_model(
+    formula_str = "logRT ~ emotion + (1 | participant_id) + (0 + emotion | participant_id)",
+    data = df_unfair, family_type = "gaussian", fixed_terms = ~ emotion, random_fallback_str = "+ (1 | participant_id)"
+  )
+  if(!is.null(m_unfair)) generate_report(m_unfair, "Unfair_Rejection_RT", c("emotion"), df_unfair, path_out_root)
+} else {
+  cat(sprintf("Process Terminated: Insufficient observations for Unfair Analysis (%s).\n", experiment_version))
+}
+
+```
+
+# 8. Exploratory Analysis II: Cross-Experiment (E1 vs. E2)
+
+This section isolates temporal presentation differences by analyzing both datasets simultaneously via a 3-way Mixed Model design.
+
+``` {r cross-experiment-import}
+path_E1 <- here("data", "02_Pipeline_Output_E1", "Method_Regression", "Stimulus_Locked", "trials.csv")
+path_E2 <- here("data", "02_Pipeline_Output_E2", "Method_Regression", "Stimulus_Locked", "trials.csv")
+
+if(file.exists(path_E1) && file.exists(path_E2)) {
+  cat("\n=== Initialization: Cross-Experiment Analytical Pipeline ===\n")
+  
+  load_and_clean_crossexp <- function(path, exp_label) {
+    read_csv(path, show_col_types = FALSE) %>%
+      mutate(
+        Subject_ID_Mega = factor(sprintf("%s_Vp%04d", exp_label, as.numeric(str_extract(participant_id, "\\d+")))),
+        Exp = factor(exp_label, levels = c("E1", "E2")),
+        offer_type = factor(case_when(Offers_Other %in% c(5, 6) ~ "Fair", Offers_Other %in% c(8, 9) ~ "Unfair", TRUE ~ "Other"), levels = c("Fair", "Unfair", "Other")),
+        is_reject = if_else(reaction == 2, 1L, 0L),
+        logRT = log(RT),
+        emotion = factor(emotion, levels = c("neu", "aff", "dis", "dom", "enj"))
+      ) %>%
+      filter(offer_type != "Other", !is.na(reaction), RT >= 150, RT <= 3000)
+  }
+
+  df_mega <- bind_rows(load_and_clean_crossexp(path_E1, "E1"), load_and_clean_crossexp(path_E2, "E2")) %>% droplevels()
+  
+  contrasts(df_mega$emotion) <- contr.sum
+  contrasts(df_mega$offer_type) <- contr.sum
+  contrasts(df_mega$Exp) <- contr.sum
+
+  if(DEBUG_MODE) df_mega <- df_mega %>% filter(Subject_ID_Mega %in% unique(Subject_ID_Mega)[1:10])
+  
+  path_out_cross <- here("results", "Behavioral", paste0("CrossExp_E1_vs_E2_", dir_suffix))
+  if(!dir.exists(path_out_cross)) dir.create(path_out_cross, recursive=TRUE)
+  
+  random_cross <- "+ (1 | Subject_ID_Mega) + (0 + emotion | Subject_ID_Mega) + (0 + offer_type | Subject_ID_Mega) + (0 + emotion:offer_type | Subject_ID_Mega)"
+  
+  # --- 1. Cross-Exp Rejection Rate ---
+  cat("\n>>> Executing Analysis: Cross-Exp Rejection Rate (3-Way Interaction) <<<\n")
+  m_cross_rej <- run_robust_model(
+    formula_str = paste("is_reject ~ Exp * emotion * offer_type", random_cross),
+    data = df_mega, family_type = "binomial", fixed_terms = ~ Exp * emotion * offer_type, random_fallback_str = "+ (1 | Subject_ID_Mega)"
+  )
+  if(!is.null(m_cross_rej)) generate_report(m_cross_rej, "CrossExp_Rejection_Rate", c("Exp", "emotion", "offer_type"), df_mega, path_out_cross)
+
+  # --- 2. Cross-Exp Response Time ---
+  cat("\n>>> Executing Analysis: Cross-Exp Response Time (3-Way Interaction) <<<\n")
+  m_cross_rt <- run_robust_model(
+    formula_str = paste("logRT ~ Exp * emotion * offer_type", random_cross),
+    data = df_mega, family_type = "gaussian", fixed_terms = ~ Exp * emotion * offer_type, random_fallback_str = "+ (1 | Subject_ID_Mega)"
+  )
+  if(!is.null(m_cross_rt)) generate_report(m_cross_rt, "CrossExp_Response_Time", c("Exp", "emotion", "offer_type"), df_mega, path_out_cross)
+
+} else {
+  cat("\n[NOTICE] Cross-Experiment pipeline bypassed. Input dependencies (E1/E2) unavailable.\n")
+}
+
+```
+
+# 9. Session Info
+
+``` {r session}
+sessionInfo()
+
+```
+

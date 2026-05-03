@@ -37,7 +37,7 @@ experiment_version <- "E2"
 # -----------------------------------------------------------
 # TRUE  = Standard Method: Subtracts baseline mean from the epoch.
 # FALSE = Regression Method: No baseline subtraction (extracts baseline as covariate).
-use_baseline_correction <- FALSE 
+use_baseline_correction <- TRUE 
 
 # -----------------------------------------------------------
 # Baseline Parameters (Stimulus-Locked Only)
@@ -66,8 +66,14 @@ run_cpp_phase   <- FALSE  # Response-Locked (CPP)
 # Path Definitions (Hierarchical & Dynamic)
 # -----------------------------------------------------------
 path_py_pipeline_src <- here("python_modules", "hu-neuro-pipeline")
-path_raw_eeg         <- here("data", "00_Raw_Input", "raw_all_cropped")
-path_raw_log         <- here("data", "00_Raw_Input", "csv_all")
+
+# Raw input paths are versioned by experiment_version so that E1 and E2 data
+# can coexist on disk without manual relocation. Expected layout:
+#   data/00_Raw_Input/raw_all_cropped_E1/   data/00_Raw_Input/csv_all_E1/
+#   data/00_Raw_Input/raw_all_cropped_E2/   data/00_Raw_Input/csv_all_E2/
+# Toggle experiment_version above to switch which dataset is processed.
+path_raw_eeg         <- here("data", "00_Raw_Input", paste0("raw_all_cropped_", experiment_version))
+path_raw_log         <- here("data", "00_Raw_Input", paste0("csv_all_", experiment_version))
 
 # Dynamic Sandboxing based on experiment_version
 path_csv_filtered    <- here("data", paste0("01_Preprocessing_Logs_", experiment_version), "csv_filtered")
@@ -99,6 +105,23 @@ dirs_to_create <- c(
   path_dest_baseline, path_dest_report_stim, path_dest_report_cpp
 )
 purrr::walk(dirs_to_create, ~dir.create(., showWarnings = FALSE, recursive = TRUE))
+
+# Defensive check: raw-input directories must exist for the selected
+# experiment_version. Failing fast here gives a clear error message; without
+# this, downstream code would fail later in obscure ways (empty file lists,
+# zero-row data frames, MNE-Python errors).
+if (!dir.exists(path_raw_eeg)) {
+  stop(sprintf(
+    "Raw EEG directory not found for experiment_version='%s':\n  %s\nExpected layout: data/00_Raw_Input/raw_all_cropped_%s/",
+    experiment_version, path_raw_eeg, experiment_version
+  ))
+}
+if (!dir.exists(path_raw_log)) {
+  stop(sprintf(
+    "Raw log directory not found for experiment_version='%s':\n  %s\nExpected layout: data/00_Raw_Input/csv_all_%s/",
+    experiment_version, path_raw_log, experiment_version
+  ))
+}
 
 
 ```
@@ -171,7 +194,7 @@ cat("Log preprocessing complete.\n")
 # Unfair categorization: Offers 8:2 and 9:1
 # Note: Offer 7:3 serves as a filler condition and is excluded from the pooled 
 #       fairness contrasts to maximize signal-to-noise ratio.
-# General Inclusion Criteria: Valid reaction (>0), RT between 150 and 3000 ms.
+# General Inclusion Criteria: Valid reaction (>0), RT between 300 and 3000 ms.
 
 common_average_by <- list(
     

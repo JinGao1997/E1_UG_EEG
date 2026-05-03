@@ -1,0 +1,535 @@
+---
+title: "Exp 1 & 2 ERP Statistical Analysis: Regression-Based Baseline Correction"
+subtitle: "Method: LMM (F-Tests via Satterthwaite) with Stepwise Reduction from Fully-Correlated Maximal Structure"
+author: "Project Research Team"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+    theme: flatly
+    fig_width: 10
+    fig_height: 6
+---
+
+``` {r setup, include=FALSE}
+# ==============================================================================
+# 1. Global Configuration & Environment
+# ==============================================================================
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+options(scipen = 999, digits = 4)
+
+# Methodological Setup: Sum-to-zero contrasts are enforced to guarantee valid 
+# Type III ANOVA results and valid lower-order main effects in the presence of interactions.
+options(contrasts = c("contr.sum", "contr.poly"))
+
+# ------------------------------------------------------------------------------
+# Global Settings & Analysis Targets (SINGLE SOURCE OF TRUTH)
+# ------------------------------------------------------------------------------
+# Parameter: Set experiment version to match upstream preprocessing pipeline output.
+experiment_version <- "E1"  # Supported values: "E1" or "E2"
+
+# Dynamic component definitions based on experimental design requirements.
+# Boolean values indicate whether to include continuous covariate moderation (SVO).
+if (experiment_version == "E1") {
+  analyze_stim_components <- c(
+    "EPN"       = TRUE,
+    "FRN"       = TRUE,
+    "N400"      = TRUE,
+    "LPP_offer" = TRUE
+  )
+} else if (experiment_version == "E2") {
+  analyze_stim_components <- c(
+    "N170"      = TRUE,
+    "EPN"       = TRUE,
+    "FRN"       = TRUE,
+    "N400"      = TRUE,
+    "LPP_offer" = TRUE
+  )
+} else {
+  stop("FATAL ERROR: Invalid experiment_version specified.")
+}
+
+analyze_resp_components <- c(
+  "CPP"       = FALSE
+)
+# ------------------------------------------------------------------------------
+
+# Dependency Management
+if(!require("pacman")) install.packages("pacman")
+pacman::p_load(
+  here, readr, readxl, dplyr, tidyr, stringr,  # Data Wrangling
+  lme4, lmerTest,                              # Mixed-Effects Modeling
+  car, parameters, performance,                # Diagnostics & APA Extraction
+  buildmer,                                    # Random Structure Optimization
+  emmeans, effectsize,                         # Statistical Inference & Marginal Means
+  sjPlot, sjmisc,                              # Visualizations
+  ggplot2, ggpubr, gridExtra,                  # Publication-grade Visualization
+  openxlsx                                     # Excel Reporting
+)
+
+# Configuration: Force rigorous calculation limits for Denominator DF estimations
+emmeans::emm_options(lmerTest.limit = 50000, pbkrtest.limit = 50000)
+
+# Directory Setup: Isolate results for the Stepwise Full Maximal methodology
+out_root <- here("results", "EEG", paste0(experiment_version, "_Stats_Regression_StepwiseFullMaximal"))
+if(!dir.exists(out_root)) dir.create(out_root, recursive = TRUE)
+
+cat(sprintf("[SYSTEM] Initializing statistical pipeline for Cohort: %s\n[SYSTEM] Output Directory: %s\n", 
+            experiment_version, out_root))
+
+# Aesthetic Constants
+theme_set(theme_bw(base_size = 14) + 
+          theme(panel.grid.minor = element_blank(), legend.position = "top"))
+
+colors_emo <- c('neu'="#8491B4",'aff'="#91D1C2",'dis'="#E64B35",'dom'="#F39B7F",'enj'="#3C5488")
+labels_emo <- c('neu'='Neutral','aff'='Affiliative','dis'='Disgust','dom'='Dominance','enj'='Reward')
+colors_off <- c('fair'="#2E86AB",'unfair'="#A23B72")
+labels_off <- c('fair'='Fair', 'unfair'='Unfair')
+
+# Optimizer Protocol: Bobyqa configured for high-dimensional random effects structures
+custom_control <- lmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 200000), calc.derivs = FALSE)
+
+```
+
+``` {r apa-module}
+# ==============================================================================
+# Statistical Utility Functions: Data Structuring & APA Formatting
+# ==============================================================================
+
+# Utility: Normalizes numeric formatting and purges empty columns for reporting
+kill_scipen <- function(df) {
+  df_clean <- df %>% 
+    mutate(across(where(is.factor), as.character)) %>%
+    mutate(across(everything(), ~ {
+      vec <- .
+      if(is.numeric(vec)) {
+        vec <- format(round(vec, 4), scientific = FALSE, trim = TRUE)
+      }
+      vec <- ifelse(vec == "Inf" | vec == "-Inf" | is.infinite(vec), "Inf", vec)
+      vec <- ifelse(is.na(vec) | vec == "NA", "-", as.character(vec))
+      vec
+    }))
+  df_clean %>% select(where(~ !all(. == "-")))
+}
+
+# Utility: Map p-values to standard significance denotations
+add_sig_stars <- function(p) {
+  case_when(
+    is.na(p) ~ "-",
+    p < 0.001 ~ "***",
+    p < 0.01  ~ "**",
+    p < 0.05  ~ "*",
+    p < 0.1   ~ ".",
+    TRUE      ~ "ns"
+  )
+}
+
+# Utility: Reverse sum-coding nomenclature to human-readable factor levels globally
+beautify_labels <- function(df) {
+  dict <- c(
+    "\\bemotion1\\b" = "emotion[neu]",
+    "\\bemotion2\\b" = "emotion[aff]",
+    "\\bemotion3\\b" = "emotion[dis]",
+    "\\bemotion4\\b" = "emotion[dom]",
+    "\\boffer_type1\\b" = "offer_type[fair]",
+    "\\boffer_type2\\b" = "offer_type[unfair]"
+  )
+  df %>% mutate(across(where(is.character), ~ stringr::str_replace_all(., dict)))
+}
+
+# Utility: Parse raw ANOVA objects into APA-compliant summary strings
+format_anova_apa <- function(anova_obj, model) {
+  df_res <- as.data.frame(anova_obj) %>% tibble::rownames_to_column("Effect")
+  
+  es_df <- data.frame(Parameter = character(), Eta2_partial = numeric())
+  tryCatch({
+    es <- effectsize::eta_squared(model, partial = TRUE, ci = 0.95, verbose = FALSE)
+    es_df <- as.data.frame(es) %>% select(Parameter, Eta2_partial)
+  }, error = function(e) NULL)
+  
+  if(nrow(es_df) > 0) {
+    df_res <- left_join(df_res, es_df, by = c("Effect" = "Parameter"))
+  } else {
+    df_res$Eta2_partial <- NA
+  }
+  
+  get_col <- function(col_name) if(col_name %in% names(df_res)) df_res[[col_name]] else NA
+  
+  df_res %>%
+    mutate(
+      F_val  = get_col("F value"), 
+      NumDF  = get_col("NumDF"), 
+      DenDF  = get_col("DenDF"), 
+      Df_val = get_col("Df"),
+      p_val  = get_col("Pr(>F)"),
+      Sig = add_sig_stars(p_val),
+      p_str = case_when(
+        is.na(p_val) ~ "-", 
+        p_val < .001 ~ "< .001", 
+        TRUE ~ paste0("= ", format(round(p_val, 3), scientific=FALSE, trim=TRUE))
+      ),
+      Eta_str = ifelse(is.na(Eta2_partial), "-", format(round(Eta2_partial, 2), scientific=FALSE, trim=TRUE)),
+      APA_Report = case_when(
+        !is.na(F_val) & !is.na(NumDF) & !is.na(DenDF) ~ sprintf("F(%s, %.2f) = %.2f, p %s, np2 = %s", NumDF, DenDF, F_val, p_str, Eta_str),
+        !is.na(F_val) & !is.na(NumDF) & is.na(DenDF) ~ sprintf("F(%s, -) = %.2f, p %s, np2 = %s", NumDF, F_val, p_str, Eta_str),
+        !is.na(F_val) & !is.na(Df_val) ~ sprintf("F(%s) = %.2f, p %s, np2 = %s", Df_val, F_val, p_str, Eta_str),
+        TRUE ~ "FORMAT_ERROR"
+      )
+    ) %>% 
+    select(Effect, APA_Report, Sig, F_val, NumDF, DenDF, Df_val, Eta2_partial, p_val) %>%
+    kill_scipen() %>%
+    beautify_labels()
+}
+
+# Utility: Parse emmeans estimated marginal means into APA-compliant post-hoc strings
+format_posthoc_apa <- function(emm_df) {
+  df_clean <- as.data.frame(emm_df)
+  est_col <- intersect(names(df_clean), c("estimate", "response", "odds.ratio", "emmean"))
+  if(length(est_col) == 0) est_col <- names(df_clean)[2] 
+  
+  df_clean <- df_clean %>% 
+    mutate(
+      Sig = add_sig_stars(p.value),
+      p_str = case_when(p.value < .001 ~ "< .001", TRUE ~ paste0("= ", format(round(p.value, 3), scientific=FALSE, trim=TRUE)))
+    )
+  
+  if("t.ratio" %in% names(df_clean)) {
+    df_clean <- df_clean %>% mutate(
+      Stats_String = sprintf("b = %.2f (SE = %.2f), t(%s) = %.2f, p %s", !!sym(est_col[1]), SE, ifelse(is.infinite(df), "Inf", round(df, 2)), t.ratio, p_str)
+    )
+  } else if("z.ratio" %in% names(df_clean)) {
+    df_clean <- df_clean %>% mutate(
+      Stats_String = sprintf("b = %.2f (SE = %.2f), z = %.2f, p %s", !!sym(est_col[1]), SE, z.ratio, p_str)
+    )
+  }
+  
+  df_clean %>% select(-p_str) %>% relocate(Sig, .after = Stats_String) %>% kill_scipen() %>% beautify_labels()
+}
+
+# Utility: Extract and format raw fixed effect coefficients
+format_coefs <- function(model) {
+  df_out <- tryCatch({
+    df_params <- as.data.frame(parameters::model_parameters(model, ci = 0.95, effects = "fixed"))
+    stat_col <- if("t" %in% names(df_params)) "t" else if("z" %in% names(df_params)) "z" else "Statistic"
+    
+    df_params %>% mutate(
+      Sig = add_sig_stars(p),
+      p_str = case_when(p < .001 ~ "< .001", TRUE ~ paste0("= ", format(round(p, 3), scientific=FALSE, trim=TRUE))),
+      Report = sprintf("b = %.2f, SE = %.2f, %s = %.2f, p %s", Coefficient, SE, stat_col, !!sym(stat_col), p_str)
+    ) %>% select(-p_str) %>% relocate(Sig, .after = Report)
+    
+  }, error = function(e) as.data.frame(summary(model)$coefficients) %>% tibble::rownames_to_column("Predictor"))
+  
+  return(beautify_labels(kill_scipen(df_out)))
+}
+
+```
+
+``` {r prep-functions}
+# ==============================================================================
+# Data Loading & Preprocessing Modules
+# ==============================================================================
+
+# Normalizes varying participant ID strings to standard fixed-width format (e.g., Vp0001)
+standardize_id <- function(ids) sprintf("Vp%04d", as.numeric(str_extract(ids, "\\d+")))
+
+# Loads and scales covariate matrices (e.g., SVO angles)
+load_covariates <- function(path_cov) {
+  if(!file.exists(path_cov)) { 
+    warning("[WARNING] Covariate file missing. Returning NULL."); 
+    return(NULL) 
+  }
+  cat(sprintf("[LOAD] Covariate dataset: %s\n", basename(path_cov)))
+  
+  df_cov <- if(grepl("\\.csv$", path_cov)) read_csv(path_cov, show_col_types=FALSE) else read_excel(path_cov)
+  names(df_cov)[1] <- "raw_id"
+  df_cov$participant_id <- standardize_id(df_cov$raw_id)
+  
+  if("Rating_1" %in% names(df_cov)) df_cov <- rename(df_cov, Reaction_Score = Rating_1)
+  
+  df_cov %>% 
+    select(participant_id, SVO_angle, SVO_type, Reaction_Score, any_of(c("Antagonism","Detachment","Disinhibition"))) %>%
+    mutate(SVO_Z = if("SVO_angle" %in% names(.)) as.numeric(scale(SVO_angle)) else NA_real_)
+}
+
+# Extracts targeted ERP window and applies robust preprocessing configurations
+load_and_prep <- function(path_erp, df_covariates, erp_name, baseline_col) {
+  if(!file.exists(path_erp)) stop("[ERROR] ERP dataset file missing.")
+  df <- read_csv(path_erp, show_col_types=FALSE)
+  
+  if(!(erp_name %in% names(df))) {
+    cat(sprintf("[SKIP] Target component '%s' not present in schema.\n", erp_name))
+    return(NULL)
+  }
+  
+  df$participant_id <- standardize_id(df$participant_id)
+  
+  # Design implementation: Isolates targeted experimental conditions (Offers)
+  df <- df %>%
+    filter(Offers_Other %in% c(5, 6, 8, 9)) %>%
+    mutate(
+      offer_type = factor(case_when(Offers_Other %in% c(5,6)~"fair", Offers_Other %in% c(8,9)~"unfair"), levels = c("fair", "unfair")),
+      emotion = factor(emotion, levels = c("neu", "aff", "dis", "dom", "enj"))
+    )
+  
+  # Artifact Rejection protocol
+  orig_n <- nrow(df)
+  df <- df %>% filter(abs(!!sym(erp_name)) < 200)
+  if(orig_n > nrow(df)) cat(sprintf("[QC] %s: Filtered %d trials exceeding ±200µV threshold.\n", erp_name, orig_n-nrow(df)))
+  
+  # Covariate integration: Baseline amplitude scaling stabilizes downstream numerical optimizers
+  if(!is.null(baseline_col) && baseline_col %in% names(df)) {
+    df$Baseline_Raw <- df[[baseline_col]]
+    df$Baseline_c <- as.numeric(scale(df$Baseline_Raw, center=TRUE, scale=TRUE))
+  } else { 
+    df$Baseline_c <- 0 
+  }
+  
+  if(!is.null(df_covariates)) df <- left_join(df, df_covariates, by = "participant_id")
+  return(df)
+}
+
+# Validation logic to ensure data fidelity prior to merge operations
+check_uniqueness <- function(df, context_name) {
+  if(nrow(df) != n_distinct(select(df, participant_id, index))) 
+    stop(sprintf("[CRITICAL] Duplicate composite keys detected in context: %s", context_name))
+}
+
+```
+
+``` {r stats-engine}
+# ==============================================================================
+# Analytical Engine: Linear Mixed-Effects Modeling Framework
+# ==============================================================================
+run_regression_analysis <- function(data, erp_name, out_dir, exp_version, use_svo = FALSE) {
+  
+  sub_dir <- file.path(out_dir, erp_name)
+  if(!dir.exists(sub_dir)) dir.create(sub_dir, recursive = TRUE)
+  
+  cat(sprintf("\n[PROCESSING] Component: %s | Experiment: %s | Subjects (N): %d\n", 
+              erp_name, exp_version, n_distinct(data$participant_id)))
+  
+  # ----------------------------------------------------------------------------
+  # Structural Specification: Fixed Effects
+  # ----------------------------------------------------------------------------
+  baseline_formula <- "+ Baseline_c"
+  fixed_effects <- paste0(erp_name, " ~ emotion * offer_type ", baseline_formula)
+  
+  if(use_svo && "SVO_Z" %in% names(data)) {
+    cat("[INFO] SVO_Z moderator parameterized into fixed-effects structure.\n")
+    fixed_effects <- paste0(erp_name, " ~ emotion * offer_type * SVO_Z ", baseline_formula)
+  }
+
+  # ----------------------------------------------------------------------------
+  # Random Effects Strategy: Data-Driven Optimization via buildmer
+  # Initial State: Fully-Correlated Maximal Model
+  # ----------------------------------------------------------------------------
+  cat("[PHASE 1] Executing random structure optimization via backward likelihood-ratio tests (LRT).\n")
+  cat("[INFO] Initialization: Fully-Correlated Maximal Model -> (1 + emotion * offer_type | participant_id)\n")
+  
+  # Methodological Rationale: This structure estimates intercept-slope and slope-slope 
+  # covariances for all repeated measures before backward elimination logic trims 
+  # non-contributing variance components.
+  random_maximal <- "+ (1 + emotion * offer_type | participant_id)"
+  
+  f_buildmer <- as.formula(paste(fixed_effects, random_maximal))
+  
+  # execution wrapper for buildmer
+  bm_res <- buildmer::buildmer(
+    formula = f_buildmer, 
+    data = data,
+    buildmerControl = buildmerControl(
+      include = as.formula(paste("~", str_split(fixed_effects, "~")[[1]][2])), # Fixed effects are locked
+      direction = c("order", "backward"), 
+      crit = "LRT", 
+      quiet = TRUE,
+      args = list(control = custom_control)
+    )
+  )
+  
+  # ----------------------------------------------------------------------------
+  # Model Fitting & Inferential Statistics Extraction
+  # ----------------------------------------------------------------------------
+  cat("[PHASE 2] Estimating final optimized model utilizing REML.\n")
+  final_formula <- formula(bm_res@model)
+  
+  FINAL_MODEL <- lmer(final_formula, data = data, REML = TRUE, control = custom_control)
+  
+  formula_str <- paste(deparse(final_formula), collapse = " ")
+  cat("\n[INFO] Final Retained Formula Structure:\n", str_squish(formula_str), "\n\n")
+
+  anova_res <- anova(FINAL_MODEL, type = 3, ddf = "Satterthwaite")
+  anova_apa <- format_anova_apa(anova_res, FINAL_MODEL)
+  print(anova_apa %>% select(Effect, APA_Report))
+
+  # ----------------------------------------------------------------------------
+  # Inferential Diagnostics: Marginal Means & Simple Effects Decomposition
+  # ----------------------------------------------------------------------------
+  cat("[PHASE 3] Compiling Estimated Marginal Means and FDR-adjusted Contrasts.\n")
+  
+  target_term <- "emotion:offer_type"
+  svo_survived <- FALSE
+  if(use_svo && any(grepl("SVO_Z", row.names(anova_res)))) {
+    target_term <- "emotion:offer_type:SVO_Z"
+    svo_survived <- TRUE
+  }
+  
+  p_int <- anova_res[target_term, "Pr(>F)"]
+  if(is.na(p_int)) p_int <- 1.0
+  
+  at_list <- list(Baseline_c = 0)
+  if(svo_survived) at_list$SVO_Z <- c(-1, 1) 
+  
+  list_of_tables <- list(
+    "ANOVA_Main" = anova_apa, 
+    "Model_Formula" = data.frame(Formula = formula_str), 
+    "Model_Coefficients" = format_coefs(FINAL_MODEL)
+  )
+  
+  if (p_int < 0.05) {
+    cat("[INFO] Significant interaction term detected. Executing bidirectional simple effects decomposition.\n")
+    list_of_tables[["Simple_Offer_by_Emotion"]] <- format_posthoc_apa(
+      pairs(emmeans(FINAL_MODEL, as.formula("~ offer_type | emotion"), at = at_list), adjust="fdr")
+    )
+    list_of_tables[["Simple_Emotion_by_Offer"]] <- format_posthoc_apa(
+      pairs(emmeans(FINAL_MODEL, as.formula("~ emotion | offer_type"), at = at_list), adjust="fdr")
+    )
+  } else {
+    cat("[INFO] No robust interaction observed. Reporting primary main effects.\n")
+    list_of_tables[["Main_Effect_Offer"]] <- format_posthoc_apa(
+      pairs(emmeans(FINAL_MODEL, ~ offer_type, at = at_list), adjust="fdr")
+    )
+    list_of_tables[["Main_Effect_Emotion"]] <- format_posthoc_apa(
+      pairs(emmeans(FINAL_MODEL, ~ emotion, at = at_list), adjust="fdr")
+    )
+    
+    if (p_int < 0.10) {
+      cat("[INFO] Marginal interaction detected (p < .10). Extracting uncorrected simple effects for exploratory assessment.\n")
+      list_of_tables[["Exploratory_Simple_Offer"]] <- format_posthoc_apa(
+        pairs(emmeans(FINAL_MODEL, as.formula("~ offer_type | emotion"), at = at_list), adjust="none")
+      )
+    }
+  }
+
+  list_of_tables[["Descriptive_Means_SE"]] <- beautify_labels(kill_scipen(
+    as.data.frame(emmeans(FINAL_MODEL, as.formula(paste("~ offer_type * emotion", if(svo_survived) "* SVO_Z" else "")), at = at_list))
+  ))
+  
+  # ----------------------------------------------------------------------------
+  # Data Serialization & Visualization
+  # ----------------------------------------------------------------------------
+  wb <- createWorkbook()
+  for(sheet_name in names(list_of_tables)) {
+    safe_sheet_name <- substr(gsub("[^A-Za-z0-9_]", "_", sheet_name), 1, 31)
+    addWorksheet(wb, safe_sheet_name)
+    writeData(wb, safe_sheet_name, list_of_tables[[sheet_name]])
+    addStyle(wb, safe_sheet_name, createStyle(textDecoration="bold", border="Bottom"), rows=1, cols=1:ncol(list_of_tables[[sheet_name]]))
+  }
+  saveWorkbook(wb, file.path(sub_dir, paste0("STATS_REPORT_StepwiseFullMax_", exp_version, "_", erp_name, ".xlsx")), overwrite = TRUE)
+
+  cat("[PHASE 4] Synthesizing diagnostic visualization assets.\n")
+  try({
+    p_forest <- sjPlot::plot_model(FINAL_MODEL, type = "est", show.values = TRUE, show.p = TRUE, 
+                                   title = paste(exp_version, erp_name, "Fixed Coefficients")) + theme_bw()
+    ggsave(file.path(sub_dir, paste0("Diag_Forest_Plot_StepFullMax_", exp_version, ".png")), p_forest, width = 6, height = 8)
+  })
+
+  if(svo_survived) {
+      pd <- as.data.frame(emmeans(FINAL_MODEL, ~ offer_type * emotion * SVO_Z, at = at_list))
+      pd$SVO_Group <- factor(pd$SVO_Z, labels=c("Low SVO (-1SD)", "High SVO (+1SD)"))
+      p_final <- ggplot(pd, aes(x = emotion, y = emmean, color = offer_type, group = offer_type)) +
+           facet_wrap(~SVO_Group) + geom_line(linewidth=1.2, position=position_dodge(0.2)) + 
+           geom_point(size=3, position=position_dodge(0.2)) +
+           geom_errorbar(aes(ymin=emmean-SE, ymax=emmean+SE), width=0.2, position=position_dodge(0.2)) +
+           scale_color_manual(values = colors_off, labels = labels_off) +
+           labs(title = paste(exp_version, erp_name, "by SVO Moderation"), y = "Amplitude (µV)", x = "Emotion Condition")
+  } else {
+      pd <- as.data.frame(emmeans(FINAL_MODEL, ~ offer_type * emotion, at = list(Baseline_c = 0)))
+      p_final <- ggplot(pd, aes(x = emotion, y = emmean, color = offer_type, group = offer_type)) +
+           geom_line(linewidth=1.2, position=position_dodge(0.2)) + 
+           geom_point(size=3.5, shape=21, fill="white", stroke=2, position=position_dodge(0.2)) +
+           geom_errorbar(aes(ymin=emmean-SE, ymax=emmean+SE), width=0.2, position=position_dodge(0.2)) +
+           scale_color_manual(values = colors_off, labels = labels_off) + scale_x_discrete(labels = labels_emo) +
+           labs(title = paste(exp_version, erp_name, "Interaction Effect"), y = "Amplitude (µV)", x = "Emotion Condition")
+  }
+  ggsave(file.path(sub_dir, paste0("Plot_StepFullMax_", exp_version, "_Main.png")), p_final, width = 8, height = 6)
+  
+  cat("[SYSTEM] Process termination successful for component.\n")
+}
+
+```
+
+``` {r execution}
+# ==============================================================================
+# Pipeline Execution Matrix
+# ==============================================================================
+path_pipeline <- here("data", paste0("02_Pipeline_Output_", experiment_version))
+
+path_stim <- file.path(path_pipeline, "Method_Regression", "Stimulus_Locked", "trials.csv")
+path_resp <- file.path(path_pipeline, "Method_Regression", "Response_Locked", "trials.csv")
+
+path_cov_csv <- file.path(path_pipeline, "Covariates", "SVO_PID5BF_PostRating.csv")
+path_cov_xlsx <- file.path(path_pipeline, "Covariates", "SVO_PID5BF_PostRating.xlsx")
+path_cov <- if(file.exists(path_cov_csv)) path_cov_csv else path_cov_xlsx
+
+if(!file.exists(path_stim)) {
+  stop(sprintf("[ERROR] Stimulus file missing at: %s\nVerify upstream pipeline resolution.", path_stim))
+}
+
+cat("[SYSTEM] Initiating Covariate Matrix load sequence.\n")
+df_covs <- load_covariates(path_cov)
+
+# ------------------------------------------------------------------------------
+# Routine 1: Stimulus-Locked Event Integration
+# ------------------------------------------------------------------------------
+if(file.exists(path_stim)) {
+  cat("\n[SYSTEM] === Initiating Stimulus-Locked Component Analysis ===\n")
+  
+  for (comp_name in names(analyze_stim_components)) {
+    use_cov <- as.logical(analyze_stim_components[comp_name])
+    baseline_col_name <- paste0("Baseline_", comp_name)
+    
+    df_comp <- load_and_prep(path_stim, df_covs, comp_name, baseline_col_name)
+    
+    if (!is.null(df_comp)) {
+      run_regression_analysis(df_comp, comp_name, out_root, experiment_version, use_svo = use_cov)
+    }
+  }
+}
+
+# ------------------------------------------------------------------------------
+# Routine 2: Response-Locked Event Integration
+# ------------------------------------------------------------------------------
+if(file.exists(path_resp) && file.exists(path_stim)) {
+  cat("\n[SYSTEM] === Initiating Response-Locked Component Analysis ===\n")
+  
+  # Base baseline integration requires temporal mapping from stimulus files
+  df_stim_base <- read_csv(path_stim, show_col_types = FALSE) %>%
+    mutate(participant_id = ifelse(grepl("^\\d+$", as.character(participant_id)), 
+                                   sprintf("Vp%04d", as.numeric(participant_id)), as.character(participant_id)))
+  
+  for (comp_name in names(analyze_resp_components)) {
+    use_cov <- as.logical(analyze_resp_components[comp_name])
+    df_comp_raw <- load_and_prep(path_resp, df_covs, comp_name, NULL)
+    
+    if (!is.null(df_comp_raw)) {
+      check_uniqueness(df_comp_raw, comp_name)
+      check_uniqueness(df_stim_base, "Base_Mapping")
+      
+      df_comp_merged <- left_join(df_comp_raw, df_stim_base %>% select(participant_id, index, Baseline_LPP_offer), by = c("participant_id", "index"))
+      if(sum(is.na(df_comp_merged$Baseline_LPP_offer)) > 0) warning(sprintf("[WARNING] %s: Baseline target misses observed during temporal join.", comp_name))
+      
+      df_comp_merged$Baseline_Raw <- df_comp_merged$Baseline_LPP_offer
+      df_comp_merged$Baseline_c <- as.numeric(scale(df_comp_merged$Baseline_Raw, center=TRUE, scale=TRUE))
+      
+      run_regression_analysis(df_comp_merged %>% filter(!is.na(Baseline_c)), comp_name, out_root, experiment_version, use_svo = use_cov)
+    }
+  }
+}
+
+cat(sprintf("\n========================================================\n[SYSTEM] Pipeline completed successfully for Cohort %s.\n========================================================\n", experiment_version))
+
+```
+
