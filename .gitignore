@@ -210,3 +210,16 @@ log/
 !environment.yml
 !.gitignore
 .positai
+############################################
+# Keep scripts under results folders
+############################################
+!results/**/
+!results/**/*.py
+!results/**/*.R
+!results/**/*.Rmd
+!results/**/*.m
+!results/**/*.sh
+!results/**/*.md
+!results/**/*.json
+!results/**/*.yaml
+!results/**/*.yml
