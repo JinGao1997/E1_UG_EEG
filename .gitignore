@@ -1,19 +1,24 @@
 ############################################
 # 0) OS / Editor
 ############################################
+
 .DS_Store
 Thumbs.db
 desktop.ini
+
 .vscode/
 .idea/
+
 *.swp
 *.swo
 *.bak
 *~
 
+
 ############################################
 # 1) Environments / caches
 ############################################
+
 # Python
 __pycache__/
 *.py[cod]
@@ -22,11 +27,13 @@ __pycache__/
 .ruff_cache/
 .cache/
 
-# Virtual envs
+# Virtual environments
 .venv/
 venv/
 env/
 ENV/
+
+# Python build/package folders
 pip-wheel-metadata/
 *.egg-info/
 dist/
@@ -43,12 +50,14 @@ build/
 renv/library/
 renv/staging/
 
-# Node (if any)
+# Node
 node_modules/
 
+
 ############################################
-# 2) Global "outputs / artifacts" to ignore
+# 2) Global output / artifact files
 ############################################
+
 # Figures / images
 *.png
 *.jpg
@@ -68,7 +77,7 @@ node_modules/
 *.pptx
 *.html
 
-# Spreadsheets & Data
+# Spreadsheets / tabular outputs
 *.csv
 *.tsv
 *.xlsx
@@ -82,9 +91,11 @@ node_modules/
 *.tar
 *.gz
 
+
 ############################################
 # 3) Data / raw / processed directories
 ############################################
+
 data/
 Data/
 raw/
@@ -92,9 +103,11 @@ Raw/
 processed/
 Processed/
 
+
 ############################################
-# 4) EEG / neuro specific
+# 4) EEG / neuro-specific files
 ############################################
+
 # EEGLAB / BrainVision / common EEG formats
 *.set
 *.fdt
@@ -112,60 +125,56 @@ Processed/
 # MATLAB data
 *.mat
 
+
 ############################################
 # 5) Local-only folders
 ############################################
+
 Problematic_data/
 _LOCAL_ONLY_BACKUP/
 
-############################################
-# 6) results/: ignore outputs but keep scripts
-############################################
-# 忽略 results 下的所有文件
-results/*
-results/**/*
 
-# 重新放行 results 下的所有“文件夹目录”（让 Git 可以遍历进去）
+############################################
+# 6) results/: ignore outputs by default
+############################################
+
+# Ignore everything under results
+results/**
+
+# Allow Git to enter folders under results
+!results/
 !results/**/
 
-# 重新放行脚本与配置文件
-!results/**/*.py
-!results/**/*.R
-!results/**/*.r
-!results/**/*.Rmd
-!results/**/*.qmd
-!results/**/*.m
-!results/**/*.jl
-!results/**/*.sh
-!results/**/*.bash
-!results/**/*.zsh
-!results/**/*.ps1
-!results/**/*.js
-!results/**/*.ts
-!results/**/*.json
-!results/**/*.yaml
-!results/**/*.yml
-!results/**/*.toml
-!results/**/*.ini
-!results/**/*.cfg
-!results/**/*.txt
-!results/**/*.md
-!results/**/*.ipynb
-
-# 再次明确屏蔽 results 内的产出文件（防止上面某条规则误伤）
+# Explicitly keep common result/output files ignored under results
 results/**/*.png
 results/**/*.jpg
 results/**/*.jpeg
+results/**/*.gif
+results/**/*.bmp
 results/**/*.tif
 results/**/*.tiff
-results/**/*.pdf
 results/**/*.svg
 results/**/*.eps
+
+results/**/*.pdf
+results/**/*.doc
+results/**/*.docx
+results/**/*.ppt
+results/**/*.pptx
+results/**/*.html
+
+results/**/*.csv
+results/**/*.tsv
 results/**/*.xlsx
 results/**/*.xls
 results/**/*.xlsm
-results/**/*.csv
-results/**/*.tsv
+
+results/**/*.zip
+results/**/*.7z
+results/**/*.rar
+results/**/*.tar
+results/**/*.gz
+
 results/**/*.set
 results/**/*.fdt
 results/**/*.edf
@@ -180,13 +189,15 @@ results/**/*.ds
 results/**/*.xdf
 results/**/*.mat
 
-# 明确屏蔽特定出版物文件夹
-results/Behavioral/Pub_Output_Final/
 
 ############################################
-# 7) Typical output folders elsewhere
+# 7) Typical output folders outside results
 ############################################
-Results/
+
+# Important:
+# Do NOT write "Results/" here, because on Windows it may also match "results/".
+# If you have a separate root-level output folder, use a more specific name instead.
+
 Output/
 Export/
 Figures/
@@ -195,31 +206,57 @@ Reports/
 logs/
 log/
 
+
 ############################################
-# 8) Keep small templates/examples
+# 8) Keep small templates / examples
 ############################################
+
 !data_example/
 !data_example/**
+
 
 ############################################
 # 9) Keep key project files
 ############################################
+
 !README.md
 !LICENSE
 !requirements.txt
 !environment.yml
 !.gitignore
-.positai
+
+
 ############################################
-# Keep scripts under results folders
+# 10) Keep analysis scripts under results
 ############################################
+
+# This section must stay at the END of the file.
+# It overrides previous ignore rules for scripts inside results.
+
+!results/
 !results/**/
+
+# Python / R / MATLAB / shell scripts
 !results/**/*.py
 !results/**/*.R
+!results/**/*.r
 !results/**/*.Rmd
+!results/**/*.qmd
 !results/**/*.m
+!results/**/*.jl
 !results/**/*.sh
-!results/**/*.md
+!results/**/*.bash
+!results/**/*.zsh
+!results/**/*.ps1
+
+# Optional script/config/readme files
+!results/**/*.ipynb
+!results/**/*.js
+!results/**/*.ts
 !results/**/*.json
 !results/**/*.yaml
 !results/**/*.yml
+!results/**/*.toml
+!results/**/*.ini
+!results/**/*.cfg
+!results/**/*.md
