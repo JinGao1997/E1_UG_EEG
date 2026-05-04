@@ -1,0 +1,593 @@
+---
+title: "Cluster-Based Permutation Test Visualization"
+subtitle: "Publication-grade rendering of hu-neuro-pipeline cluster outputs"
+author: "Project Maintainer"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    code_folding: show
+    theme: flatly
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+set.seed(20260504)
+```
+
+# 1. Configuration
+
+```{r config}
+# ==============================================================================
+# 1.1 USER-EDITABLE PATHS AND IDENTIFIERS
+# ==============================================================================
+# USER: edit these for your local environment.
+PROJECT_ROOT    <- "C:/Code/UG_ERP_Project"
+EXPERIMENT_ID   <- "E2"               # "E1" or "E2"
+ANALYSIS_METHOD <- "Method_Standard"  # cluster perm uses Standard baseline pipeline
+
+# Path to upstream trials.csv from the Regression pipeline (for caption N).
+# Note: although cluster perm uses Standard pipeline, N is identical across
+# pipelines (same subjects, same trial-inclusion rules), so we read from the
+# Regression trials.csv where it is canonical.
+TRIALS_CSV <- file.path(PROJECT_ROOT,
+                        "data",
+                        paste0("02_Pipeline_Output_", EXPERIMENT_ID),
+                        "Method_Regression",
+                        "Stimulus_Locked",
+                        "trials.csv")
+
+# Permutation count from upstream pipeline (hu-neuro-pipeline default = 1024).
+N_PERM <- 1024
+
+# Time-bin width (ms) for Panel C dynamic difference topographies.
+# Adaptive to cluster duration: longer cluster -> wider bins to keep panel count
+# visually manageable. Resolved per-cluster in plot_cluster_figure().
+TARGET_PANEL_C_BINS <- 5
+
+# ==============================================================================
+# 1.2 DEPENDENCIES
+# ==============================================================================
+if (!require("pacman")) install.packages("pacman")
+pacman::p_load(tidyverse, eegUtils, patchwork, cowplot, scales, fs, glue, stringr)
+
+# ==============================================================================
+# 1.3 INPUT/OUTPUT PATHS
+# ==============================================================================
+INPUT_DIR <- file.path(PROJECT_ROOT, "data",
+                       paste0("02_Pipeline_Output_", EXPERIMENT_ID),
+                       ANALYSIS_METHOD, "Stimulus_Locked")
+
+OUTPUT_DIR <- file.path(PROJECT_ROOT, "results",
+                        "Permutation_Visualization",
+                        EXPERIMENT_ID, ANALYSIS_METHOD)
+
+cat(sprintf("Pipeline Initialized.\nExperiment: %s | Method: %s\nInput: %s\nOutput: %s\n",
+            EXPERIMENT_ID, ANALYSIS_METHOD, INPUT_DIR, OUTPUT_DIR))
+
+if (!dir.exists(INPUT_DIR)) {
+  stop(sprintf("Input directory does not exist: %s", INPUT_DIR))
+}
+dir_create(OUTPUT_DIR, recurse = TRUE)
+```
+
+# 2. Caption Metadata Loader
+
+```{r caption-metadata}
+# ==============================================================================
+# Loads upstream trials.csv to derive N (subject count) for caption metadata.
+# Falls back to placeholder if missing so the script still runs.
+# ==============================================================================
+load_caption_metadata <- function(trials_csv_path) {
+  default_meta <- list(n_subjects = NA_integer_,
+                       n_trials_total = NA_integer_,
+                       source_status = "MISSING")
+
+  if (!file.exists(trials_csv_path)) {
+    warning(sprintf("trials.csv not found at: %s\nCaption N fields will be left as 'NA'.",
+                    trials_csv_path))
+    return(default_meta)
+  }
+
+  df_trials <- tryCatch(read_csv(trials_csv_path, show_col_types = FALSE),
+                        error = function(e) NULL)
+  if (is.null(df_trials)) return(default_meta)
+
+  id_candidates <- c("participant_id", "subject", "subj", "id", "subject_id")
+  id_col <- intersect(id_candidates, names(df_trials))[1]
+  if (is.na(id_col)) return(default_meta)
+
+  meta <- list(
+    n_subjects     = dplyr::n_distinct(df_trials[[id_col]]),
+    n_trials_total = nrow(df_trials),
+    source_status  = "OK"
+  )
+  cat(sprintf("[Caption metadata] N = %d subjects, %d total trials retained.\n",
+              meta$n_subjects, meta$n_trials_total))
+  meta
+}
+
+CAPTION_META <- load_caption_metadata(TRIALS_CSV)
+```
+
+# 3. Helper Functions
+
+```{r helpers}
+# ==============================================================================
+# Channel whitelist: anything not in channel_locations.csv (component scalars,
+# baseline scalars, A2 reference, query strings, label) is excluded from
+# topographic rendering.
+# ==============================================================================
+load_channel_whitelist <- function(input_dir) {
+  chan_file <- file.path(input_dir, "channel_locations.csv")
+  if (!file.exists(chan_file)) {
+    stop(sprintf("channel_locations.csv missing at: %s", chan_file))
+  }
+  read_csv(chan_file, show_col_types = FALSE) %>%
+    rename(electrode = channel)
+}
+
+# ==============================================================================
+# Symmetric color limits: data-driven 99th-percentile cap with stepped rounding.
+# Used for both t-value maps and uV difference maps with appropriate step tables.
+# ==============================================================================
+compute_limits <- function(values, kind = c("voltage", "tvalue")) {
+  kind <- match.arg(kind)
+  if (all(is.na(values))) return(c(-0.1, 0.1))
+
+  cap <- quantile(abs(values), probs = 0.99, na.rm = TRUE)
+  if (is.infinite(cap) || cap == 0) return(c(-0.1, 0.1))
+
+  step <- if (kind == "voltage") {
+    if (cap <= 0.5) 0.05 else if (cap <= 1.0) 0.1 else if (cap <= 2.5) 0.25 else 0.5
+  } else {
+    if (cap <= 1.0) 0.25 else if (cap <= 3.0) 0.5 else if (cap <= 6.0) 1.0 else 2.0
+  }
+  cap <- ceiling(cap / step) * step
+  if (cap == 0) cap <- step
+  c(-cap, cap)
+}
+
+# ==============================================================================
+# Resolve the contrast string into two condition labels.
+# Defensive: validates both labels exist in df_grand$label.
+# ==============================================================================
+parse_contrast <- function(contrast_name, df_grand) {
+  conds <- str_split(contrast_name, "\\s*-\\s*", simplify = TRUE)[1, ]
+  if (length(conds) != 2) {
+    stop(sprintf("Cannot parse contrast '%s' into two condition names.", contrast_name))
+  }
+  cond1 <- conds[1]
+  cond2 <- conds[2]
+  available <- unique(df_grand$label)
+  missing <- setdiff(c(cond1, cond2), available)
+  if (length(missing) > 0) {
+    stop(sprintf("Contrast condition(s) absent in grand_ave.csv: %s",
+                 paste(missing, collapse = ", ")))
+  }
+  list(cond1 = cond1, cond2 = cond2)
+}
+
+# ==============================================================================
+# Per-cluster summary: spatiotemporal extent and statistics.
+# Used both for layout decisions and for caption text.
+# ==============================================================================
+summarise_cluster <- function(df_stats, contrast_name, cluster_id) {
+  sub <- df_stats %>%
+    filter(contrast == contrast_name, cluster == cluster_id) %>%
+    mutate(time_ms = round(time * 1000))
+  if (nrow(sub) == 0) return(NULL)
+
+  list(
+    cluster_id = cluster_id,
+    p_val      = unique(sub$p_val)[1],
+    t_min_ms   = min(sub$time_ms),
+    t_max_ms   = max(sub$time_ms),
+    n_chans    = dplyr::n_distinct(sub$channel),
+    chans      = sort(unique(sub$channel)),
+    mean_t     = mean(sub$t_obs, na.rm = TRUE),
+    sign       = if (str_detect(cluster_id, "^pos")) "positive" else "negative"
+  )
+}
+```
+
+# 4. Core Visualization Engine
+
+```{r viz-engine}
+# ==============================================================================
+# Renders one figure per contrast, combining all significant clusters within
+# that contrast (typically pos_1 + neg_1 forming a dipolar topography).
+#
+# Three panels:
+#   A. Difference wave averaged across electrodes belonging to each cluster,
+#      with cluster temporal extent shaded. Multiple cluster traces overlaid
+#      in distinct colors. No CI ribbon (grand_ave.csv has no participant_id).
+#   B. uV difference topography averaged across the union of all cluster time
+#      windows. Cluster electrodes highlighted with cluster-specific markers.
+#   C. Temporal evolution of the uV difference topography across the union
+#      time window, in adaptive bins. Cluster electrodes highlighted per-bin.
+#
+# Caption embeds: N, n_perm, all cluster p-values and extents, and the
+# cluster-level inference disclaimer (Sassenhagen & Draschkow, 2019).
+# ==============================================================================
+
+plot_cluster_figure <- function(df_grand, df_stats, contrast_name,
+                                cluster_ids, chanlocs, out_dir) {
+
+  # --- Resolve conditions and per-cluster summaries -------------------------
+  conds <- parse_contrast(contrast_name, df_grand)
+  cond1 <- conds$cond1
+  cond2 <- conds$cond2
+
+  cluster_summaries <- purrr::map(cluster_ids,
+                                  ~summarise_cluster(df_stats, contrast_name, .x))
+  cluster_summaries <- compact(cluster_summaries)
+  if (length(cluster_summaries) == 0) {
+    warning(sprintf("No valid clusters for contrast %s. Skipping.", contrast_name))
+    return(NULL)
+  }
+
+  # Union time window across all clusters in this contrast.
+  union_tmin <- min(map_dbl(cluster_summaries, "t_min_ms"))
+  union_tmax <- max(map_dbl(cluster_summaries, "t_max_ms"))
+
+  # --- Restrict df_grand to cond1/cond2 and EEG channels only ---------------
+  eeg_whitelist <- chanlocs$electrode
+  eeg_cols_present <- intersect(eeg_whitelist, names(df_grand))
+
+  df_erp <- df_grand %>%
+    filter(label %in% c(cond1, cond2)) %>%
+    select(time, label, all_of(eeg_cols_present)) %>%
+    mutate(time_ms = round(time * 1000))
+
+  # --- Per-cluster, per-time difference wave averaged across cluster chans --
+  # Vectorized: for each cluster, mean uV across cluster's electrodes per time
+  # per condition; then cond1 - cond2.
+  df_panel_a <- map_dfr(cluster_summaries, function(clu) {
+    chans_in <- intersect(clu$chans, eeg_cols_present)
+    if (length(chans_in) == 0) return(NULL)
+
+    df_erp %>%
+      select(time_ms, label, all_of(chans_in)) %>%
+      pivot_longer(all_of(chans_in), names_to = "electrode", values_to = "uV") %>%
+      group_by(time_ms, label) %>%
+      summarise(uV = mean(uV, na.rm = TRUE), .groups = "drop") %>%
+      pivot_wider(names_from = label, values_from = uV) %>%
+      mutate(diff = !!sym(cond1) - !!sym(cond2),
+             cluster_id = clu$cluster_id,
+             cluster_sign = clu$sign)
+  })
+
+  if (nrow(df_panel_a) == 0) {
+    warning(sprintf("No EEG-valid cluster channels for contrast %s.", contrast_name))
+    return(NULL)
+  }
+
+  # --- Color mapping: positive clusters red, negative blue -----------------
+  cluster_colors <- setNames(
+    map_chr(cluster_summaries, function(clu) {
+      if (clu$sign == "positive") "#D62828" else "#0077B6"
+    }),
+    map_chr(cluster_summaries, "cluster_id")
+  )
+
+  # ============================================================================
+  # PANEL A: Difference wave per cluster, with shaded cluster windows
+  # ============================================================================
+  # Build shaded-region data for each cluster.
+  shade_df <- map_dfr(cluster_summaries, function(clu) {
+    tibble(cluster_id = clu$cluster_id,
+           xmin = clu$t_min_ms, xmax = clu$t_max_ms,
+           fill_color = cluster_colors[clu$cluster_id])
+  })
+
+  panel_A <- ggplot() +
+    # Cluster temporal extents as semi-transparent bands.
+    geom_rect(data = shade_df,
+              aes(xmin = xmin, xmax = xmax, ymin = -Inf, ymax = Inf,
+                  fill = cluster_id),
+              alpha = 0.12, inherit.aes = FALSE) +
+    geom_vline(xintercept = 0, linewidth = 0.4, color = "black") +
+    geom_hline(yintercept = 0, linewidth = 0.4, color = "black") +
+    geom_line(data = df_panel_a,
+              aes(x = time_ms, y = diff, color = cluster_id),
+              linewidth = 1.1) +
+    scale_color_manual(values = cluster_colors,
+                       name = "Cluster (electrode set)") +
+    scale_fill_manual(values = cluster_colors, guide = "none") +
+    scale_y_continuous(labels = scales::number_format(accuracy = 0.1)) +
+    labs(title = sprintf("A. Difference wave: %s minus %s", cond1, cond2),
+         subtitle = "Averaged across electrodes belonging to each cluster",
+         x = "Time (ms)",
+         y = "Amplitude difference (\u00b5V)") +
+    theme_classic(base_size = 11) +
+    theme(plot.title    = element_text(face = "bold", size = 13),
+          plot.subtitle = element_text(size = 11, color = "grey30"),
+          axis.title    = element_text(size = 11),
+          axis.text     = element_text(size = 10),
+          legend.position = "bottom",
+          legend.box = "horizontal",
+          legend.title = element_text(size = 10),
+          legend.text  = element_text(size = 9))
+
+  # ============================================================================
+  # PANEL B: uV difference topography averaged across union cluster window
+  # ============================================================================
+  df_diff_topo_B <- df_erp %>%
+    filter(time_ms >= union_tmin & time_ms <= union_tmax) %>%
+    pivot_longer(all_of(eeg_cols_present),
+                 names_to = "electrode", values_to = "uV") %>%
+    group_by(label, electrode) %>%
+    summarise(uV = mean(uV, na.rm = TRUE), .groups = "drop") %>%
+    pivot_wider(names_from = label, values_from = uV) %>%
+    mutate(amplitude = !!sym(cond1) - !!sym(cond2))
+
+  diff_limits_B <- compute_limits(df_diff_topo_B$amplitude, kind = "voltage")
+
+  # Highlight all electrodes ever participating in any cluster of this contrast.
+  all_cluster_chans <- unique(unlist(map(cluster_summaries, "chans")))
+
+  panel_B <- topoplot(df_diff_topo_B,
+                      chan_locs = chanlocs,
+                      quantity = "amplitude",
+                      interp_limit = "head",
+                      contour = TRUE,
+                      limits = diff_limits_B,
+                      palette = "RdBu",
+                      points = TRUE,
+                      highlights = all_cluster_chans) +
+    labs(title = sprintf("B. Difference topography (%d-%d ms)",
+                         union_tmin, union_tmax),
+         subtitle = "Cluster electrodes highlighted") +
+    theme(plot.title    = element_text(face = "bold", size = 13, hjust = 0.5),
+          plot.subtitle = element_text(size = 11, color = "grey30", hjust = 0.5)) +
+    guides(fill = guide_colorbar(title = "Diff (\u00b5V)",
+                                 barheight = unit(4.5, "cm"),
+                                 barwidth  = unit(0.5, "cm")))
+
+  # ============================================================================
+  # PANEL C: Temporal evolution of uV difference topography
+  # ============================================================================
+  union_duration <- union_tmax - union_tmin
+  adaptive_step <- max(50, ceiling(union_duration / TARGET_PANEL_C_BINS / 10) * 10)
+  bins <- seq(union_tmin, union_tmax, by = adaptive_step)
+  if (max(bins) < union_tmax) bins <- c(bins, union_tmax)
+
+  # Pre-compute the long-format difference per electrode per time-ms.
+  df_diff_long <- df_erp %>%
+    pivot_longer(all_of(eeg_cols_present),
+                 names_to = "electrode", values_to = "uV") %>%
+    pivot_wider(names_from = label, values_from = uV) %>%
+    mutate(amplitude = !!sym(cond1) - !!sym(cond2)) %>%
+    select(time_ms, electrode, amplitude)
+
+  # Use a single shared scale across all time bins (computed across the union
+  # window so all panels in row C are directly comparable).
+  diff_scan_C <- df_diff_long %>%
+    filter(time_ms >= union_tmin & time_ms <= union_tmax)
+  diff_limits_C <- compute_limits(diff_scan_C$amplitude, kind = "voltage")
+
+  # Per-bin cluster-electrode set (across all clusters in this contrast).
+  bin_chan_lookup <- function(b_min, b_max) {
+    df_stats %>%
+      filter(contrast == contrast_name,
+             cluster %in% cluster_ids) %>%
+      mutate(time_ms = round(time * 1000)) %>%
+      filter(time_ms >= b_min & time_ms < b_max) %>%
+      pull(channel) %>% unique()
+  }
+
+  dyn_plots <- purrr::map(seq_len(length(bins) - 1), function(i) {
+    b_min <- bins[i]
+    b_max <- bins[i + 1]
+
+    df_slice <- df_diff_long %>%
+      filter(time_ms >= b_min & time_ms < b_max) %>%
+      group_by(electrode) %>%
+      summarise(amplitude = mean(amplitude, na.rm = TRUE), .groups = "drop")
+
+    bin_chans <- bin_chan_lookup(b_min, b_max)
+    hl_chans  <- if (length(bin_chans) > 0) bin_chans else NULL
+
+    topoplot(df_slice, chan_locs = chanlocs,
+             quantity = "amplitude", interp_limit = "head",
+             contour = FALSE, limits = diff_limits_C, palette = "RdBu",
+             points = TRUE, highlights = hl_chans) +
+      labs(title = sprintf("%d-%d ms", round(b_min), round(b_max))) +
+      theme(plot.title = element_text(size = 11, hjust = 0.5, face = "plain"),
+            legend.position = "none")
+  })
+
+  # Shared colorbar for Panel C row.
+  dummy_df <- df_diff_long %>%
+    filter(time_ms >= union_tmin & time_ms <= union_tmax) %>%
+    slice(seq_len(min(50, n())))
+
+  dummy_p <- topoplot(dummy_df, chan_locs = chanlocs,
+                      quantity = "amplitude",
+                      limits = diff_limits_C, palette = "RdBu") +
+    guides(fill = guide_colorbar(title = "Diff (\u00b5V)",
+                                 barheight = unit(4.0, "cm"),
+                                 barwidth  = unit(0.5, "cm")))
+  dyn_legend <- cowplot::get_legend(dummy_p)
+
+  panel_C_row <- patchwork::wrap_plots(dyn_plots, nrow = 1) +
+    patchwork::plot_annotation(
+      title = "C. Difference topography evolution",
+      theme = theme(plot.title = element_text(face = "bold", size = 13))
+    )
+
+  # ============================================================================
+  # CAPTION CONSTRUCTION
+  # ============================================================================
+  n_str <- if (is.na(CAPTION_META$n_subjects)) "[N pending]"
+           else sprintf("N = %d", CAPTION_META$n_subjects)
+
+  cluster_lines <- map_chr(cluster_summaries, function(clu) {
+    sprintf("  %s cluster (%s): %d-%d ms across %d electrodes; cluster-level p = %.4f",
+            clu$sign, clu$cluster_id, clu$t_min_ms, clu$t_max_ms,
+            clu$n_chans, clu$p_val)
+  })
+
+  caption_text <- paste0(
+    sprintf("Cluster-based permutation test, contrast: %s (E%s, %s, %d permutations).\n",
+            contrast_name, str_extract(EXPERIMENT_ID, "\\d"), n_str, N_PERM),
+    paste(cluster_lines, collapse = "\n"), "\n",
+    "Cluster-forming threshold p < 0.05, two-tailed. Difference topography in panels B and C ",
+    "displays Cond1 - Cond2 in microvolts; highlighted electrodes participated in the ",
+    "respective cluster. Cluster-based permutation provides cluster-level inference: ",
+    "the test indicates that the observed cluster mass is unlikely under the null. ",
+    "Precise temporal and spatial boundaries should be interpreted as approximate ",
+    "(Sassenhagen & Draschkow, 2019, Psychophysiology).\n",
+    "Note: cluster permutation here uses traditional pre-stimulus baseline subtraction ",
+    "(Standard pipeline); main analyses use mean-centered baseline as covariate (Alday, 2019)."
+  )
+
+  # ============================================================================
+  # MASTER ASSEMBLY
+  # ============================================================================
+  top_row    <- panel_A | panel_B
+  bottom_row <- panel_C_row | dyn_legend
+
+  cluster_p_str <- map_chr(cluster_summaries,
+                           ~sprintf("%s p=%.4f", .x$cluster_id, .x$p_val)) %>%
+    paste(collapse = " | ")
+
+  final_plot <- top_row / bottom_row +
+    patchwork::plot_layout(heights = c(1, 0.6)) +
+    patchwork::plot_annotation(
+      title    = sprintf("Cluster-based Permutation: %s", contrast_name),
+      subtitle = cluster_p_str,
+      caption  = str_wrap(caption_text, width = 130),
+      theme = theme(
+        plot.title    = element_text(size = 17, face = "bold"),
+        plot.subtitle = element_text(size = 12, color = "grey30"),
+        plot.caption  = element_text(size = 8.5, hjust = 0, color = "grey25",
+                                     margin = margin(t = 14))
+      )
+    )
+
+  # ============================================================================
+  # EXPORT: PNG + PDF + values.csv
+  # ============================================================================
+  safe_contrast <- contrast_name %>%
+    str_replace_all("\\s*-\\s*", "_minus_") %>%
+    str_replace_all("\\s+", "_")
+
+  fig_width  <- max(12, 4 + length(dyn_plots) * 1.8)
+  fig_height <- 11
+
+  base_name <- file.path(out_dir, paste0("Cluster_", safe_contrast))
+  ggsave(paste0(base_name, ".png"), final_plot,
+         width = fig_width, height = fig_height, dpi = 300, bg = "white",
+         limitsize = FALSE)
+  ggsave(paste0(base_name, ".pdf"), final_plot, device = cairo_pdf,
+         width = fig_width, height = fig_height, limitsize = FALSE)
+
+  # Values CSVs for replotting.
+  write_csv(df_panel_a,       paste0(base_name, "_panelA_values.csv"))
+  write_csv(df_diff_topo_B,   paste0(base_name, "_panelB_values.csv"))
+  write_csv(df_diff_long %>%
+              filter(time_ms >= union_tmin & time_ms <= union_tmax),
+            paste0(base_name, "_panelC_values.csv"))
+
+  cat(sprintf("[Export] Contrast %s: figure + values written to %s\n",
+              contrast_name, out_dir))
+  invisible(final_plot)
+}
+```
+
+# 5. Execution
+
+```{r execution}
+# ==============================================================================
+# 5.1 LOCATE STATISTICAL FILES
+# ==============================================================================
+possible_stats_files <- c("clusters.csv", "perm.csv")
+stats_file <- NULL
+for (fname in possible_stats_files) {
+  candidate <- file.path(INPUT_DIR, fname)
+  if (file.exists(candidate)) { stats_file <- candidate; break }
+}
+grand_file <- file.path(INPUT_DIR, "grand_ave.csv")
+
+if (is.null(stats_file)) {
+  cat("[Diagnostic] Cannot find statistical output ('clusters.csv' or 'perm.csv').\n")
+  cat("Files in INPUT_DIR:\n"); print(list.files(INPUT_DIR))
+  stop("Halted: missing cluster statistics file.")
+}
+if (!file.exists(grand_file)) {
+  cat("[Diagnostic] Cannot find ERP waveform data ('grand_ave.csv').\n")
+  cat("Files in INPUT_DIR:\n"); print(list.files(INPUT_DIR))
+  stop("Halted: missing grand_ave.csv.")
+}
+
+cat(sprintf("[Status] Files verified.\n  Stats: %s\n  Grand: %s\n",
+            basename(stats_file), basename(grand_file)))
+
+# ==============================================================================
+# 5.2 LOAD DATA
+# ==============================================================================
+df_stats <- read_csv(stats_file, show_col_types = FALSE)
+df_grand <- read_csv(grand_file, show_col_types = FALSE)
+chanlocs <- load_channel_whitelist(INPUT_DIR)
+
+# Sanity probe: cluster summary table before any plotting.
+cluster_probe <- df_stats %>%
+  filter(p_val < 0.05) %>%
+  mutate(time_ms = round(time * 1000)) %>%
+  group_by(contrast, cluster) %>%
+  summarise(t_min_ms = min(time_ms),
+            t_max_ms = max(time_ms),
+            n_chans  = dplyr::n_distinct(channel),
+            mass_abs_t = sum(abs(t_obs)),
+            p_val    = first(p_val),
+            .groups  = "drop")
+
+cat("\n=== Significant cluster summary ===\n")
+print(cluster_probe, n = Inf)
+
+if (nrow(cluster_probe) == 0) {
+  cat("\n[Status] No significant clusters at alpha = 0.05. Nothing to render.\n")
+} else {
+
+  # ============================================================================
+  # 5.3 RENDER ONE FIGURE PER CONTRAST (POS + NEG CLUSTERS COMBINED)
+  # ============================================================================
+  unique_contrasts <- df_sig <- cluster_probe %>%
+    distinct(contrast) %>% pull(contrast)
+
+  cat(sprintf("\n[Status] Rendering %d contrast(s)...\n", length(unique_contrasts)))
+
+  for (contrast_name in unique_contrasts) {
+    cluster_ids_in_contrast <- cluster_probe %>%
+      filter(contrast == contrast_name) %>%
+      pull(cluster)
+
+    cat(sprintf("\n---> Contrast: %s | clusters: %s\n",
+                contrast_name,
+                paste(cluster_ids_in_contrast, collapse = ", ")))
+
+    tryCatch({
+      plot_cluster_figure(df_grand     = df_grand,
+                          df_stats     = df_stats,
+                          contrast_name = contrast_name,
+                          cluster_ids  = cluster_ids_in_contrast,
+                          chanlocs     = chanlocs,
+                          out_dir      = OUTPUT_DIR)
+    }, error = function(e) {
+      cat(sprintf("     [WARN] Failed to render %s: %s\n", contrast_name, e$message))
+    })
+  }
+
+  cat("\n[Done] All contrasts processed.\n")
+}
+```
+
+# 6. Session Information
+
+```{r session-info}
+sessionInfo()
+```

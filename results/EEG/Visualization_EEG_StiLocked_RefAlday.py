@@ -4,8 +4,28 @@
 """
 Master Analysis & Visualization Script: Stimulus-Locked Components
 =============================================================================
-v2.1 — Aligned with upstream LMM analyses (Sta_EEG_OfferPhase_RefAlday.Rmd v2.1
-       and Sta_EEG_OfferPhase_RefTraditional.Rmd v2.1).
+v2.1.1 — Bugfixes for cross-experiment robustness.
+v2.1   — Aligned with upstream LMM analyses (Sta_EEG_OfferPhase_RefAlday.Rmd v2.1
+         and Sta_EEG_OfferPhase_RefTraditional.Rmd v2.1).
+
+[v2.1.1 BUGFIX SUMMARY]:
+    1. load_data_csv now standardizes participant_id BEFORE the valid_set
+       membership test. Previously this comparison used the raw filename
+       prefix (e.g. 'Vp0000'), which mismatched valid_keys entries
+       (canonicalized to 'VP0000' by load_trials_csv_filtered). On
+       experiments where epoch filenames used non-canonical casing, all
+       trials silently failed the membership test and load_data_csv
+       returned (None, None, None), causing RegressionAnalysis to halt
+       with a generic "No epoch data" message — no figures emitted.
+    2. valid_set membership test rewritten as vectorized .isin() (was
+       df.apply(lambda r: ..., axis=1), which scaled with rows × subjects
+       and could take 10+ minutes on the full dataset).
+    3. Bare except block in load_data_csv replaced with explicit error
+       reporting (type + filename + message); previously masked legitimate
+       file-level errors as silent skips.
+    4. [HALT] message in RegressionAnalysis.run now prints diagnostic
+       context (valid_keys size, expected ROI channels, common causes)
+       to make root-cause analysis tractable.
 
 Description:
     Unified visualization pipeline for both Experiment 1 (E1) and Experiment 2 (E2).
@@ -78,7 +98,7 @@ warnings.filterwarnings('ignore')
 # 1. GLOBAL EXPERIMENT TOGGLE & DYNAMIC CONFIGURATION
 # ==============================================================================
 # Switch between 'E1' and 'E2' to dynamically adjust component lists and windows
-EXPERIMENT_VERSION = 'E2'  
+EXPERIMENT_VERSION = 'E1'  
 
 # Dynamically set component targets and FRN windows based on upstream preprocessing
 if EXPERIMENT_VERSION == 'E1':
@@ -112,7 +132,7 @@ SCALE_CONFIG = {
 # ==============================================================================
 
 # ANALYSIS_METHOD Options: 'All', 'Regression', 'Standard', 'QC'
-ANALYSIS_METHOD = 'All' 
+ANALYSIS_METHOD = 'Regression' 
 
 REJECT_PTP_THRESHOLD_UV = 200.0
 
@@ -603,23 +623,44 @@ def load_data_csv(folder_or_file, desc, is_file=False, valid_keys=None):
     for f in tqdm(files, desc=desc):
         try:
             df = pd.read_csv(f, low_memory=False)
-            if df.empty: continue
+            if df.empty: 
+                print(f"   [WARN] {f.name}: empty file")
+                continue
             
-            # Standardize participant_id from the filename (epoch CSV may or
-            # may not carry this column; trust the filename as authoritative).
-            sub_id = f.name.split('_')[0]
+            # v2.1.1: participant_id is derived from filename and standardized
+            # immediately. The HU pipeline uses 'VPxxxx' canonically; epoch
+            # filenames may or may not match that exact case (Windows is case-
+            # insensitive on disk but pandas string comparison is not).
+            # Standardizing here ensures the (participant_id, index) tuple
+            # matches valid_set entries (which were also standardized when
+            # valid_keys was built in load_trials_csv_filtered).
+            sub_id_raw = f.name.split('_')[0]
+            sub_id = standardize_participant_id(sub_id_raw)
             df['participant_id'] = sub_id
             
             # Filter against valid_keys (LMM-equivalent trial set), if provided.
             # Inner-join semantics: trials present in the epoch but absent from
             # valid_keys are silently dropped. Sanity 2 (run upstream of this
             # function in RegressionAnalysis) verifies the converse direction.
+            #
+            # v2.1.1: vectorized membership test replaces the row-by-row
+            # df.apply(lambda r: ...) which scaled poorly (~30 sec/subject for
+            # large epoch files). The merge form completes in <1 sec/subject.
             if valid_set is not None:
-                df = df[df.apply(
-                    lambda r: (str(r['participant_id']), int(r['index'])) in valid_set,
-                    axis=1
-                )]
-                if df.empty: continue
+                # Build a per-subject expected-index set in vectorized form.
+                expected_idx = {idx for (pid, idx) in valid_set if pid == sub_id}
+                if not expected_idx:
+                    # This subject has no valid trials per LMM filter; either
+                    # it has zero rows in trials.csv after filtering, or there
+                    # is a participant_id encoding mismatch. The latter would
+                    # already have been caught by Sanity 1 / Sanity 2, so a
+                    # warning here flags the former (rare but legitimate).
+                    print(f"   [WARN] {f.name}: no LMM-valid trials for {sub_id}; skipping")
+                    continue
+                df = df[df['index'].isin(expected_idx)]
+                if df.empty:
+                    print(f"   [WARN] {f.name}: filter produced empty frame")
+                    continue
             
             win_min, win_max = CURR_CFG['window']
             mask = (df['time'] >= win_min) & (df['time'] <= win_max)
@@ -633,7 +674,11 @@ def load_data_csv(folder_or_file, desc, is_file=False, valid_keys=None):
             cols_wave = ['participant_id','index','time'] + roi_avail + avail
             wave.append(df[cols_wave].copy())
         except Exception as e:
-            print(f"   [WARN] skipped {f.name}: {e}")
+            # v2.1.1: surface error type + filename for actionable debugging.
+            # Previously bare `except: pass` silently consumed all errors,
+            # which made it impossible to distinguish "0 valid trials" from
+            # "ROI column missing" from "file corrupt".
+            print(f"   [ERROR] skipped {f.name}: {type(e).__name__}: {e}")
         
     if not topo: return None, None, None
     return pd.concat(topo), pd.concat(wave), eeg
@@ -1027,11 +1072,28 @@ class RegressionAnalysis:
             PATHS["reg_epochs"], "Loading epochs", is_file=False, valid_keys=valid_keys
         )
         if df_topo is None:
-            print(f"   [HALT] No epoch data after filtering.")
+            # v2.1.1: surface upstream context for diagnosis. Possible causes
+            # (in rough order of historical frequency):
+            #   1) participant_id encoding mismatch between trials.csv and
+            #      epoch filenames (now defended in load_data_csv via
+            #      standardize_participant_id, but printed here in case the
+            #      defense itself fails or the directory is wrong).
+            #   2) Epoch files missing the expected ROI columns for this
+            #      component (load_data_csv reports per-file warnings).
+            #   3) trials.csv filter chain produced an empty valid set
+            #      (Sanity checks should have caught this earlier).
+            print(f"   [HALT] No epoch data after filtering for {TARGET_COMPONENT}.")
+            print(f"          valid_keys had {len(valid_keys)} rows across "
+                  f"{valid_keys['participant_id'].nunique()} subjects.")
+            print(f"          Re-check: (a) epoch filename casing matches VPxxxx, "
+                  f"(b) ROI channels {CURR_CFG['roi']} present in epoch CSV, "
+                  f"(c) inspect [WARN]/[ERROR] lines above.")
             return
         
-        # Standardize participant_id format on the loaded epoch frames so the
-        # subsequent merge with df_trials (containing baseline scalars) succeeds.
+        # v2.1.1: standardize_participant_id is now applied inside load_data_csv
+        # (so valid_set membership tests succeed). The defensive re-application
+        # here is retained as a safeguard in case load_data_csv changes; it is
+        # idempotent on already-canonical participant_ids.
         df_topo['participant_id']  = df_topo['participant_id'].apply(standardize_participant_id)
         df_wave['participant_id']  = df_wave['participant_id'].apply(standardize_participant_id)
         

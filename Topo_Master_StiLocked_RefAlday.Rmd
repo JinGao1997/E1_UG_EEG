@@ -1,0 +1,961 @@
+---
+title: "Master Topographic Report: Stimulus-Locked Components"
+subtitle: "Visualization of Regression-Corrected & Standard Topographies with Exploratory Slicing. v2.3.3: topoplot scaling = 0.9 (10% reduction in all visual elements for a more refined look). v2.3.2: ROI markers via eegUtils built-in `highlights = roi`. Wider 4.5 in figure layout. v2.3: cross-method color scale led by Regression. v2.2.1: PDF disabled. v2.1: caption text and testFRN window aligned with upstream Sta_EEG_OfferPhase_RefAlday.Rmd v2.1."
+author: "Project Maintainer"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    code_folding: show
+    theme: flatly
+---
+
+``` {r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+```
+
+# 1. Configuration & Setup
+
+```{r}
+# ==============================================================================
+# 1.1 GLOBAL DIRECTORY & PIPELINE CONFIGURATION
+# ==============================================================================
+
+# Experiment identifier. Matches upstream Python pre-processing output nomenclature.
+experiment_id <- "E2" 
+
+# Parent directory containing all component-specific subdirectories.
+root_dir <- "C:/Code/UG_ERP_Project/results/EEG" 
+
+# Temporal step size (in milliseconds) for high-density topographic grids.
+time_course_step_ms <- 40 
+
+# ==============================================================================
+# 1.2 DEPENDENCY MANAGEMENT
+# ==============================================================================
+if(!require("pacman")) install.packages("pacman")
+pacman::p_load(tidyverse, stringr, fs, gridExtra, scales, here, cowplot, purrr)
+
+# eegUtils is strictly required for topographic interpolation and spatial mapping.
+if (!require("eegUtils")) {
+  stop("Critical Package Missing: 'eegUtils'. Install via devtools::install_github('craddm/eegUtils')")
+}
+
+# ==============================================================================
+# 1.2.1 PUBLICATION-GRADE THEME & OUTPUT CONFIGURATION
+# ==============================================================================
+# Centralizes all dimensions, font sizes, and output formats. Values follow
+# common conventions for cognitive psychophysiology journals (Psychophysiology,
+# NeuroImage, Cognition). Adjust here once; all downstream plot calls inherit.
+#
+# Figure dimensions: single-column (89 mm = 3.5 in) for one-up topographies;
+# the height is slightly larger than width to accommodate title + subtitle +
+# caption blocks below the topographic disc.
+#
+# Font sizes follow the "≥ 7 pt at final print size" rule (most journals).
+# We use 8 pt for primary labels, 7 pt for secondary metadata, 9 pt for the
+# main title (which carries the most semantic weight).
+#
+# Vector output (PDF) is essential for publication-grade rendering; raster
+# (PNG, 600 DPI) is retained for quick inspection and for environments where
+# vector embedding fails (e.g., older Word workflows).
+THEME_CONFIG <- list(
+  # Figure dimensions (inches; 1 in = 25.4 mm).
+  # v2.3.1: widened from 3.5 in to 4.5 in to give the topographic disc more
+  # breathing room. Kept in v2.3.2 because the wider layout is a clean win
+  # independent of the ROI-marker debacle.
+  fig_width_single  = 4.5,    # widened for clean disc + colorbar layout
+  fig_height_single = 4.0,    # accommodates title/subtitle/caption stack
+  fig_width_grid    = 7.2,    # 183 mm — two-column figure (for time grids)
+  
+  # Font sizes (pt at final size).
+  font_family      = "sans",
+  size_title       = 9,
+  size_subtitle    = 8,
+  size_caption     = 7,
+  size_legend_ttl  = 8,
+  size_legend_txt  = 7,
+  size_grid_label  = 8,
+  size_grid_panel  = 7,
+  
+  # Output formats.
+  dpi              = 600,
+  emit_pdf         = FALSE,
+  emit_png         = TRUE,
+  
+  # Caption wrapping width for the 4.5 in figure layout.
+  caption_wrap_width = 70,
+  
+  # eegUtils topoplot() scaling factor. Default = 1.0; smaller values
+  # proportionally reduce ALL visual elements (electrode dots, head shape,
+  # highlight markers, contour lines). 0.9 = "10% smaller, more refined look"
+  # without distorting the visual hierarchy.
+  topoplot_scaling = 0.9,
+  
+  # Global plot margin (mm).
+  plot_margin_mm   = c(3, 3, 3, 3)
+)
+
+# ==============================================================================
+# 1.3 COMPONENT & SPATIOTEMPORAL DEFINITIONS
+# ==============================================================================
+# Dynamic FRN window logic mirroring upstream Python architecture constraints.
+frn_window <- if (experiment_id == "E1") c(250, 300) else c(200, 250)
+
+# Component parameter definitions synchronized with preprocessing models.
+# v2.1: testFRN window now branches on experiment_id, mirroring the FRN logic
+# above (frn_window). Previously testFRN was hardcoded to (200, 250) ms which
+# is the E2 component window; for E1 the FRN component sits at (250, 300) ms,
+# so testFRN should expand around that. The other test* windows are stable
+# across experiments because their target components (N170, EPN, N400, LPP)
+# do not differ in window between E1 and E2 in the upstream specification.
+testfrn_window <- if (experiment_id == "E1") c(200, 350) else c(150, 300)
+
+component_specs <- list(
+  N170 = list(win_ms = c(150, 200), roi = c("P7", "P8", "PO7", "PO8"), source_comp = "N170"),
+  EPN = list(win_ms = c(250, 350), roi = c("PO7", "PO8", "P7", "P8", "O1", "O2"), source_comp = "EPN"),
+  FRN = list(win_ms = frn_window, roi = c("F3", "Fz", "F4", "FC1", "FC2", "Cz"), source_comp = "FRN"),
+  N400 = list(win_ms = c(350, 450), roi = c("Cz", "CPz", "Pz"), source_comp = "N400"),
+  LPP_offer = list(win_ms = c(500, 800), roi = c("Pz", "Cz", "C1", "C2", "CP1", "CP2"), source_comp = "LPP_offer"),
+  
+  testN170 = list(win_ms = c(150, 350), roi = c("P7", "P8", "PO7", "PO8"), source_comp = "N170"),
+  testEPN = list(win_ms = c(200, 400), roi = c("PO7", "PO8", "P7", "P8", "O1", "O2"), source_comp = "EPN"),
+  testFRN = list(win_ms = testfrn_window, roi = c("F3", "Fz", "F4", "FC1", "FC2", "Cz"), source_comp = "FRN"),
+  testN400 = list(win_ms = c(300, 500), roi = c("Cz", "CPz", "Pz"), source_comp = "N400"),
+  testLPP = list(win_ms = c(400, 600), roi = c("Pz", "Cz", "C1", "C2", "CP1", "CP2"), source_comp = "LPP_offer")
+)
+
+# Formal nomenclature aligned with upstream Python pipeline ('enj' mapped to Reward).
+# Keys represent internal logic; Values represent publication-ready presentation labels.
+emotion_list <- c("aff", "dis", "dom", "enj")
+emotion_labels <- c(neu = "Neutral", aff = "Affiliative", dis = "Disgust", dom = "Dominance", enj = "Reward")
+offer_types  <- c("fair", "unfair")
+
+cat(sprintf("Pipeline Initialized.\nTarget Experiment: %s\nData Root: %s\n", experiment_id, root_dir))
+
+```
+
+# 2. Methodological Helper Functions
+
+```{r}
+# ==============================================================================
+# LMM Provenance Reader
+# ==============================================================================
+# Reads <session>/Regression_Results/<COMP>_lmm_provenance.txt (written by
+# Visualization_EEG_StiLocked.py v2.1) and returns a compact metadata block
+# suitable for figure captions. Provides full chain-of-custody from upstream
+# LMM (Sta_EEG_OfferPhase_RefAlday.Rmd) through viz reconstruction (Python)
+# down to the topographic figure (this script).
+#
+# Returns NULL on any failure (file absent, parse error). Callers should
+# fall back to a minimal caption when NULL is returned.
+read_lmm_provenance <- function(provenance_file) {
+  if (!file.exists(provenance_file)) return(NULL)
+  txt <- tryCatch(readLines(provenance_file, warn = FALSE),
+                  error = function(e) return(NULL))
+  if (is.null(txt)) return(NULL)
+  
+  extract <- function(pattern) {
+    line <- grep(pattern, txt, value = TRUE)[1]
+    if (is.na(line)) return(NA_character_)
+    sub(paste0("^.*?", pattern, "\\s*"), "", line)
+  }
+  
+  list(
+    lmm_generated   = extract("LMM generated:"),
+    lmm_n           = extract("LMM Observations:"),
+    lmm_singular    = extract("LMM Singular fit:"),
+    has_emo_BL      = extract("has_emo_BL\\s*:"),
+    has_offer_BL    = extract("has_offer_BL\\s*:"),
+    has_emo_offer   = extract("has_emo_offer\\s*:"),
+    formula_lmm     = extract("Final formula \\(LMM\\):") 
+                      %||% extract("Final formula:")
+  )
+}
+# Helper for null-safe extraction.
+`%||%` <- function(a, b) if (is.null(a) || is.na(a) || a == "") b else a
+
+# Construct a publication-grade caption from provenance + spec metadata.
+#
+# v2.3 caption philosophy: minimum information necessary for a reader to
+# identify the figure without consulting the manuscript. Detailed provenance
+# (LMM run timestamp, retained interactions, design matrix) belongs in the
+# accompanying lmm_provenance.txt and Methods section, NOT in the caption.
+#
+# Caption structure (2 lines):
+#   Line 1: "{COMP} ({window}). {method_label}."
+#   Line 2: "ROI: {channels}. N = {n_trials} trials, {n_subjects} subjects."
+#
+# Both lines wrap at THEME_CONFIG$caption_wrap_width to fit the 89 mm figure.
+# The component label is derived from comp_name by the caller (passed in).
+build_publication_caption <- function(spec, method_label, provenance, 
+                                      experiment_id, comp_label,
+                                      n_subjects = 30) {
+  win_str <- sprintf("%d-%d ms", spec$win_ms[1], spec$win_ms[2])
+  roi_str <- paste(spec$roi, collapse = ", ")
+  ww <- THEME_CONFIG$caption_wrap_width
+  
+  # Line 1: component + window + method.
+  line1 <- str_wrap(sprintf("%s (%s). %s.", comp_label, win_str, method_label),
+                    width = ww)
+  
+  # Line 2: ROI + sample.
+  if (!is.null(provenance) && !is.na(provenance$lmm_n)) {
+    line2 <- str_wrap(sprintf("ROI: %s. N = %s trials, %d subjects.",
+                              roi_str, provenance$lmm_n, n_subjects),
+                      width = ww)
+  } else {
+    line2 <- str_wrap(sprintf("ROI: %s.", roi_str), width = ww)
+  }
+  
+  paste(c(line1, line2), collapse = "\n")
+}
+
+# ==============================================================================
+# Dynamic Scale Limit Computation (Adaptive Precision Method)
+# Evaluates pooled magnitude to determine optimal rounding step, maximizing 
+# visual contrast for weak signals while maintaining zero-center symmetry.
+# ==============================================================================
+compute_limits <- function(values, symmetric = TRUE, prob_thresh = 0.99) {
+  if (all(is.na(values))) return(c(-0.1, 0.1))
+  
+  if (symmetric) {
+    max_val <- quantile(abs(values), probs = prob_thresh, na.rm = TRUE)
+    if (is.infinite(max_val) || max_val == 0) return(c(-0.1, 0.1))
+    
+    # Adaptive step resolution based on overall signal magnitude
+    if (max_val <= 0.5) {
+      step <- 0.05
+    } else if (max_val <= 1.0) {
+      step <- 0.1
+    } else if (max_val <= 2.5) {
+      step <- 0.25
+    } else {
+      step <- 0.5
+    }
+    
+    max_val <- ceiling(max_val / step) * step
+    if (max_val == 0) max_val <- step 
+    
+    return(c(-max_val, max_val))
+  } else {
+    return(quantile(values, probs = c(1 - prob_thresh, prob_thresh), na.rm = TRUE))
+  }
+}
+
+# ==============================================================================
+# Unified Publication-Ready Topographic Plotting Engine (v2.1 academic-grade)
+# 
+# Renders a single topographic disc with:
+#   - Title (component + analytical context), subtitle (condition labels),
+#     and multi-line caption (sample/method/window/ROI/LMM provenance).
+#   - White-fill / black-outline ROI markers (visible against any palette).
+#   - Symmetric RdBu palette with publication-standard colorbar.
+#   - Both PNG (raster, 600 DPI for inspection) and PDF (vector, for
+#     publication submission) emitted side-by-side, controlled by THEME_CONFIG.
+#
+# All sizing, font, and output toggles flow from THEME_CONFIG (see § 1.2.1)
+# so cosmetic adjustments require editing only one block at the top.
+# ==============================================================================
+plot_topo_unified <- function(dat_long, chan_locs, roi, 
+                              main_title, sub_title, caption_text, 
+                              filename, limits, show_contour = TRUE) {
+  
+  if(!"electrode" %in% names(dat_long)) {
+    warning("Spatial mapping failure: 'electrode' identifier absent.")
+    return(NULL)
+  }
+
+  safe_title <- str_wrap(main_title, width = 50)
+  safe_sub   <- str_wrap(sub_title, width = 50)
+  
+  # v2.3.2 ROI marker strategy: use eegUtils built-in `highlights = roi`.
+  #
+  # History (so future maintainers don't repeat the mistake):
+  #   v2.2  — Tried to overlay custom geom_point with chanlocs$x/y, assuming
+  #           those coords matched topoplot's internal coord system. Resulting
+  #           markers appeared visually offset; reverted.
+  #   v2.3.1 — Tried `topoplot(points = FALSE, highlights = NULL)` then
+  #            overlaid two geom_point layers (small for all electrodes, big
+  #            for ROI). Failed because the eegUtils argument is `chan_marker`
+  #            (not `points`), so topoplot's default markers were never
+  #            actually disabled — the overlays compounded with the defaults
+  #            into a visually chaotic mix of dot sizes.
+  #   v2.3.2 (current) — Stop trying to customize. Use eegUtils built-in
+  #            highlight (which is white-filled and positionally accurate)
+  #            and accept the visual trade-off. ROI is also explicitly named
+  #            in the caption ("ROI: P7, P8, PO7, PO8") for unambiguity.
+  #
+  # If a future iteration truly needs size-based ROI emphasis, the path is to
+  # rewrite the function using geom_topo()-based assembly (full ggplot2 layer
+  # control), not topoplot()'s wrapper. That requires more debugging budget
+  # than has been available here.
+  p <- topoplot(
+    dat_long, chan_locs = chan_locs, interp_limit = "head",
+    contour = show_contour, points = TRUE, highlights = roi,
+    palette = "RdBu", limits = limits,
+    scaling = THEME_CONFIG$topoplot_scaling
+  )
+  
+  # Title / subtitle / caption / theme — all sizing from THEME_CONFIG.
+  p <- p +
+    labs(title = safe_title, subtitle = safe_sub, caption = caption_text) +
+    theme(
+      text          = element_text(family = THEME_CONFIG$font_family),
+      plot.title    = element_text(size = THEME_CONFIG$size_title,
+                                    face = "bold", hjust = 0.5,
+                                    margin = margin(t = 4, b = 2)),
+      plot.subtitle = element_text(size = THEME_CONFIG$size_subtitle,
+                                    hjust = 0.5, color = "grey20",
+                                    margin = margin(b = 6)),
+      plot.caption  = element_text(size = THEME_CONFIG$size_caption,
+                                    hjust = 0, color = "grey30",
+                                    lineheight = 1.1,
+                                    margin = margin(t = 6)),
+      legend.position  = "right",
+      legend.title     = element_text(size = THEME_CONFIG$size_legend_ttl,
+                                       face = "bold"),
+      legend.text      = element_text(size = THEME_CONFIG$size_legend_txt),
+      plot.margin      = margin(THEME_CONFIG$plot_margin_mm[1],
+                                THEME_CONFIG$plot_margin_mm[2],
+                                THEME_CONFIG$plot_margin_mm[3],
+                                THEME_CONFIG$plot_margin_mm[4],
+                                unit = "mm"),
+      panel.background = element_rect(fill = "white", color = NA),
+      plot.background  = element_rect(fill = "white", color = NA)
+    ) +
+    guides(fill = guide_colorbar(
+      title          = "Amplitude\n(\u00b5V)",
+      barheight      = unit(3.0, "cm"),
+      barwidth       = unit(0.4, "cm"),
+      ticks.linewidth = 0.6,
+      title.position = "top"
+    ))
+  
+  base <- tools::file_path_sans_ext(filename)
+  
+  if (THEME_CONFIG$emit_pdf) {
+    ggsave(paste0(base, ".pdf"), plot = p, device = cairo_pdf,
+           width  = THEME_CONFIG$fig_width_single,
+           height = THEME_CONFIG$fig_height_single,
+           bg = "white")
+  }
+  if (THEME_CONFIG$emit_png) {
+    ggsave(paste0(base, ".png"), plot = p, device = "png",
+           width  = THEME_CONFIG$fig_width_single,
+           height = THEME_CONFIG$fig_height_single,
+           dpi = THEME_CONFIG$dpi, bg = "white")
+  }
+  return(p)
+}
+
+```
+
+# 3. Component Processing & Visualization Engine
+
+```{r}
+for (comp_name in names(component_specs)) {
+  
+  spec <- component_specs[[comp_name]]
+  time_win_str <- paste0(spec$win_ms[1], " - ", spec$win_ms[2], " ms")
+  
+  target_source <- ifelse(!is.null(spec$source_comp), spec$source_comp, comp_name)
+  target_folder_name <- paste0("Results_", target_source, "_", experiment_id)
+  comp_results_dir   <- file.path(root_dir, target_folder_name)
+  
+  cat(paste0("\n", str_dup("#", 75), "\n"))
+  cat(sprintf("ANALYSIS TARGET: %s | PHYSICAL SOURCE: %s\n", comp_name, target_folder_name))
+  cat(paste0(str_dup("#", 75), "\n"))
+  
+  if (!dir_exists(comp_results_dir)) {
+    cat(sprintf("Directory unresolved: %s. Skipping.\n", comp_results_dir))
+    next
+  }
+  
+  sessions <- dir_ls(comp_results_dir, glob = "*Session_*", type = "directory")
+  if (length(sessions) == 0) {
+    cat("Session index empty. Skipping.\n")
+    next
+  }
+  current_session <- sort(sessions, decreasing = TRUE)[1]
+  
+  chan_file <- file.path(current_session, "Regression_Results", "channel_locations.csv")
+  if (!file.exists(chan_file)) chan_file <- file.path(current_session, "Standard_Baseline", "channel_locations.csv")
+  if (!file.exists(chan_file)) {
+    cat("Spatial montage missing. Skipping.\n")
+    next
+  }
+  
+  chanlocs <- read_csv(chan_file, show_col_types = FALSE, lazy = FALSE) %>% rename(electrode = channel)
+  methods_to_run <- c("Regression", "Standard")
+  
+  # ============================================================================
+  # v2.3: Cross-method shared color scale (Regression-led)
+  # ============================================================================
+  # Both Regression and Standard topographies use the SAME 7-tier color scale,
+  # determined by Regression first. Rationale:
+  #   - Regression (Alday 2019 baseline-as-covariate) is the primary analysis
+  #     producing the LMM-aligned marginal means; Standard is a sensitivity
+  #     check / reference visualization.
+  #   - Visual comparability across methods requires a shared scale.
+  #   - Regression-led (rather than Standard-led, or pooled max) faithfully
+  #     reflects the primary analysis's signal range. Standard topographies
+  #     may saturate (clip to scale extremes) on this scale, but that is the
+  #     correct visual signature of "Standard signals are larger than the
+  #     baseline-corrected Regression marginal means" — a real methodological
+  #     fact, not an artifact.
+  #
+  # Container initialized as NULL; populated when method=="Regression" runs;
+  # consumed when method=="Standard" runs. If Regression is skipped (e.g. for
+  # exploratory windows like testN170 where target_source != comp_name in a
+  # way that bypasses Regression), Standard falls back to its own limits.
+  shared_lims <- list(
+    raw  = NULL, main = NULL,
+    diff_emo_main = NULL, diff_offer_main = NULL,
+    diff_cond_emo = NULL, diff_cond_offer = NULL
+  )
+  
+  for (method in methods_to_run) {
+    if (method == "Regression" && comp_name != target_source) {
+      cat(sprintf("\n  >>> Analytical Method: %s [GUARD INTERCEPT] Skipped.\n", method))
+      next
+    }
+    
+    cat(sprintf("\n  >>> Analytical Method: %s\n", method))
+    topo_data <- NULL; title_prefix <- ""; caption_method <- ""
+    
+    # ==========================================================================
+    # 3.1 DATA INGESTION 
+    # ==========================================================================
+    if (method == "Regression") {
+      f <- file.path(current_session, "Regression_Results", "topomap_data_for_R", paste0(target_source, "_topomap_data.csv"))
+      if (file.exists(f)) {
+        topo_data <- read_csv(f, show_col_types = FALSE, lazy = FALSE)
+        title_prefix <- "Marginal Means (Regression)"
+        # v2.1: caption updated to match upstream baseline handling.
+        # Pre-v2.1 used Z-scored baseline; v2.1+ uses mean-centered baseline
+        # following Alday (2019) recommendations. Keeps baseline in microvolts
+        # so that beta_baseline is interpretable as fraction of pre-stimulus
+        # drift propagated forward. See Sta_EEG_OfferPhase_RefAlday.Rmd v2.1
+        # and Visualization_EEG_StiLocked.py for upstream consistency.
+        caption_method <- "Marginal means from linear modeling (Alday 2019; baseline as mean-centered covariate)"
+      } else { cat("    File absent. Skipping.\n"); next }
+      
+    } else if (method == "Standard") {
+      f <- file.path(current_session, "Standard_Baseline", paste0(target_source, "_ave_labelled.csv"))
+      if (file.exists(f)) {
+        raw_df <- read_csv(f, show_col_types = FALSE, lazy = FALSE)
+        valid_chans <- intersect(names(raw_df), chanlocs$electrode)
+        
+        df_agg <- raw_df %>%
+          pivot_longer(all_of(valid_chans), names_to = "channel", values_to = "uV") %>%
+          mutate(time_ms = round(time * 1000)) %>%
+          filter(time_ms >= spec$win_ms[1] & time_ms <= spec$win_ms[2]) %>%
+          group_by(channel, emotion, offer_type) %>%
+          summarise(mean_amp = mean(uV, na.rm=TRUE), .groups="drop")
+        
+        topo_data <- df_agg %>%
+          pivot_wider(names_from = c(emotion, offer_type), values_from = mean_amp, names_sep = "_") %>%
+          rename_with(~paste0("raw_", .), -channel)
+          
+        title_prefix <- "Evoked Amplitude (Standard)"
+        caption_method <- "Traditional Pre-stimulus Subtraction (-200 to 0 ms)"
+      } else { cat("    File absent. Skipping.\n"); next }
+    }
+    
+    # ==========================================================================
+    # 3.2 FACTORIAL DIFFERENCE COMPUTATION
+    # ==========================================================================
+    if (!is.null(topo_data)) {
+      for(o in offer_types) {
+        neu_col <- paste0("raw_neu_", o)
+        for(e in emotion_list) {
+          tgt <- paste0("raw_", e, "_", o)
+          if(neu_col %in% names(topo_data) & tgt %in% names(topo_data)) 
+            topo_data[[paste0("conditional_diff_", e, "_vs_neu_", o)]] <- topo_data[[tgt]] - topo_data[[neu_col]]
+        }
+        cols <- paste0("raw_", c("neu", emotion_list), "_", o)
+        valid <- cols[cols %in% names(topo_data)]
+        if(length(valid)>0) topo_data[[paste0("offer_main_", o)]] <- rowMeans(topo_data[, valid], na.rm=TRUE)
+      }
+      
+      for(e in c("neu", emotion_list)) {
+        cols <- paste0("raw_", e, "_", offer_types)
+        valid <- cols[cols %in% names(topo_data)]
+        if(length(valid)>0) topo_data[[paste0("emotion_main_", e)]] <- rowMeans(topo_data[, valid], na.rm=TRUE)
+        if(e != "neu" && paste0("emotion_main_", e) %in% names(topo_data) && "emotion_main_neu" %in% names(topo_data)) {
+           topo_data[[paste0("emotion_diff_main_", e, "_vs_neu")]] <- topo_data[[paste0("emotion_main_", e)]] - topo_data[["emotion_main_neu"]]
+        }
+      }
+      
+      if("offer_main_unfair" %in% names(topo_data) && "offer_main_fair" %in% names(topo_data)) {
+        topo_data[["offer_diff_main_unfair_vs_fair"]] <- topo_data[["offer_main_unfair"]] - topo_data[["offer_main_fair"]]
+      }
+
+      for(e in c("neu", emotion_list)) {
+        unfair_col <- paste0("raw_", e, "_unfair")
+        fair_col   <- paste0("raw_", e, "_fair")
+        if(unfair_col %in% names(topo_data) && fair_col %in% names(topo_data)) {
+          topo_data[[paste0("offer_diff_conditional_", e, "_unfair_vs_fair")]] <- topo_data[[unfair_col]] - topo_data[[fair_col]]
+        }
+      }
+    }
+
+    # ==========================================================================
+    # 3.3 POOLED DYNAMIC SCALING & DIRECTORY PROVISIONING
+    # ==========================================================================
+    subfolder <- ifelse(method == "Regression", "Regression_Results", "Standard_Baseline")
+    out_base <- file.path(current_session, subfolder, paste0("topoplots_R_", comp_name))
+    
+    # File-naming factory: each output PNG/PDF carries EXP and method tags in
+    # its basename so a single figure file is self-identifying when filed in
+    # supplementary materials (e.g., "FRN_E2_reg_diff_unfair_vs_fair.pdf"
+    # rather than the prior "FRN_diff_unfair_vs_fair.png" which lost context
+    # once moved out of its parent directory).
+    method_tag <- if (method == "Regression") "reg" else "std"
+    fname <- function(subdir, basename_core, ext = "png") {
+      file.path(out_base, subdir, paste0(comp_name, "_", experiment_id, "_",
+                                         method_tag, "_", basename_core, ".", ext))
+    }
+    
+    dir_map_static <- c("raw", "diff", "emotion_main", "emotion_diff", "offer_main", "offer_diff", "offer_diff_conditional")
+    walk(file.path(out_base, dir_map_static), dir_create)
+    
+    if (method == "Standard" && exists("raw_df")) {
+      dir_map_tc <- c("raw_offer", "raw_emotion", "raw_cond", "diff_offer", "diff_emotion", "diff_cond")
+      walk(file.path(out_base, "time_course_grids", dir_map_tc), dir_create)
+    }
+    
+    topo_long <- topo_data %>% rename(electrode = channel)
+    
+    raw_cols  <- grep("^raw_", names(topo_long), value = TRUE)
+    main_cols <- grep("_main_", names(topo_long), value = TRUE)
+    
+    emo_main_diff_cols   <- grep("emotion_diff_main_", names(topo_long), value = TRUE)
+    offer_main_diff_cols <- grep("offer_diff_main_", names(topo_long), value = TRUE)
+    cond_emo_diff_cols   <- grep("conditional_diff_", names(topo_long), value = TRUE)
+    cond_offer_diff_cols <- grep("offer_diff_conditional_", names(topo_long), value = TRUE)
+
+    raw_vals  <- if(length(raw_cols) > 0) unlist(topo_long[, raw_cols]) else 0
+    main_vals <- if(length(main_cols) > 0) unlist(topo_long[, main_cols]) else 0
+    
+    emo_main_diff_vals   <- if(length(emo_main_diff_cols) > 0) unlist(topo_long[, emo_main_diff_cols]) else 0
+    offer_main_diff_vals <- if(length(offer_main_diff_cols) > 0) unlist(topo_long[, offer_main_diff_cols]) else 0
+    cond_emo_diff_vals   <- if(length(cond_emo_diff_cols) > 0) unlist(topo_long[, cond_emo_diff_cols]) else 0
+    cond_offer_diff_vals <- if(length(cond_offer_diff_cols) > 0) unlist(topo_long[, cond_offer_diff_cols]) else 0
+    
+    if (method == "Standard" && exists("raw_df")) {
+        valid_chans_tc <- intersect(names(raw_df), chanlocs$electrode)
+        df_tc_scan <- raw_df %>%
+          mutate(time_ms = round(time * 1000)) %>%
+          filter(time_ms >= spec$win_ms[1] & time_ms <= spec$win_ms[2]) %>%
+          pivot_longer(all_of(valid_chans_tc), names_to = "channel", values_to = "uV") %>%
+          group_by(time, channel, emotion, offer_type) %>%
+          summarise(uV = mean(uV, na.rm=TRUE), .groups="drop")
+          
+        raw_vals <- c(raw_vals, df_tc_scan$uV)
+    }
+
+    # ==========================================================================
+    # 3.3.x SHARED COLOR-SCALE PROVISIONING (v2.3)
+    # ==========================================================================
+    # Regression branch: compute limits from this method's data and store into
+    #   shared_lims for the subsequent Standard branch to consume.
+    # Standard branch: prefer the limits stored by Regression (cross-method
+    #   visual comparability); fall back to independent computation only if
+    #   Regression was skipped or did not populate the container.
+    if (method == "Regression") {
+      lims_raw             <- compute_limits(raw_vals)
+      lims_main            <- compute_limits(main_vals)
+      lims_diff_emo_main   <- compute_limits(emo_main_diff_vals)
+      lims_diff_offer_main <- compute_limits(offer_main_diff_vals)
+      lims_diff_cond_emo   <- compute_limits(cond_emo_diff_vals)
+      lims_diff_cond_offer <- compute_limits(cond_offer_diff_vals)
+      
+      # Persist for Standard branch.
+      shared_lims$raw             <- lims_raw
+      shared_lims$main            <- lims_main
+      shared_lims$diff_emo_main   <- lims_diff_emo_main
+      shared_lims$diff_offer_main <- lims_diff_offer_main
+      shared_lims$diff_cond_emo   <- lims_diff_cond_emo
+      shared_lims$diff_cond_offer <- lims_diff_cond_offer
+      
+      cat(sprintf("       -> Limits computed from Regression (will be reused by Standard):\n"))
+    } else {
+      # Standard branch — try to inherit Regression's scale.
+      if (!is.null(shared_lims$raw)) {
+        lims_raw             <- shared_lims$raw
+        lims_main            <- shared_lims$main
+        lims_diff_emo_main   <- shared_lims$diff_emo_main
+        lims_diff_offer_main <- shared_lims$diff_offer_main
+        lims_diff_cond_emo   <- shared_lims$diff_cond_emo
+        lims_diff_cond_offer <- shared_lims$diff_cond_offer
+        cat(sprintf("       -> Limits INHERITED from Regression (cross-method shared scale):\n"))
+      } else {
+        # Fallback: Regression was unavailable for this comp_name, so Standard
+        # computes its own. This path is taken e.g. for exploratory windows
+        # where Regression is skipped but we still want Standard topographies.
+        lims_raw             <- compute_limits(raw_vals)
+        lims_main            <- compute_limits(main_vals)
+        lims_diff_emo_main   <- compute_limits(emo_main_diff_vals)
+        lims_diff_offer_main <- compute_limits(offer_main_diff_vals)
+        lims_diff_cond_emo   <- compute_limits(cond_emo_diff_vals)
+        lims_diff_cond_offer <- compute_limits(cond_offer_diff_vals)
+        cat(sprintf("       -> Limits computed independently (Regression unavailable):\n"))
+      }
+    }
+    
+    cat(sprintf("       -> Raw bounds: [%.2f, %.2f] uV\n", lims_raw[1], lims_raw[2]))
+    cat(sprintf("       -> Diff bounds (Emo Main): [%.2f, %.2f] uV\n", lims_diff_emo_main[1], lims_diff_emo_main[2]))
+    cat(sprintf("       -> Diff bounds (Offer Main): [%.2f, %.2f] uV\n", lims_diff_offer_main[1], lims_diff_offer_main[2]))
+
+    # ==========================================================================
+    # 3.3.1 LMM provenance — read from upstream viz output for caption metadata.
+    # ==========================================================================
+    # Visualization_EEG_StiLocked.py v2.1 writes <COMP>_lmm_provenance.txt
+    # alongside the topomap CSV. We attempt to read it (Regression mode only;
+    # Standard does not require this since it has no LMM correspondence).
+    provenance <- NULL
+    if (method == "Regression") {
+      prov_file <- file.path(current_session, "Regression_Results",
+                             paste0(target_source, "_lmm_provenance.txt"))
+      provenance <- read_lmm_provenance(prov_file)
+      if (is.null(provenance)) {
+        cat(sprintf("       -> LMM provenance NOT found (%s); caption will omit LMM info.\n",
+                    basename(prov_file)))
+      } else {
+        cat(sprintf("       -> LMM provenance loaded: N=%s, generated=%s\n",
+                    provenance$lmm_n %||% "?",
+                    provenance$lmm_generated %||% "?"))
+      }
+    }
+    
+    # Publication-grade caption with full chain-of-custody metadata.
+    global_caption <- build_publication_caption(
+      spec = spec, method_label = caption_method,
+      provenance = provenance, experiment_id = experiment_id,
+      comp_label = comp_name
+    )
+
+    # ==========================================================================
+    # 3.4 STATIC TOPOGRAPHIC RENDERINGS
+    # ==========================================================================
+    # 3.4.1 Raw Topographies
+    for (ofr in offer_types) {
+      for (emo in c("neu", emotion_list)) {
+        col <- paste0("raw_", emo, "_", ofr)
+        if (col %in% names(topo_long)) {
+          plot_topo_unified(
+            dat_long = select(topo_long, electrode, amplitude = all_of(col)), chan_locs = chanlocs, roi = spec$roi,
+            main_title = paste(comp_name, title_prefix), 
+            sub_title = paste("Offer:", str_to_title(ofr), "| Emotion:", emotion_labels[emo]),
+            caption_text = global_caption,
+            filename = fname("raw", paste0(ofr, "_", emo)),
+            limits = lims_raw, show_contour = TRUE
+          )
+        }
+      }
+    }
+    
+    # 3.4.2 Conditional Differences (Emotion - Neutral within Offer)
+    for (ofr in offer_types) {
+      for (emo in emotion_list) {
+        col <- paste0("conditional_diff_", emo, "_vs_neu_", ofr)
+        if (col %in% names(topo_long)) {
+          plot_topo_unified(
+            dat_long = select(topo_long, electrode, amplitude = all_of(col)), chan_locs = chanlocs, roi = spec$roi,
+            main_title = paste(comp_name, title_prefix, "- Contrast"), 
+            sub_title = paste("Offer:", str_to_title(ofr), "| Diff:", emotion_labels[emo], "minus Neutral"),
+            caption_text = global_caption,
+            filename = fname("diff", paste0(ofr, "_", emo, "_vs_neu")),
+            limits = lims_diff_cond_emo, show_contour = FALSE 
+          )
+        }
+      }
+    }
+    
+    # 3.4.3 Offer Main Effect Topographies 
+    for (ofr in offer_types) {
+      col <- paste0("offer_main_", ofr)
+      if (col %in% names(topo_long)) {
+         plot_topo_unified(
+          dat_long = select(topo_long, electrode, amplitude = all_of(col)), chan_locs = chanlocs, roi = spec$roi,
+          main_title = paste(comp_name, title_prefix, "- Main Effect"), 
+          sub_title = paste("Offer Context:", str_to_title(ofr)),
+          caption_text = global_caption,
+          filename = fname("offer_main", paste0("main_offer_", ofr)), 
+          limits = lims_main, show_contour = TRUE 
+        )
+      }
+    }
+
+    # 3.4.4 Offer Main Difference (Unfair - Fair)
+    if ("offer_diff_main_unfair_vs_fair" %in% names(topo_long)) {
+       plot_topo_unified(
+          dat_long = select(topo_long, electrode, amplitude = offer_diff_main_unfair_vs_fair), chan_locs = chanlocs, roi = spec$roi,
+          main_title = paste(comp_name, title_prefix, "- Main Effect"), 
+          sub_title = "Unfair minus Fair Offers", 
+          caption_text = global_caption,
+          filename = fname("offer_diff", "diff_unfair_vs_fair"),
+          limits = lims_diff_offer_main, show_contour = FALSE 
+       )
+    }
+
+    # 3.4.5 Emotion Main Effects
+    for (e in c("neu", emotion_list)) {
+      col <- paste0("emotion_main_", e)
+      if (col %in% names(topo_long)) {
+         plot_topo_unified(
+          dat_long = select(topo_long, electrode, amplitude = all_of(col)), chan_locs = chanlocs, roi = spec$roi,
+          main_title = paste(comp_name, title_prefix, "- Main Effect"), 
+          sub_title = paste("Emotion Context:", emotion_labels[e]),
+          caption_text = global_caption,
+          filename = fname("emotion_main", paste0("main_emotion_", e)), 
+          limits = lims_main, show_contour = TRUE 
+        )
+      }
+    }
+
+    # 3.4.6 Emotion Main Differences (Emotion - Neutral)
+    for (e in emotion_list) {
+      col <- paste0("emotion_diff_main_", e, "_vs_neu")
+      if (col %in% names(topo_long)) {
+         plot_topo_unified(
+          dat_long = select(topo_long, electrode, amplitude = all_of(col)), chan_locs = chanlocs, roi = spec$roi,
+          main_title = paste(comp_name, title_prefix, "- Contrast"), 
+          sub_title = paste("Main Effect:", emotion_labels[e], "minus Neutral"), 
+          caption_text = global_caption,
+          filename = fname("emotion_diff", paste0("main_diff_", e, "_vs_neu")),
+          limits = lims_diff_emo_main, show_contour = FALSE 
+        )
+      }
+    }
+    
+    # 3.4.7 Offer Conditional Differences (Unfair - Fair within Emotion)
+    for (e in c("neu", emotion_list)) {
+      col <- paste0("offer_diff_conditional_", e, "_unfair_vs_fair")
+      if (col %in% names(topo_long)) {
+         plot_topo_unified(
+          dat_long = select(topo_long, electrode, amplitude = all_of(col)), chan_locs = chanlocs, roi = spec$roi,
+          main_title = paste(comp_name, title_prefix, "- Contrast"), 
+          sub_title = paste("Unfair minus Fair | Context:", emotion_labels[e]), 
+          caption_text = global_caption,
+          filename = fname("offer_diff_conditional", paste0("diff_unfair_vs_fair_in_", e)),
+          limits = lims_diff_cond_offer, show_contour = FALSE 
+        )
+      }
+    }
+
+    # ==========================================================================
+    # 3.5 SPATIOTEMPORAL MATRIX GENERATION (TIME COURSE GRIDS)
+    # ==========================================================================
+    if (method == "Standard" && exists("raw_df")) {
+      
+      tc_out_dir <- file.path(out_base, "time_course_grids")
+      t_step <- time_course_step_ms
+      
+      tmins <- seq(spec$win_ms[1], spec$win_ms[2] - 1, by = t_step)
+      
+      build_tc_row <- function(df_subset, row_label, limits, roi, palette="RdBu") {
+        # v2.3.2: same ROI strategy as plot_topo_unified — eegUtils built-in
+        # highlight, no custom geom_point overlays. See plot_topo_unified
+        # comment block above for the iteration history.
+        plots <- purrr::map(tmins, function(tmin) {
+          tmax <- min(tmin + t_step, spec$win_ms[2])
+          
+          dat <- df_subset %>%
+             mutate(time_ms = round(time * 1000)) %>%
+             filter(time_ms >= tmin & time_ms < tmax) %>%
+             group_by(channel) %>%
+             summarise(amplitude = mean(amplitude, na.rm=TRUE), .groups="drop") %>%
+             filter(!is.na(amplitude)) %>%
+             rename(electrode = channel)
+
+          if (nrow(dat) == 0) {
+             return(ggplot() + theme_void() + 
+                    ggtitle(paste0(tmin, "-", tmax, " ms")) +
+                    theme(plot.title = element_text(
+                      size = THEME_CONFIG$size_grid_panel, family = THEME_CONFIG$font_family,
+                      hjust = 0.5, face = "bold", margin = margin(b=4))))
+          }
+
+          p_temp <- topoplot(dat, chan_locs = chanlocs, interp_limit = "head", 
+                             contour = FALSE, limits = limits, palette = palette,
+                             highlights = roi,
+                             scaling = THEME_CONFIG$topoplot_scaling) 
+          
+          p_temp + 
+            ggtitle(paste0(tmin, "-", tmax, " ms")) +
+            theme(plot.title = element_text(
+                    size = THEME_CONFIG$size_grid_panel, family = THEME_CONFIG$font_family,
+                    hjust = 0.5, face = "bold", margin = margin(b=4)), 
+                  legend.position = "none",
+                  plot.margin = margin(4, 3, 4, 3, unit = "mm")) 
+        })
+        
+        label_gg <- cowplot::ggdraw() + 
+                    cowplot::draw_label(row_label, fontface = "bold",
+                                        size = THEME_CONFIG$size_grid_label,
+                                        fontfamily = THEME_CONFIG$font_family,
+                                        angle = 90)
+        
+        row_grid <- cowplot::plot_grid(plotlist = plots, nrow = 1)
+        cowplot::plot_grid(label_gg, row_grid, ncol = 2, rel_widths = c(0.12, length(tmins)))
+      }
+
+      save_mega_tc <- function(row_plots, main_title, limits, file_name, time_window, palette="RdBu") {
+        dummy_df <- data.frame(electrode = chanlocs$electrode[1:2], amplitude = limits)
+        bar_h <- min(length(row_plots) * 1.5, 6) 
+        
+        dummy_p <- topoplot(dummy_df, chan_locs = chanlocs, limits = limits, palette = palette,
+                            scaling = THEME_CONFIG$topoplot_scaling) +
+           guides(fill = guide_colorbar(title = "Amplitude\n(\u00b5V)", title.position = "top", 
+                                        barheight = unit(bar_h, "cm"), barwidth = unit(0.4, "cm"))) +
+           theme(legend.position = "right", 
+                 legend.title = element_text(
+                   size = THEME_CONFIG$size_legend_ttl, face = "bold",
+                   family = THEME_CONFIG$font_family, margin = margin(b = 6)),
+                 legend.text = element_text(
+                   size = THEME_CONFIG$size_legend_txt, family = THEME_CONFIG$font_family),
+                 legend.margin = margin(0, 6, 0, 6)) 
+        shared_legend <- cowplot::get_legend(dummy_p)
+
+        mega_stack <- cowplot::plot_grid(plotlist = row_plots, ncol = 1)
+        stack_w_leg <- cowplot::plot_grid(mega_stack, shared_legend, ncol = 2, rel_widths = c(length(tmins), 0.8))
+
+        safe_main_title <- stringr::str_wrap(paste0(main_title, " | Window: ", time_window), width = 75)
+        title_gg <- cowplot::ggdraw() + 
+                    cowplot::draw_label(safe_main_title, fontface = "bold",
+                                        size = THEME_CONFIG$size_title + 2,
+                                        fontfamily = THEME_CONFIG$font_family,
+                                        lineheight = 1.2) +
+                    theme(plot.margin = margin(8, 4, 5, 4))
+                    
+        final_plot <- cowplot::plot_grid(title_gg, stack_w_leg, ncol = 1, rel_heights = c(0.6, length(row_plots) * 2.0))
+
+        # Width scales with number of time bins; height with number of rows.
+        # Tighter dimensions than v2.0 (was 2.8 cm/panel; now ~2.0) to keep
+        # multi-row grids printable as supplementary figures.
+        dynamic_width <- max(8, 2.0 + (length(tmins) * 1.6) + 1.5)
+        dynamic_height <- 1.5 + (length(row_plots) * 2.0)
+
+        # Dual-format output for time-course grids.
+        base <- file.path(tc_out_dir, tools::file_path_sans_ext(file_name))
+        
+        if (THEME_CONFIG$emit_pdf) {
+          ggsave(paste0(base, ".pdf"), final_plot,
+                 device = cairo_pdf,
+                 width = dynamic_width, height = dynamic_height,
+                 bg = "white", limitsize = FALSE)
+        }
+        if (THEME_CONFIG$emit_png) {
+          ggsave(paste0(base, ".png"), final_plot,
+                 device = "png",
+                 width = dynamic_width, height = dynamic_height,
+                 dpi = THEME_CONFIG$dpi, bg = "white", limitsize = FALSE)
+        }
+      }
+
+      valid_chans_tc <- intersect(names(raw_df), chanlocs$electrode)
+      df_tc_base <- raw_df %>%
+        pivot_longer(all_of(valid_chans_tc), names_to = "channel", values_to = "uV") %>%
+        group_by(time, channel, emotion, offer_type) %>%
+        summarise(uV = mean(uV, na.rm=TRUE), .groups="drop")
+
+      row_plots <- list()
+      for (ofr in offer_types) {
+        df_slice <- df_tc_base %>% filter(offer_type == ofr) %>%
+                    group_by(time, channel) %>% summarise(amplitude = mean(uV, na.rm=TRUE), .groups="drop")
+        row_plots[[length(row_plots)+1]] <- build_tc_row(df_slice, paste("Offer:", str_to_title(ofr)), lims_raw, spec$roi)
+      }
+      save_mega_tc(row_plots, paste(comp_name, "Evolution: Main Effects of Offer"), 
+                   lims_raw,
+                   file.path("raw_offer",
+                             paste0(comp_name, "_", experiment_id, "_std_TC_Raw_Offer")),
+                   time_win_str)
+
+      row_plots <- list()
+      for (emo in c("neu", emotion_list)) {
+        df_slice <- df_tc_base %>% filter(emotion == emo) %>%
+                    group_by(time, channel) %>% summarise(amplitude = mean(uV, na.rm=TRUE), .groups="drop")
+        row_plots[[length(row_plots)+1]] <- build_tc_row(df_slice, paste("Emotion:", emotion_labels[emo]), lims_raw, spec$roi)
+      }
+      save_mega_tc(row_plots, paste(comp_name, "Evolution: Main Effects of Emotion"), 
+                   lims_raw,
+                   file.path("raw_emotion",
+                             paste0(comp_name, "_", experiment_id, "_std_TC_Raw_Emotion")),
+                   time_win_str)
+
+      row_plots <- list()
+      for (emo in c("neu", emotion_list)) {
+        for (ofr in offer_types) {
+          df_slice <- df_tc_base %>% filter(offer_type == ofr, emotion == emo) %>% rename(amplitude = uV)
+          row_label <- paste0(emotion_labels[emo], "\n(", str_to_title(ofr), ")")
+          row_plots[[length(row_plots)+1]] <- build_tc_row(df_slice, row_label, lims_raw, spec$roi)
+        }
+      }
+      save_mega_tc(row_plots, paste(comp_name, "Evolution: Offer Type per Emotional Context"), 
+                   lims_raw,
+                   file.path("raw_cond",
+                             paste0(comp_name, "_", experiment_id, "_std_TC_Raw_Conditional")),
+                   time_win_str)
+
+      row_plots <- list()
+      df_slice <- df_tc_base %>%
+        group_by(time, channel, offer_type) %>%
+        summarise(uV = mean(uV, na.rm=TRUE), .groups="drop") %>%
+        pivot_wider(names_from = offer_type, values_from = uV) %>%
+        mutate(amplitude = unfair - fair)
+      row_plots[[length(row_plots)+1]] <- build_tc_row(df_slice, "Unfair - Fair\n(Aggregated)", lims_diff_offer_main, spec$roi)
+      save_mega_tc(row_plots, paste(comp_name, "Spatiotemporal Contrast: Unfair minus Fair"), 
+                   lims_diff_offer_main,
+                   file.path("diff_offer",
+                             paste0(comp_name, "_", experiment_id, "_std_TC_Diff_Offer_Main")),
+                   time_win_str)
+
+      row_plots <- list()
+      for (emo in emotion_list) {
+        df_slice <- df_tc_base %>%
+          filter(emotion %in% c(emo, "neu")) %>%
+          group_by(time, channel, emotion) %>%
+          summarise(uV = mean(uV, na.rm=TRUE), .groups="drop") %>%
+          pivot_wider(names_from = emotion, values_from = uV) %>%
+          mutate(amplitude = !!sym(emo) - neu)
+        row_plots[[length(row_plots)+1]] <- build_tc_row(df_slice, paste0(emotion_labels[emo], "\n- Neutral"), lims_diff_emo_main, spec$roi)
+      }
+      save_mega_tc(row_plots, paste(comp_name, "Spatiotemporal Contrast: Emotion minus Neutral"), 
+                   lims_diff_emo_main,
+                   file.path("diff_emotion",
+                             paste0(comp_name, "_", experiment_id, "_std_TC_Diff_Emotion_Main")),
+                   time_win_str)
+
+      row_plots <- list()
+      for (emo in c("neu", emotion_list)) {
+        df_slice <- df_tc_base %>%
+          filter(emotion == emo) %>%
+          group_by(time, channel, offer_type) %>%
+          summarise(uV = mean(uV, na.rm=TRUE), .groups="drop") %>%
+          pivot_wider(names_from = offer_type, values_from = uV) %>%
+          mutate(amplitude = unfair - fair)
+        row_plots[[length(row_plots)+1]] <- build_tc_row(df_slice, paste0("Unfair - Fair\n(", emotion_labels[emo], ")"), lims_diff_cond_offer, spec$roi)
+      }
+      save_mega_tc(row_plots, paste(comp_name, "Spatiotemporal Contrast: Conditional Interactions"), 
+                   lims_diff_cond_offer,
+                   file.path("diff_cond",
+                             paste0(comp_name, "_", experiment_id, "_std_TC_Diff_Conditional")),
+                   time_win_str)
+    }
+    
+    cat(sprintf("    Exportation complete. Assets localized at: %s\n", out_base))
+  }
+  
+  graphics.off()
+  closeAllConnections()
+  gc(verbose = FALSE)
+}
+
+```
+

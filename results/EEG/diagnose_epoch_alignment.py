@@ -51,7 +51,7 @@ import numpy as np
 PROJECT_ROOT = Path(r"C:\Code\UG_ERP_Project")
 
 # Experiment and method.
-EXPERIMENT = "E2"                  # "E1" or "E2"
+EXPERIMENT = "E1"                  # "E1" or "E2"
 METHOD     = "Method_Regression"   # "Method_Regression" (Alday) or "Method_Standard" (Traditional)
 
 # Components to check. Set SINGLE_COMPONENT to a name (e.g., "FRN") to run
