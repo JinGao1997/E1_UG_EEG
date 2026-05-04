@@ -1,6 +1,6 @@
 ---
 title: "Exp 1 & 2 ERP Statistical Analysis: Two-Stage Pipeline (v2)"
-subtitle: "Stage 1: Single-trial LMM (Alday baseline-as-covariate, Bates random-structure selection). Stage 2: BLUP-based individual-difference correlations (FDR-corrected). v2: confirmatory/exploratory component split; lmerTest dispatch hardening; partial eta-squared with 95% CI; cascade Satterthwaite -> Kenward-Roger -> Wald."
+subtitle: "Stage 1: Single-trial LMM (Alday baseline-as-covariate, Bates random-structure selection). Stage 2: BLUP-based individual-difference correlations (FDR-corrected). v2.1: trial inclusion criteria (reaction != 0; RT in [300, 3000] ms) aligned with parallel behavioral analysis. v2: confirmatory/exploratory component split; lmerTest dispatch hardening; partial eta-squared with 95% CI; cascade Satterthwaite -> Kenward-Roger -> Wald."
 author: "Project Research Team"
 date: "`r Sys.Date()`"
 output: 
@@ -83,6 +83,24 @@ stage2_trait_groups <- list(
 
 # Flat union retained for covariate loading (load_covariates filters by this).
 stage2_traits <- unlist(stage2_trait_groups, use.names = FALSE)
+
+# ------------------------------------------------------------------------------
+# Trial-level inclusion criteria
+# ------------------------------------------------------------------------------
+# These thresholds define which trials enter Stage 1 LMM analysis. They are
+# applied AT THE ANALYSIS LAYER (in load_and_prep below), NOT in the upstream
+# HU pipeline preprocessing. Rationale: the canonical trials.csv produced by
+# HU pipeline reflects only EEG-artifact rejection (peak-to-peak > 200 uV
+# marked as NaN); response-related and RT-range exclusions are analysis-
+# specific decisions and are therefore implemented here for transparency.
+#
+# IMPORTANT: keep these constants synchronized with Sta_Behaviour_RefAlday.Rmd
+# (rt_lower_ms / rt_upper_ms, lines 56-57). Cross-modality sample equivalence
+# requires identical inclusion logic across the behavioral and EEG analyses.
+# These values also match the average_by query in upstream HU pipeline calls
+# (Pipline_UG_OfferPhase.Rmd lines 181-236) and the predeclared analysis plan.
+rt_lower_ms <- 300
+rt_upper_ms <- 3000
 
 # Post-hoc gating thresholds (v2: layered).
 # Effects with omnibus interaction p < confirmatory_alpha enter the main report.
@@ -595,7 +613,11 @@ load_and_prep <- function(path_erp, df_covariates, erp_name, baseline_col) {
   
   df <- readr::read_csv(path_erp, show_col_types = FALSE)
   
-  required_cols <- c("participant_id", "Offers_Other", "emotion", "index")
+  # reaction and RT are required for the trial-level inclusion criteria
+  # applied below; participant_id, Offers_Other, emotion, and index are
+  # required for condition coding and downstream key construction.
+  required_cols <- c("participant_id", "Offers_Other", "emotion", "index",
+                     "reaction", "RT")
   missing_cols <- setdiff(required_cols, names(df))
   if (length(missing_cols) > 0) {
     stop(sprintf("Required columns missing from %s: %s",
@@ -609,8 +631,42 @@ load_and_prep <- function(path_erp, df_covariates, erp_name, baseline_col) {
   
   df$participant_id <- standardize_id(df$participant_id)
   
+  # ----------------------------------------------------------------------------
+  # Apply trial inclusion criteria with logging.
+  # 
+  # Three sequential filters mirror those in Sta_Behaviour_RefAlday.Rmd
+  # (load_and_prep_behavior, lines 605-622) to ensure cross-modality sample
+  # equivalence:
+  #   (1) standard fair/unfair offer pairs (excludes 7:3 medium-fairness filler);
+  #   (2) reaction != 0 (excludes timeout / no-response trials);
+  #   (3) RT within [rt_lower_ms, rt_upper_ms] (excludes premature responses
+  #       and response-window-exceeding trials).
+  # 
+  # These filters are applied at the analysis layer rather than in upstream
+  # HU pipeline preprocessing, for the reason given in the inclusion-criteria
+  # block at the top of the setup chunk.
+  # ----------------------------------------------------------------------------
+  n_orig <- nrow(df)
+  
+  # Filter 1: standard fair/unfair offers only.
+  df <- df %>% dplyr::filter(Offers_Other %in% c(5, 6, 8, 9))
+  cat(sprintf("[Filter] %s | Offers_Other in {5,6,8,9}: %d -> %d trials (%d removed)\n",
+              erp_name, n_orig, nrow(df), n_orig - nrow(df)))
+  
+  # Filter 2: exclude reaction == 0 (timeout / missing response).
+  n_pre <- nrow(df)
+  df <- df %>% dplyr::filter(reaction != 0)
+  cat(sprintf("[Filter] %s | reaction != 0 (timeout): %d -> %d trials (%d removed)\n",
+              erp_name, n_pre, nrow(df), n_pre - nrow(df)))
+  
+  # Filter 3: RT range.
+  n_pre <- nrow(df)
+  df <- df %>% dplyr::filter(RT >= rt_lower_ms, RT <= rt_upper_ms)
+  cat(sprintf("[Filter] %s | RT in [%d, %d] ms: %d -> %d trials (%d removed)\n",
+              erp_name, rt_lower_ms, rt_upper_ms,
+              n_pre, nrow(df), n_pre - nrow(df)))
+  
   df <- df %>%
-    dplyr::filter(Offers_Other %in% c(5, 6, 8, 9)) %>%
     dplyr::mutate(
       offer_type = factor(
         dplyr::case_when(
@@ -2401,8 +2457,17 @@ writeLines(c(
   "Categorical predictors used sum-to-zero contrasts (R option contr.sum)",
   "to support valid Type III tests in the presence of interactions",
   "(Schad, Vasishth, Hohenstein, & Kliegl, 2020). Trials were excluded",
-  "if |amplitude| > 200 microvolts (likely artifact), if the offer was",
-  "the medium-fairness filler, or if the participant did not respond.",
+  "if |amplitude| > 200 microvolts at any electrode (HU pipeline",
+  "peak-to-peak rejection, marked as NaN in the single-trial data),",
+  "if the offer was the medium-fairness filler (Offers_Other == 7),",
+  "if the participant did not respond (reaction == 0), or if the",
+  sprintf("response time fell outside [%d, %d] ms. The latter three",
+          rt_lower_ms, rt_upper_ms),
+  "criteria were applied at the analysis layer rather than in upstream",
+  "preprocessing, to keep the canonical trials.csv as a single source",
+  "of truth and to maintain identical inclusion logic across the",
+  "parallel behavioral analysis (Sta_Behaviour_RefAlday.Rmd) and the",
+  "Stage 1 EEG analysis reported here.",
   "Baseline amplitude was mean-centered (per Alday 2019) but kept on the",
   "microvolt scale to preserve direct interpretation as voltage drift.",
   "",

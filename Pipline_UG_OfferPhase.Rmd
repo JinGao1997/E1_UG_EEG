@@ -30,14 +30,14 @@ pacman::p_load(tidyverse, reticulate, readr, stringr, here, fs)
 # Options: "E1" (Sequential Presentation) or "E2" (Simultaneous Presentation)
 # This toggle controls BOTH the output directory sandboxing AND the 
 # component time-window definitions (e.g., FRN latency shifts, N170 inclusion).
-experiment_version <- "E2" 
+experiment_version <- "E1" 
 
 # -----------------------------------------------------------
 # Method Configuration
 # -----------------------------------------------------------
 # TRUE  = Standard Method: Subtracts baseline mean from the epoch.
 # FALSE = Regression Method: No baseline subtraction (extracts baseline as covariate).
-use_baseline_correction <- TRUE 
+use_baseline_correction <- FALSE 
 
 # -----------------------------------------------------------
 # Baseline Parameters (Stimulus-Locked Only)

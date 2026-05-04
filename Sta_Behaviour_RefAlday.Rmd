@@ -38,7 +38,7 @@ options(contrasts = c("contr.sum", "contr.poly"))
 # ------------------------------------------------------------------------------
 # Global Settings & Analysis Targets (SINGLE SOURCE OF TRUTH)
 # ------------------------------------------------------------------------------
-experiment_version <- "E2"  # Options: "E1" or "E2"
+experiment_version <- "E1"  # Options: "E1" or "E2"
 
 # Behavioral analyses to run. Each is a separate model fit.
 # - GLMM_rejection : reject_binary ~ emotion * offer_type, all valid trials
@@ -795,7 +795,25 @@ add_correlations_step4 <- function(model_zcp_reduced, fixed_str, data,
   if (length(surviving) == 0) {
     progress_log("[Step 4] Reduced model has only random intercept; no correlations to test.",
                  indent = 1)
-    return(model_zcp_reduced)
+    # SAFETY: do NOT return model_zcp_reduced directly. When it was extracted
+    # from buildmer (bm_res@model), its @call slot stores buildmer's internal
+    # data placeholder ('..2'), which cannot be resolved by downstream tools
+    # such as emmeans::recover_data(). Symptom in E1 GLMM_Rejection (Sept
+    # 2026): "We are unable to reconstruct the data ... The dataset name is:
+    # ..2". Explicit refit using formula() and the function's `data` argument
+    # produces a clean @call.
+    f_int_only <- formula(model_zcp_reduced)
+    m_int_only <- if (model_family == "binomial") {
+      glmmTMB::glmmTMB(f_int_only, data = data,
+                       family = binomial(link = "logit"),
+                       control = custom_control_glmmTMB,
+                       REML = FALSE)
+    } else {
+      lme4::lmer(f_int_only, data = data, REML = TRUE,
+                 control = custom_control_lmer)
+    }
+    attr(m_int_only, "step4_selected") <- "RandomIntercept_only"
+    return(m_int_only)
   }
   
   candidates <- list()
@@ -907,10 +925,18 @@ add_correlations_step4 <- function(model_zcp_reduced, fixed_str, data,
   
   if (length(fits) == 1) {
     progress_log("[Step 4] Only ZCP candidate viable; correlations not added.", indent = 1)
+    # SAFETY: same buildmer ..2 placeholder issue as in the
+    # length(surviving)==0 branch above. Refit explicitly from formula()
+    # rather than returning model_zcp_reduced or update()-ing it.
+    f_zcp_only <- formula(model_zcp_reduced)
     if (model_family == "binomial") {
-      return(model_zcp_reduced)
+      return(glmmTMB::glmmTMB(f_zcp_only, data = data,
+                              family = binomial(link = "logit"),
+                              control = custom_control_glmmTMB,
+                              REML = FALSE))
     } else {
-      return(update(model_zcp_reduced, REML = TRUE))
+      return(lme4::lmer(f_zcp_only, data = data, REML = TRUE,
+                        control = custom_control_lmer))
     }
   }
   
@@ -983,7 +1009,19 @@ add_correlations_step4 <- function(model_zcp_reduced, fixed_str, data,
   if (model_family == "binomial") {
     best_fit
   } else {
-    update(best_fit, REML = TRUE)
+    # SAFETY: explicit refit rather than update(best_fit, REML=TRUE).
+    # Although best_fit was produced by an explicit lme4::lmer() call within
+    # this function, defensive refit eliminates any residual risk of @call
+    # resolution issues during downstream emmeans / anova() dispatch.
+    f_best <- formula(best_fit)
+    m_reml <- lme4::lmer(f_best, data = data, REML = TRUE,
+                         control = custom_control_lmer)
+    # Preserve diagnostic attributes attached above.
+    for (an in c("step4_lrt_table", "step4_selected")) {
+      a <- attr(best_fit, an)
+      if (!is.null(a)) attr(m_reml, an) <- a
+    }
+    m_reml
   }
 }
 
