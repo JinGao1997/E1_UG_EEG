@@ -1,6 +1,6 @@
 # Methods Paragraph (EEG Single-trial LMM, E1)
 
-Generated: 2026-05-04 15:46:15
+Generated: 2026-05-05 13:31:26
 
 ## Statistical Analysis
 
@@ -96,19 +96,42 @@ the omnibus interaction p < 0.05. Effects with 0.05 <= p < 0.10
 were computed but reported only in supplementary materials, never
 as confirmatory evidence.
 
-### Stage 2: BLUP-based individual differences
+### Stage 2: trait moderation analyses (dual-track design)
 
-Per-participant best linear unbiased predictors (BLUPs) for the
-emotion x offer_type interaction term were extracted from each
-component's Stage 1 fit and weighted-regressed against personality
-and trust covariates (weights 1/SE^2). FDR correction was applied
-independently within each pre-registered trait group. Stage 2
-analyses are exploratory across all components: the BLUP procedure
-is post-hoc inference on subject-specific deviations from the
-fixed-effect mean, with shrinkage that complicates standard error
-interpretation. We report Stage 2 findings to surface candidate
-individual-difference patterns for future pre-registration, not as
-confirmatory evidence in this manuscript.
+Stage 2 implements two methodologically distinct tracks based on the
+strength of prior literature support for each trait as an a priori
+moderator of UG-related ERP responses.
+
+Five traits with established UG-ERP literature support entered a
+confirmatory single-stage moderation analysis: three cover-story
+belief ratings (Rating_1: self-reported manipulation strength;
+Rating_2: belief that offers came from real individuals; Rating_3:
+belief that facial stimuli depicted real individuals), Social Value
+Orientation (SVO_angle), and Negative Affectivity. For each trait,
+a single linear mixed-effects model was refit containing the full
+trait x emotion x offer_type three-way interaction together with
+the Alday baseline covariate, reusing the random-effects structure
+selected at Stage 1. This is the statistically valid implementation
+of cross-level moderation (Snijders & Bosker, 2012, ch. 5) and
+avoids the BLUP shrinkage and standard-error misspecification that
+complicate two-stage BLUP-then-correlate inference (Hofmann &
+Rovine, 2007; Rouder & Haaf, 2019). Type III F-tests with
+cascading Satterthwaite -> Kenward-Roger -> Wald inference were
+applied as in Stage 1. Within each trait, Benjamini-Hochberg FDR
+correction was applied across components and the three trait-by-
+condition interaction terms.
+
+The five remaining PID-5-BF maladaptive personality dimensions
+(Detachment, Antagonism, Disinhibition, Anankastia, Psychoticism)
+lack direct UG-ERP literature support and were screened in a
+secondary BLUP-based exploratory analysis. Per-participant BLUPs
+for emotion and offer_type random slopes were extracted from each
+Stage 1 fit and weighted-regressed (weights 1/SE^2) against each
+of the five trait dimensions, with within-group BH-FDR correction
+and Spearman rank correlation as a distribution-robust check.
+These exploratory tests are reported in Supplementary Materials
+only and are explicitly hypothesis-generating, not interpreted as
+confirmatory evidence.
 
 ## Sample
 
@@ -146,3 +169,23 @@ Westfall, J., Kenny, D. A., & Judd, C. M. (2014). Statistical power
   and optimal design in experiments in which samples of participants
   respond to samples of stimuli. Journal of Experimental Psychology:
   General, 143, 2020-2045.
+
+References added in v2.2 (single-stage moderation rationale):
+Hofmann, D. A., & Rovine, M. J. (2007). Multilevel models in
+  organizational and management research. In Modern Methods for
+  Business Research. Lawrence Erlbaum.
+Krueger, R. F., Derringer, J., Markon, K. E., Watson, D., &
+  Skodol, A. E. (2012). Initial construction of a maladaptive
+  personality trait model and inventory for DSM-5. Psychological
+  Medicine, 42, 1879-1890.
+Rouder, J. N., & Haaf, J. M. (2019). A psychometrics of
+  individual differences in experimental tasks. Psychonomic
+  Bulletin & Review, 26, 452-467.
+Snijders, T. A. B., & Bosker, R. J. (2012). Multilevel Analysis:
+  An Introduction to Basic and Advanced Multilevel Modeling
+  (2nd ed.). Sage.
+Wu, Y., Liu, J., Qu, L., Eisenegger, C., Clark, L., & Zhou, X.
+  (2021). Social value orientation modulates fairness processing
+  during social decision-making: evidence from behavior and brain
+  potentials. Social Cognitive and Affective Neuroscience, 16,
+  670-682.

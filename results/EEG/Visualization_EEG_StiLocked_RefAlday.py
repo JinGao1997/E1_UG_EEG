@@ -132,7 +132,7 @@ SCALE_CONFIG = {
 # ==============================================================================
 
 # ANALYSIS_METHOD Options: 'All', 'Regression', 'Standard', 'QC'
-ANALYSIS_METHOD = 'Regression' 
+ANALYSIS_METHOD = 'All' 
 
 REJECT_PTP_THRESHOLD_UV = 200.0
 

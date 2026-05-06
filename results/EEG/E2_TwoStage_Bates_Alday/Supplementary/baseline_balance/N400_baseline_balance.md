@@ -1,5 +1,5 @@
 # Baseline Balance Pre-Check: N400
-Generated: 2026-05-04 15:50:34
+Generated: 2026-05-05 12:03:01
 
 ## Purpose
 Diagnostic test of whether mean baseline amplitude differs across
