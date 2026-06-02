@@ -1057,12 +1057,37 @@ fit_stage1_bates <- function(data, outcome_var, fixed_terms, include_terms,
     step5_pca = NULL
   )
   
-  # Determine random-slope variables based on outcome and design.
-  # Behavioral analyses always use within-subject factors emotion and offer_type
-  # as candidate random slopes (interaction omitted by design per Bates 2015).
-  random_max_vars <- c("emotion", "offer_type")
-  random_max_str <- paste("(1 +", paste(random_max_vars, collapse = " + "),
-                          "| participant_id)")
+  # Determine random-slope variables from the design ACTUALLY present in `data`.
+  # Candidate within-subject factors are emotion, offer_type, and reaction; a
+  # factor is kept as a candidate random slope only if it (a) is modeled as a
+  # fixed effect (appears in fixed_terms) AND (b) varies within the data
+  # (>= 2 levels after droplevels). The interaction random slope is omitted by
+  # design (Bates 2015).
+  #
+  # This guards the degenerate case where a stratum holds a factor constant.
+  # The unfair-only stratum has a single offer_type level; the previous
+  # hard-coded c("emotion", "offer_type") then triggered a "contrasts can be
+  # applied only to factors with 2 or more levels" error in Steps 1-2, silently
+  # collapsing the random structure to intercept-only and NEVER testing the
+  # within-subject slope that actually matters there (reaction). With this
+  # data-driven selection the unfair stratum resolves to c("emotion",
+  # "reaction"); the all-trials strata still resolve to c("emotion",
+  # "offer_type") -- fully backward-compatible.
+  candidate_slope_vars <- c("emotion", "offer_type", "reaction")
+  random_max_vars <- candidate_slope_vars[vapply(candidate_slope_vars, function(v) {
+    v %in% names(data) &&
+      grepl(v, fixed_terms, fixed = TRUE) &&
+      nlevels(droplevels(factor(data[[v]]))) >= 2
+  }, logical(1))]
+  progress_log(sprintf("[Random structure] Candidate random slopes: %s",
+                       if (length(random_max_vars) > 0)
+                         paste(random_max_vars, collapse = ", ") else "(none -- intercept only)"),
+               indent = 1)
+  random_max_str <- if (length(random_max_vars) > 0) {
+    paste("(1 +", paste(random_max_vars, collapse = " + "), "| participant_id)")
+  } else {
+    "(1 | participant_id)"
+  }
   
   # Determine fitting function based on family.
   # GLMM: glmmTMB (TMB-based, faster + more stable on binomial than lme4::glmer)
@@ -1134,10 +1159,11 @@ fit_stage1_bates <- function(data, outcome_var, fixed_terms, include_terms,
   progress_log("[Step 2] Fitting zero-correlation-parameter model...", indent = 1)
   t_step2 <- Sys.time()
   
-  random_zcp <- paste("(1 | participant_id)",
-                      sprintf("(0 + %s | participant_id)", random_max_vars[1]),
-                      sprintf("(0 + %s | participant_id)", random_max_vars[2]),
-                      sep = " + ")
+  # Build the ZCP structure from whatever surviving candidate slopes exist
+  # (handles 0, 1, 2, or more slopes -- no longer assumes exactly two).
+  random_zcp <- paste(c("(1 | participant_id)",
+                        sprintf("(0 + %s | participant_id)", random_max_vars)),
+                      collapse = " + ")
   f_zcp <- as.formula(paste(fixed_str, "+", random_zcp))
   
   m_zcp <- tryCatch(fit_func(f_zcp, data, REML_flag = FALSE),
@@ -1830,7 +1856,158 @@ run_behavior_analysis <- function(data, analysis_name, outcome_var, fixed_terms,
   openxlsx::saveWorkbook(wb,
     file.path(out_dir, sprintf("STATS_%s_%s.xlsx", exp_version, analysis_name)),
     overwrite = TRUE)
-  
+
+  # ============================================================================
+  # 9. Assumption & data-support diagnostics (added v1.7).
+  #
+  # Two complementary checks the earlier pipeline omitted:
+  #
+  #  (a) LMM distributional assumptions (Gaussian models only): residual
+  #      normality (Q-Q), homoscedasticity (residual-vs-fitted + residual SD
+  #      per design cell), and random-effect normality (BLUP Q-Q). These are
+  #      the assumptions an LMM actually makes. Skipped for the binomial GLMM,
+  #      where raw residuals are not interpretable on this scale.
+  #
+  #  (b) Data-support / empty-cell audit (all models): for the design cells
+  #      (between x within post-hoc factors), how many subjects contribute
+  #      ZERO trials, plus per-subject trial density. This quantifies the
+  #      behavioral self-selection that produces structurally empty per-subject
+  #      cells (e.g., subjects who never accept disgust unfair offers, so the
+  #      disgust-accept cell is informed by only a subset of the cohort).
+  #
+  #      IMPORTANT: empty per-subject cells do NOT violate LMM assumptions --
+  #      LMM supports unbalanced/incomplete designs and does not require every
+  #      subject in every cell (unlike RM-ANOVA). The audit documents the
+  #      reduced precision and the selected estimand (effects describe the
+  #      observed accepted/rejected trials, not a causal accept-vs-reject
+  #      manipulation), for transparent reporting in supplementary materials.
+  # ============================================================================
+  tryCatch({
+    # Design-cell factors: prefer the post-hoc (between, within) pair.
+    cell_vars <- intersect(
+      c(posthoc_factors$between, posthoc_factors$within), names(data))
+    if (length(cell_vars) == 0) {
+      cell_vars <- intersect(c("emotion", "offer_type", "reaction"), names(data))
+    }
+
+    # ---- (b) Empty-cell audit -------------------------------------------------
+    if (length(cell_vars) >= 1) {
+      n_subj_total <- dplyr::n_distinct(data$participant_id)
+      cell_audit <- data %>%
+        dplyr::group_by(across(all_of(cell_vars))) %>%
+        dplyr::summarise(N_trials = dplyr::n(),
+                         N_subjects_present = dplyr::n_distinct(participant_id),
+                         .groups = "drop") %>%
+        dplyr::mutate(
+          N_subjects_total   = n_subj_total,
+          N_subjects_empty   = n_subj_total - N_subjects_present,
+          Pct_subjects_empty = sprintf("%.1f%%", 100 * N_subjects_empty / n_subj_total))
+      dens <- data %>%
+        dplyr::group_by(across(all_of(cell_vars)), participant_id) %>%
+        dplyr::summarise(n_i = dplyr::n(), .groups = "drop_last") %>%
+        dplyr::summarise(Min_trials_per_subj = min(n_i),
+                         Median_trials_per_subj = median(n_i), .groups = "drop")
+      cell_audit <- dplyr::left_join(cell_audit, dens, by = cell_vars)
+      writeLines(
+        knitr::kable(beautify_labels(cell_audit), format = "markdown",
+          caption = sprintf("%s -- Empty-cell audit. N_subjects_empty = subjects contributing zero trials to that design cell (behavioral self-selection). Empty per-subject cells do not violate LMM assumptions but constrain the estimand to observed trials.",
+                            analysis_name)),
+        con = file.path(out_dir, "diagnostic_EmptyCell_Audit.md"))
+      progress_log(sprintf("[Diag] Empty-cell audit written (max empty subjects in any cell: %d/%d).",
+                           max(cell_audit$N_subjects_empty), n_subj_total), indent = 1)
+    }
+
+    # ---- (a) Residual & random-effect diagnostics (Gaussian / lme4 only) ------
+    if (model_family != "binomial" && inherits(FINAL_MODEL, "merMod")) {
+      res  <- as.numeric(residuals(FINAL_MODEL))
+      fitv <- as.numeric(fitted(FINAL_MODEL))
+      diag_df <- data.frame(.resid = res, .fitted = fitv)
+
+      # Residuals align with the model frame (rows of `data`) when no NA were
+      # dropped; guard before attaching design-cell factors.
+      aligned <- (length(res) == nrow(data) && length(cell_vars) >= 1)
+      if (aligned) for (v in cell_vars) diag_df[[v]] <- data[[v]]
+
+      # Numeric summary. With large N, Shapiro/KS over-reject; report skew /
+      # excess kurtosis magnitudes and the homoscedasticity SD ratio instead.
+      sk <- mean((res - mean(res))^3) / (sd(res)^3)
+      ku <- mean((res - mean(res))^4) / (sd(res)^4) - 3
+      sd_ratio <- NA_real_
+      if (aligned) {
+        sd_by_cell <- diag_df %>%
+          dplyr::group_by(across(all_of(cell_vars))) %>%
+          dplyr::summarise(Residual_SD = sd(.resid), N = dplyr::n(), .groups = "drop")
+        sd_ratio <- max(sd_by_cell$Residual_SD) / min(sd_by_cell$Residual_SD)
+        writeLines(
+          knitr::kable(beautify_labels(sd_by_cell), format = "markdown",
+            caption = sprintf("%s -- Residual SD by design cell (homoscedasticity; SD ratio < ~2 acceptable).",
+                              analysis_name)),
+          con = file.path(out_dir, "diagnostic_Residual_SD_by_cell.md"))
+      }
+      resid_summary <- data.frame(
+        Metric = c("Residual skewness", "Residual excess kurtosis",
+                   "Max/min residual-SD ratio across cells", "N residuals"),
+        Value  = c(sprintf("%.3f", sk), sprintf("%.3f", ku),
+                   ifelse(is.na(sd_ratio), "-", sprintf("%.2f", sd_ratio)),
+                   as.character(length(res))))
+      writeLines(
+        knitr::kable(resid_summary, format = "markdown",
+          caption = sprintf("%s -- Residual distribution summary. Large-N normality tests over-reject; judge normality from the Q-Q plot and skew/kurtosis (|skew| < ~1, |excess kurtosis| < ~2 is mild).",
+                            analysis_name)),
+        con = file.path(out_dir, "diagnostic_Residual_Summary.md"))
+
+      # Plots: Q-Q, residual-vs-fitted, and residual-by-within-factor.
+      p_qq <- ggplot(diag_df, aes(sample = .resid)) +
+        stat_qq(alpha = 0.3, size = 0.6) +
+        stat_qq_line(color = "#E64B35", linewidth = 0.8) +
+        labs(title = sprintf("Residual Q-Q: %s", analysis_name),
+             x = "Theoretical quantiles", y = "Residual quantiles")
+      p_rf <- ggplot(diag_df, aes(x = .fitted, y = .resid)) +
+        geom_point(alpha = 0.15, size = 0.5) +
+        geom_hline(yintercept = 0, color = "#E64B35", linewidth = 0.8) +
+        geom_smooth(method = "loess", se = FALSE, color = "#3C5488", linewidth = 0.8) +
+        labs(title = "Residuals vs fitted (homoscedasticity)",
+             x = sprintf("Fitted (%s)", outcome_var), y = "Residuals")
+      plots <- list(p_qq, p_rf)
+      wv <- posthoc_factors$within
+      if (aligned && !is.null(wv) && wv %in% names(diag_df)) {
+        p_grp <- ggplot(diag_df, aes(x = .data[[wv]], y = .resid, fill = .data[[wv]])) +
+          geom_violin(alpha = 0.5, color = NA) +
+          geom_boxplot(width = 0.15, outlier.size = 0.3, alpha = 0.85) +
+          labs(title = sprintf("Residuals by %s (equal-variance check)", wv),
+               x = wv, y = "Residuals") +
+          theme(legend.position = "none")
+        plots <- c(plots, list(p_grp))
+      }
+      combined <- gridExtra::arrangeGrob(grobs = plots, ncol = length(plots))
+      ggsave(file.path(out_dir, "diagnostic_Residuals.png"), combined,
+             width = 5 * length(plots), height = 4.2, dpi = 150)
+      ggsave(file.path(out_dir, "diagnostic_Residuals.pdf"), combined,
+             width = 5 * length(plots), height = 4.2)
+
+      # Random-effect normality: BLUP Q-Q per random term.
+      re <- tryCatch(lme4::ranef(FINAL_MODEL)$participant_id, error = function(e) NULL)
+      if (!is.null(re) && ncol(re) >= 1) {
+        re_long <- tidyr::pivot_longer(
+          tibble::rownames_to_column(re, "id"),
+          cols = -id, names_to = "term", values_to = "blup")
+        p_re <- ggplot(re_long, aes(sample = blup)) +
+          stat_qq(size = 0.8) + stat_qq_line(color = "#E64B35") +
+          facet_wrap(~ term, scales = "free") +
+          labs(title = sprintf("Random-effects Q-Q: %s", analysis_name),
+               x = "Theoretical quantiles", y = "BLUP quantiles")
+        ggsave(file.path(out_dir, "diagnostic_RandomEffects_QQ.png"), p_re,
+               width = 4.5 * ncol(re), height = 4, dpi = 150)
+      }
+      progress_log(sprintf("[Diag] Residual diagnostics written (skew=%.2f, kurt=%.2f, SD-ratio=%s).",
+                           sk, ku, ifelse(is.na(sd_ratio), "n/a", sprintf("%.2f", sd_ratio))),
+                   indent = 1)
+    }
+  }, error = function(e) {
+    progress_log(sprintf("[Diag] Diagnostic block failed (non-fatal): %s",
+                         conditionMessage(e)), indent = 1)
+  })
+
   # ---- Visualization removed in v1.6.
   # 
   # Rationale: Publication-quality figures are generated by the downstream
