@@ -1,0 +1,2855 @@
+---
+title: "Behavioral Statistical Analysis: E1 + E2 + Integrative (GLMM rejection, LMM logRT)"
+subtitle: "Single-file three-stage pipeline. Stages E1 and E2 run independent two-stratum analyses (main + unfair-only). Stage Integrative pools E1 and E2 with Experiment as a between-subjects factor for a 3-way interaction model. Bates 5-step random-structure selection (Matuschek et al., 2017). APA reporting: 95% CI on all estimates, partial eta-squared for omnibus LMM tests, odds ratios for GLMM, percent RT change for LMM."
+author: "Project Research Team"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+    theme: flatly
+    fig_width: 10
+    fig_height: 6
+---
+
+``` {r setup, include=FALSE}
+# ==============================================================================
+# 1. Global Configuration & Environment
+# ==============================================================================
+# Note: knitr defaults buffer chunk output until completion. For long-running
+# chunks (large GLMM fits, especially the Integrative 3-way binomial model),
+# we set R.options(progress = TRUE) and use flush.console() inside helpers
+# (see flush_progress() below). When running interactively in RStudio
+# (not via Knit), output is unbuffered automatically.
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  results = "markup"
+)
+options(scipen = 999, digits = 4)
+set.seed(2024)
+
+# Sum-to-zero contrasts: required for valid Type III ANOVA in the presence of
+# interactions, and for interpretable zero-correlation random-effect
+# parameterizations.
+# Reference: Schad, Vasishth, Hohenstein, & Kliegl (2020) on contrast coding.
+options(contrasts = c("contr.sum", "contr.poly"))
+
+# ------------------------------------------------------------------------------
+# Stage configuration (SINGLE SOURCE OF TRUTH for the for-loop)
+# ------------------------------------------------------------------------------
+# Three stages run sequentially. Each writes to its own subdirectory under
+# results/Behavior/. Schemas across stages:
+#   E1, E2:      single-experiment analyses (emotion x offer_type / x reaction).
+#   Integrative: pooled E1+E2 with Exp factor (3-way interaction model).
+#                Uses Subject_ID_Mega = paste0("E1", "_", id) or
+#                paste0("E2", "_", id) to ensure id uniqueness across
+#                experiments. E1 uses "Vp" prefix in raw ids; E2 uses "VP"
+#                prefix. Both are case-sensitive but the Mega prefix makes
+#                this irrelevant.
+stages_to_run <- c("E1", "E2", "Integrative")
+
+# Behavioral analyses to run within each stage. Each is a separate model fit.
+# Single-experiment stages (E1, E2):
+# - GLMM_rejection : reject_binary ~ emotion * offer_type, all valid trials
+# - LMM_RT_main    : logRT ~ emotion * offer_type, all valid trials
+# - LMM_RT_unfair  : logRT ~ emotion * reaction, unfair trials only
+#                    (HDDM-parallel: emotion modulation of accept-vs-reject
+#                    decision dynamics on unfair offers)
+# Integrative stage adds Exp as between-subjects factor on each model
+# (3-way interaction). Reaction is NOT a covariate in LMM_RT_main; that is
+# downstream of emotion x offer_type and conditioning on it would induce
+# collider bias (Rohrer, 2018, AMPPS).
+analyses_to_run <- c("GLMM_rejection", "LMM_RT_main", "LMM_RT_unfair")
+
+# Behavioral data filtering thresholds.
+rt_lower_ms <- 300
+rt_upper_ms <- 3000
+
+# Post-hoc gating: confirmatory simple-effect decomposition is triggered ONLY
+# when the omnibus interaction p < confirmatory_alpha. Effects with
+# confirmatory_alpha <= p < marginal_threshold are computed but written to
+# Supplementary/ rather than the main result tables. This separates
+# confirmatory from exploratory inference cleanly:
+#   Confirmatory (p < 0.05): main tables, reported in manuscript Results.
+#   Exploratory_Marginal (0.05 <= p < 0.10): supplementary tables, reported
+#     in supplementary materials only, never as confirmatory evidence.
+confirmatory_alpha <- 0.05
+marginal_threshold <- 0.10
+
+if(!require("pacman")) install.packages("pacman")
+pacman::p_load(
+  here, readr, readxl, dplyr, tidyr, stringr, tibble, purrr,  # Data wrangling
+  lme4, lmerTest, glmmTMB,                                     # Modeling
+  pbkrtest,                                                    # Kenward-Roger backend for lmerTest
+  car, parameters, performance,                                # Diagnostics
+  buildmer,                                                    # LRT-based structure search (LMM + GLMM via buildglmmTMB)
+  R.utils,                                                     # withTimeout for buildmer protection
+  emmeans, effectsize,                                         # Marginal means, effect sizes
+  sjPlot, sjmisc,                                              # tab_model, plot_model
+  ggplot2, ggpubr, gridExtra,                                  # Publication visualization
+  knitr, kableExtra,                                           # Markdown table rendering
+  openxlsx                                                     # Legacy Excel export
+)
+
+# Inferential strategy: cascading method preference for LMM (Satterthwaite ->
+# Kenward-Roger -> Wald); Wald-only for GLMM (Satterthwaite is mathematically
+# undefined for non-Gaussian likelihoods because the approximation requires a
+# residual variance term that does not exist in the binomial likelihood).
+# 
+# Empirical tests show Satterthwaite F-tests succeed in < 1 second on N > 20,000
+# trials with complex random structures, provided lmerTest.limit and
+# pbkrtest.limit are raised above the data size. Earlier pipeline versions 
+# silently fell back to Wald due to default limits being too low; this is fixed.
+# 
+# Kenward-Roger is added as a middle fallback because it uses a different
+# numerical implementation (pbkrtest::KRmodcomp) than Satterthwaite. When
+# Satterthwaite hits Hessian inversion failure on certain random structures
+# (e.g., (0 + offer_type | id) at the boundary), KR can still succeed.
+# Empirical Type I error rates from Luke (2017) show KR is the most
+# conservative of the three; it slightly under-powers vs Satterthwaite at
+# small N but is essentially identical at large N.
+# 
+# Post-hoc contrasts via emmeans use asymptotic (z-test) df for computational
+# stability on large datasets. At present DenDF magnitudes (DenDF >> 30),
+# z-tests differ from Satterthwaite-based t-tests by less than 1% (Luke, 2017).
+emmeans::emm_options(lmerTest.limit = 1e7, pbkrtest.limit = 1e7,
+                     lmer.df = "asymptotic")
+options(lmerTest.limit = 1e7)
+options(pbkrtest.limit = 1e7)
+
+# Buildmer timeout configuration. The Integrative stage fits a 3-way model on
+# pooled N ~30000 trials; its random structure can take significantly longer
+# to search than single-experiment models. We use a per-stage timeout map.
+buildmer_timeout_map <- list(
+  "E1"          = 1800,  # 30 min
+  "E2"          = 1800,  # 30 min
+  "Integrative" = 3600   # 60 min
+)
+
+# Output directory tree (one root, three stage-specific branches).
+out_root_base <- here("results", "Behavior")
+if (!dir.exists(out_root_base)) dir.create(out_root_base, recursive = TRUE)
+
+cat(sprintf("Behavioral pipeline initialized.\nStages: %s\nAnalyses (per stage): %s\nRT filter: %d-%d ms\nOutput root: %s\n",
+            paste(stages_to_run, collapse=", "),
+            paste(analyses_to_run, collapse=", "),
+            rt_lower_ms, rt_upper_ms, out_root_base))
+
+# Visual theme.
+theme_set(theme_bw(base_size = 14) +
+          theme(panel.grid.minor = element_blank(), legend.position = "top"))
+
+colors_emo <- c('neu'="#8491B4",'aff'="#91D1C2",'dis'="#E64B35",'dom'="#F39B7F",'enj'="#3C5488")
+labels_emo <- c('neu'='Neutral','aff'='Affiliative','dis'='Disgust','dom'='Dominance','enj'='Reward')
+colors_off <- c('fair'="#2E86AB",'unfair'="#A23B72")
+labels_off <- c('fair'='Fair', 'unfair'='Unfair')
+colors_rxn <- c('accept'="#3C5488", 'reject'="#E64B35")
+labels_rxn <- c('accept'='Accept', 'reject'='Reject')
+colors_exp <- c('E1'="#4DBBD5", 'E2'="#E64B35")
+labels_exp <- c('E1'='E1 (Sequential)', 'E2'='E2 (Simultaneous)')
+
+# Optimizers and modeling engines.
+# 
+# DESIGN: GLMM and LMM use different engines but both follow Bates 5-step + 
+# buildmer LRT simplification (Matuschek et al., 2017, alpha = 0.20).
+# 
+# LMM (Gaussian, lme4 + lmerTest):
+#   - bobyqa optimizer; closed-form likelihood -> lme4::lmer.
+#   - Step 3 simplification via buildmer::buildmer().
+# 
+# GLMM (binomial, glmmTMB):
+#   - glmmTMB engine (Brooks et al., 2017): Template Model Builder backend
+#     with autodiff, ~2-10x faster than lme4::glmer for binomial models.
+#   - Step 3 simplification via buildmer::buildglmmTMB().
+#   - emmeans, car::Anova, sjPlot::tab_model are all glmmTMB-compatible.
+# 
+# ENGINEERING: Both buildmer paths protected against deadlock via:
+#   (a) lmerTest temporarily detached during buildmer (prevents Satterthwaite
+#       Hessian inversion deadlock at large N);
+#   (b) R.utils::withTimeout per-stage timeout (see buildmer_timeout_map);
+#   (c) Fallback to ZCP model if buildmer times out or errors.
+custom_control_lmer  <- lmerControl(optimizer = "bobyqa",
+                                    optCtrl = list(maxfun = 200000),
+                                    calc.derivs = FALSE)
+custom_control_glmmTMB <- glmmTMB::glmmTMBControl(
+  optimizer = optim,
+  optArgs = list(method = "BFGS"),
+  parallel = 1
+)
+
+# Null-coalescing helper for safe attribute fallback.
+`%||%` <- function(a, b) if (is.null(a)) b else a
+
+# ------------------------------------------------------------------------------
+# Buildmer engineering helpers.
+# 
+# Two recurring failure modes for buildmer on large datasets:
+#   (1) lmerTest, when loaded, intercepts ALL anova() calls and forces
+#       Satterthwaite df computation. Inside buildmer's iterative LRT loop,
+#       this triggers Hessian inversions for every candidate model. On certain
+#       random structures (e.g., (0 + offer_type | id)) at large N (> 20K),
+#       these Hessian inversions hang indefinitely, manifesting as CPU 0%
+#       deadlock. SOLUTION: detach lmerTest before buildmer, reload after.
+#   (2) Even without lmerTest, buildmer can occasionally hang on a single
+#       optimization iteration. SOLUTION: wrap buildmer in withTimeout
+#       (R.utils package); on timeout, fall back to ZCP model.
+# ------------------------------------------------------------------------------
+
+# Safe lmerTest detach helper. Returns TRUE if lmerTest was attached and we
+# detached it (caller should reload after buildmer). Returns FALSE if it
+# wasn't attached.
+detach_lmerTest_safely <- function() {
+  if ("package:lmerTest" %in% search()) {
+    detach("package:lmerTest", unload = FALSE, character.only = FALSE)
+    return(TRUE)
+  }
+  FALSE
+}
+
+# Re-attach lmerTest (only if it was detached by us).
+reattach_lmerTest_safely <- function(was_detached) {
+  if (isTRUE(was_detached)) {
+    suppressMessages(library(lmerTest))
+  }
+  invisible(NULL)
+}
+
+# Wrap buildmer call in withTimeout; on timeout, return NULL so caller falls
+# back to ZCP. timeout_sec defaults to 1800 (30 minutes) but is overridden
+# per-stage via buildmer_timeout_map.
+run_buildmer_protected <- function(buildmer_fn, ..., timeout_sec = 1800) {
+  # IMPORTANT: R.utils::withTimeout interrupts R-level loops but cannot interrupt
+  # blocking C-level calls (e.g., the optimizer's inner loop). For deeply stuck
+  # buildmer iterations, you may still need to manually interrupt R (Ctrl+C / 
+  # ESC). Timeout offers protection against MOST stuck states (R loop hangs)
+  # but is not 100% guaranteed.
+  was_lmerTest <- detach_lmerTest_safely()
+  on.exit(reattach_lmerTest_safely(was_lmerTest), add = TRUE)
+  
+  result <- tryCatch({
+    R.utils::withTimeout({
+      buildmer_fn(...)
+    }, timeout = timeout_sec, onTimeout = "error")
+  }, TimeoutException = function(ex) {
+    progress_log(sprintf("[TIMEOUT] buildmer exceeded %d seconds; aborting.",
+                         timeout_sec), indent = 2)
+    NULL
+  }, error = function(e) {
+    if (grepl("reached.*time.*limit|timeout", conditionMessage(e), ignore.case = TRUE)) {
+      progress_log(sprintf("[TIMEOUT] buildmer exceeded %d seconds; aborting.",
+                           timeout_sec), indent = 2)
+      NULL
+    } else {
+      progress_log(sprintf("[WARN] buildmer error: %s", conditionMessage(e)),
+                   indent = 2)
+      NULL
+    }
+  })
+  
+  result
+}
+
+# ------------------------------------------------------------------------------
+# Progress reporting helpers.
+# ------------------------------------------------------------------------------
+flush_progress <- function() {
+  flush.console()
+  if (interactive()) Sys.sleep(0)
+}
+
+progress_log <- function(msg, indent = 0) {
+  prefix <- strrep("  ", indent)
+  cat(sprintf("%s%s\n", prefix, msg))
+  flush_progress()
+}
+
+format_elapsed <- function(t_start) {
+  secs <- as.numeric(Sys.time() - t_start, units = "secs")
+  if (secs < 60) sprintf("%.1fs", secs)
+  else if (secs < 3600) sprintf("%dm%02ds", floor(secs / 60), round(secs %% 60))
+  else sprintf("%dh%02dm", floor(secs / 3600), floor((secs %% 3600) / 60))
+}
+```
+
+``` {r apa-module}
+# ==============================================================================
+# 2. APA Formatting Helpers
+# ==============================================================================
+# These helpers convert raw model output (anova tables, emmeans contrasts,
+# parameters tables) into APA-style strings with consistent precision and
+# significance star annotation. All helpers handle both LMM (F/t) and GLMM
+# (chi-square/z) cases via column detection.
+
+# Universal type conversion, missing-value handling, and column purging.
+# CRITICAL: this function converts Inf and NaN to string placeholders BEFORE
+# openxlsx writes them to xlsx. Without this conversion, IEEE 754 special
+# values are emitted to Excel as numeric cells, which Excel renders as #NUM!
+# and blank cells respectively. Always call kill_scipen() on any data frame
+# that contains emmeans output (where df can be Inf or NaN under asymptotic
+# inference).
+kill_scipen <- function(df) {
+  df %>%
+    dplyr::mutate(across(where(is.factor), as.character)) %>%
+    dplyr::mutate(across(everything(), function(vec) {
+      if (is.numeric(vec)) {
+        # Trap Inf and NaN BEFORE the round() + format() pipeline. round(Inf)
+        # is Inf, format(Inf) is "Inf", but the column type would remain
+        # numeric and openxlsx would still emit it as Inf. Explicit string
+        # coercion is required.
+        vec <- ifelse(is.infinite(vec), "Inf",
+                      ifelse(is.nan(vec), "-",
+                             format(round(vec, 4), scientific = FALSE, trim = TRUE)))
+      }
+      vec <- ifelse(is.na(vec) | vec == "NA" | vec == "NaN", "-", as.character(vec))
+      vec
+    })) %>%
+    dplyr::select(where(~ !all(. == "-")))
+}
+
+# APA significance star generator.
+add_sig_stars <- function(p) {
+  dplyr::case_when(
+    is.na(p)  ~ "-",
+    p < 0.001 ~ "***",
+    p < 0.01  ~ "**",
+    p < 0.05  ~ "*",
+    p < 0.1   ~ ".",
+    TRUE      ~ "ns"
+  )
+}
+
+# Map sum-coding suffixes back to interpretable factor-level labels.
+# Includes Experiment factor for Integrative stage.
+beautify_labels <- function(df) {
+  dict <- c(
+    "\\bemotion1\\b"    = "emotion[neu-grand]",
+    "\\bemotion2\\b"    = "emotion[aff-grand]",
+    "\\bemotion3\\b"    = "emotion[dis-grand]",
+    "\\bemotion4\\b"    = "emotion[dom-grand]",
+    "\\bemotion5\\b"    = "emotion[enj-grand]",
+    "\\boffer_type1\\b" = "offer_type[fair-grand]",
+    "\\breaction1\\b"   = "reaction[accept-grand]",
+    "\\bExp1\\b"        = "Exp[E1-grand]"
+  )
+  df %>% dplyr::mutate(across(where(is.character),
+                              ~ stringr::str_replace_all(., dict)))
+}
+
+# Format ANOVA table to APA strings. Handles both F-tests (lmerTest::anova) and
+# chi-square tests (car::Anova) seamlessly.
+#
+# For LMM F-tests: appends partial eta-squared with 95% CI from
+# effectsize::eta_squared(). For GLMM Wald chi-square tests: partial
+# eta-squared is not directly defined; effect size on the appropriate scale
+# (odds ratio) is reported in the post-hoc contrasts table instead.
+format_anova_apa <- function(anova_obj, model = NULL) {
+  df_res <- as.data.frame(anova_obj) %>%
+    tibble::rownames_to_column("Effect")
+  
+  get_col <- function(col_name) {
+    if (col_name %in% names(df_res)) df_res[[col_name]] else rep(NA, nrow(df_res))
+  }
+  
+  df_res <- df_res %>%
+    dplyr::mutate(
+      F_val  = get_col("F value"),
+      NumDF  = get_col("NumDF"),
+      DenDF  = get_col("DenDF"),
+      Df_val = get_col("Df"),
+      Chisq  = get_col("Chisq"),
+      p_val  = dplyr::case_when(
+        !is.na(get_col("Pr(>F)"))     ~ get_col("Pr(>F)"),
+        !is.na(get_col("Pr(>Chisq)")) ~ get_col("Pr(>Chisq)"),
+        TRUE ~ NA_real_
+      ),
+      Sig = add_sig_stars(p_val),
+      p_str = dplyr::case_when(
+        is.na(p_val)  ~ "-",
+        p_val < .001  ~ "< .001",
+        TRUE          ~ paste0("= ", format(round(p_val, 3), scientific = FALSE, trim = TRUE))
+      ),
+      APA_Report = dplyr::case_when(
+        !is.na(F_val) & !is.na(NumDF) & !is.na(DenDF) ~
+          sprintf("F(%s, %.2f) = %.2f, p %s", NumDF, DenDF, F_val, p_str),
+        !is.na(F_val) & !is.na(NumDF) ~
+          sprintf("F(%s) = %.2f, p %s", NumDF, F_val, p_str),
+        !is.na(Chisq) & !is.na(Df_val) ~
+          sprintf("\u03C7\u00B2(%s) = %.2f, p %s", Df_val, Chisq, p_str),
+        TRUE ~ "[stat unrecognized]"
+      )
+    )
+  
+  # Partial eta-squared with 95% CI: only for LMM F-tests (Gaussian).
+  # For GLMM chi-square, eta-squared is not directly defined; we leave the
+  # column NA and rely on odds ratios in the post-hoc table for effect size.
+  has_F <- "F value" %in% names(as.data.frame(anova_obj))
+  
+  eta2_df <- NULL
+  if (has_F) {
+    eta2_df <- tryCatch({
+      es <- effectsize::eta_squared(anova_obj, partial = TRUE, ci = 0.95,
+                                    alternative = "two.sided",
+                                    verbose = FALSE)
+      data.frame(
+        Effect = as.character(es$Parameter),
+        eta2_partial = es$Eta2_partial,
+        eta2_CI_low  = es$CI_low,
+        eta2_CI_high = es$CI_high,
+        stringsAsFactors = FALSE
+      )
+    }, error = function(e) {
+      progress_log(sprintf("[ANOVA] eta-squared computation failed: %s",
+                           conditionMessage(e)), indent = 2)
+      NULL
+    })
+  }
+  
+  if (!is.null(eta2_df)) {
+    df_res <- df_res %>%
+      dplyr::left_join(eta2_df, by = "Effect") %>%
+      dplyr::mutate(
+        eta2_str = dplyr::case_when(
+          is.na(eta2_partial) ~ "-",
+          TRUE ~ sprintf("%.3f [%.3f, %.3f]",
+                         eta2_partial, eta2_CI_low, eta2_CI_high)
+        )
+      )
+  } else {
+    df_res$eta2_str <- "-"
+  }
+  
+  df_res <- df_res %>%
+    dplyr::select(Effect, APA_Report, eta2_partial_95CI = eta2_str, Sig, p_val)
+  beautify_labels(df_res)
+}
+
+# Format post-hoc emmeans output. Switches to z-statistic notation when df is
+# infinite (asymptotic / GLMM cases).
+#
+# Reporting upgrades:
+# - 95% CI on the estimate (always).
+# - Odds ratio with 95% CI (when input is on logit scale, i.e. GLMM contrasts).
+# - Percent RT change (when scale_hint == "logRT", i.e. LMM logRT contrasts).
+#
+# scale_hint argument:
+#   "auto"   - auto-detect from estimate column name (default)
+#   "logit"  - GLMM logit-scale estimates; compute odds ratios
+#   "logRT"  - LMM log-RT estimates; compute percent RT change
+#   "raw"    - report estimate as-is, no transformation
+format_posthoc_apa <- function(emm_df, scale_hint = "auto") {
+  df_clean <- as.data.frame(emm_df)
+  
+  est_col <- intersect(names(df_clean),
+                       c("estimate", "emmean", "response", "odds.ratio"))
+  if (length(est_col) == 0) {
+    trend_col <- grep("\\.trend$", names(df_clean), value = TRUE)
+    est_col <- if (length(trend_col) > 0) trend_col[1] else names(df_clean)[2]
+  } else {
+    est_col <- est_col[1]
+  }
+  
+  # Auto-detect scale.
+  if (scale_hint == "auto") {
+    if (est_col == "odds.ratio") {
+      scale_hint <- "odds_ratio_input"
+    } else {
+      scale_hint <- "raw"
+    }
+  }
+  
+  # Confidence intervals: emmeans output should already include lower.CL /
+  # upper.CL when summary(infer = c(TRUE, TRUE)) was used. If absent, compute
+  # from estimate +/- 1.96 * SE (Wald-based, asymptotic).
+  has_ci <- all(c("lower.CL", "upper.CL") %in% names(df_clean))
+  if (!has_ci) {
+    df_clean$lower.CL <- df_clean[[est_col]] - 1.96 * df_clean$SE
+    df_clean$upper.CL <- df_clean[[est_col]] + 1.96 * df_clean$SE
+  }
+  
+  df_clean <- df_clean %>%
+    dplyr::mutate(
+      Sig = add_sig_stars(p.value),
+      p_str = dplyr::case_when(
+        p.value < .001 ~ "< .001",
+        TRUE ~ paste0("= ", format(round(p.value, 3), scientific = FALSE, trim = TRUE))
+      ),
+      CI_str = sprintf("[%.3f, %.3f]", lower.CL, upper.CL)
+    )
+  
+  if ("t.ratio" %in% names(df_clean)) {
+    df_clean <- df_clean %>% dplyr::mutate(
+      Stats_String = ifelse(
+        is.infinite(df),
+        sprintf("b = %.2f (SE = %.2f), 95%% CI %s, z = %.2f, p %s",
+                .data[[est_col]], SE, CI_str, t.ratio, p_str),
+        sprintf("b = %.2f (SE = %.2f), 95%% CI %s, t(%.2f) = %.2f, p %s",
+                .data[[est_col]], SE, CI_str, df, t.ratio, p_str)
+      )
+    )
+  } else if ("z.ratio" %in% names(df_clean)) {
+    df_clean <- df_clean %>% dplyr::mutate(
+      Stats_String = sprintf("b = %.2f (SE = %.2f), 95%% CI %s, z = %.2f, p %s",
+                             .data[[est_col]], SE, CI_str, z.ratio, p_str)
+    )
+  } else {
+    df_clean <- df_clean %>% dplyr::mutate(
+      Stats_String = sprintf("b = %.2f (SE = %.2f), 95%% CI %s, p %s",
+                             .data[[est_col]], SE, CI_str, p_str)
+    )
+  }
+  
+  # Scale-specific effect size additions.
+  if (scale_hint == "logit") {
+    # GLMM logit-scale contrasts: append OR with 95% CI.
+    # Adaptive precision: standard %.2f formatting collapses extreme ORs
+    # (e.g. OR = 0.0019 with strong fair/unfair effect rounds to "0.00",
+    # erasing the actual effect magnitude). When |log10(OR)| > 1.5 (i.e.
+    # OR < ~0.03 or OR > ~30), switch to %.4f precision so readers can see
+    # the effect.
+    df_clean <- df_clean %>% dplyr::mutate(
+      OR          = exp(.data[[est_col]]),
+      OR_CI_low   = exp(lower.CL),
+      OR_CI_high  = exp(upper.CL),
+      OR_String   = mapply(function(or_val, lo, hi) {
+        magnitude <- max(abs(log10(or_val)), abs(log10(lo)), abs(log10(hi)),
+                         na.rm = TRUE)
+        if (is.finite(magnitude) && magnitude > 1.5) {
+          sprintf("OR = %.4f, 95%% CI [%.4f, %.4f]", or_val, lo, hi)
+        } else {
+          sprintf("OR = %.2f, 95%% CI [%.2f, %.2f]", or_val, lo, hi)
+        }
+      }, OR, OR_CI_low, OR_CI_high)
+    )
+  } else if (scale_hint == "logRT") {
+    # LMM log-RT contrasts: append percent RT change.
+    # b on log scale -> percent change in raw RT = (exp(b) - 1) * 100
+    df_clean <- df_clean %>% dplyr::mutate(
+      PctChange       = (exp(.data[[est_col]]) - 1) * 100,
+      PctChange_low   = (exp(lower.CL) - 1) * 100,
+      PctChange_high  = (exp(upper.CL) - 1) * 100,
+      PctChange_String = sprintf("RT change = %+.2f%%, 95%% CI [%+.2f%%, %+.2f%%]",
+                                  PctChange, PctChange_low, PctChange_high)
+    )
+  } else if (scale_hint == "odds_ratio_input") {
+    # emmeans was called with type = "response" on a logit model;
+    # the est_col is already odds.ratio. CI columns already exist.
+    df_clean <- df_clean %>% dplyr::mutate(
+      OR_String = sprintf("OR = %.2f, 95%% CI %s", .data[[est_col]], CI_str)
+    )
+  }
+  
+  df_clean <- df_clean %>%
+    dplyr::select(-p_str) %>%
+    dplyr::relocate(Sig, .after = Stats_String)
+  # CRITICAL: run kill_scipen here so Inf and NaN in df (from asymptotic
+  # emmeans) become string placeholders before openxlsx serialization.
+  kill_scipen(beautify_labels(df_clean))
+}
+
+# Extract fixed-effect coefficients with safe fallback.
+format_coefs <- function(model) {
+  tryCatch({
+    coefs <- as.data.frame(parameters::parameters(model, effects = "fixed"))
+    coefs %>% beautify_labels() %>% kill_scipen()
+  }, error = function(e) {
+    as.data.frame(summary(model)$coefficients) %>%
+      tibble::rownames_to_column("Predictor") %>%
+      beautify_labels() %>% kill_scipen()
+  })
+}
+
+# Cell-level descriptive statistics for the manuscript Table 1.
+#
+# Outputs per group_vars cell:
+#   N_subjects, N_trials, rejection_rate, mean_RT, SD_RT, median_RT, IQR_RT
+# group_vars can include any combination of emotion / offer_type / reaction /
+# Exp (the last only in Integrative).
+format_descriptives_table <- function(df, group_vars = c("emotion", "offer_type")) {
+  # Coerce to character to ensure stable group order.
+  group_vars <- intersect(group_vars, names(df))
+  if (length(group_vars) == 0) {
+    return(data.frame(Note = "No grouping variables found in data."))
+  }
+  
+  desc <- df %>%
+    dplyr::group_by(across(all_of(group_vars))) %>%
+    dplyr::summarise(
+      N_subjects     = dplyr::n_distinct(participant_id_internal),
+      N_trials       = dplyr::n(),
+      Rejection_rate = mean(reject_binary, na.rm = TRUE),
+      Mean_RT_ms     = mean(RT, na.rm = TRUE),
+      SD_RT_ms       = sd(RT, na.rm = TRUE),
+      Median_RT_ms   = median(RT, na.rm = TRUE),
+      IQR_RT_ms      = IQR(RT, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    dplyr::mutate(
+      Rejection_rate = sprintf("%.3f", Rejection_rate),
+      Mean_RT_ms     = sprintf("%.0f", Mean_RT_ms),
+      SD_RT_ms       = sprintf("%.0f", SD_RT_ms),
+      Median_RT_ms   = sprintf("%.0f", Median_RT_ms),
+      IQR_RT_ms      = sprintf("%.0f", IQR_RT_ms)
+    )
+  
+  beautify_labels(desc)
+}
+
+# Engine-agnostic pseudo R-squared extractor (Nakagawa-Schielzeth 2013).
+# Returns a single-row data frame with R2_marginal and R2_conditional.
+# When performance::r2 fails (e.g., 3-way GLMM with complex random structure),
+# returns a placeholder row with NAs and a note.
+extract_r2_table <- function(model, analysis_name) {
+  r2_obj <- tryCatch(performance::r2(model), error = function(e) NULL)
+  if (is.null(r2_obj)) {
+    return(data.frame(
+      Analysis = analysis_name,
+      R2_marginal    = NA_real_,
+      R2_conditional = NA_real_,
+      Note = "performance::r2 failed; consider MuMIn::r.squaredGLMM as alternative."
+    ))
+  }
+  data.frame(
+    Analysis = analysis_name,
+    R2_marginal    = r2_obj$R2_marginal %||% NA_real_,
+    R2_conditional = r2_obj$R2_conditional %||% NA_real_,
+    Note = "Nakagawa-Schielzeth (2013) marginal=fixed-only, conditional=fixed+random."
+  )
+}
+```
+
+``` {r prep-functions}
+# ==============================================================================
+# 3. Data Loading & Cleaning
+# ==============================================================================
+# Two loaders:
+#   load_single_experiment(path, exp_label): for E1/E2 stages.
+#   load_integrative(path_E1, path_E2): for Integrative stage; concatenates
+#     after applying uniqueness prefix to participant ids.
+#
+# Both loaders apply identical filters in identical order:
+#   1. Offers_Other in {5, 6, 8, 9}: standard fair/unfair offer pairs.
+#      Filler 7 (medium fairness) is excluded.
+#   2. reaction != 0: excludes timeout / no-response trials.
+#   3. RT in [rt_lower_ms, rt_upper_ms]: excludes premature responses and
+#      response-window-exceeding trials.
+#
+# Generated columns (both loaders):
+#   offer_type:    factor("fair", "unfair") from Offers_Other.
+#   emotion:       factor with levels c("neu","aff","dis","dom","enj").
+#   reaction:      factor("accept", "reject") -- recoded from 1=accept, 2=reject.
+#   reject_binary: numeric 0/1 for GLMM outcome (reject=1).
+#   logRT:         log(RT) for LMM (variance-stabilizing for skewed RT).
+#   participant_id_internal:  for single-exp stages, this equals participant_id
+#                  after standardization. For Integrative, this is the unique
+#                  Subject_ID_Mega ("E1_Vp0001", "E2_VP0000", ...). All
+#                  downstream code uses participant_id_internal as the random
+#                  grouping variable so Bates 5-step, emmeans, descriptives,
+#                  and rePCA all work identically across stages.
+
+# Standardize raw participant ids to a canonical 4-digit numeric form within
+# a single experiment. E1 uses "Vp0001" naming, E2 uses "VP0000" naming
+# (case differs); both reduce to the same 4-digit number via str_extract.
+# For Integrative stage, this canonical form is prefixed with the experiment
+# label to ensure cross-experiment uniqueness.
+standardize_id_within_exp <- function(ids) {
+  sprintf("Vp%04d", as.numeric(stringr::str_extract(ids, "\\d+")))
+}
+
+# Common cleaning step shared between single-exp and Integrative loaders.
+# Operates on a data frame that already has the canonical participant_id_internal
+# column. Returns a tibble ready for modeling.
+clean_and_filter <- function(df, label_for_log = "") {
+  required_cols <- c("participant_id_internal", "Offers_Other", "emotion",
+                     "reaction", "RT", "index")
+  missing_cols <- setdiff(required_cols, names(df))
+  if (length(missing_cols) > 0) {
+    stop(sprintf("Required columns missing in %s: %s",
+                 label_for_log, paste(missing_cols, collapse = ", ")))
+  }
+  
+  n_orig <- nrow(df)
+  
+  # Filter 1: standard fair/unfair offers only.
+  df <- df %>% dplyr::filter(Offers_Other %in% c(5, 6, 8, 9))
+  cat(sprintf("[%s] Filter Offers_Other in {5,6,8,9}: %d -> %d trials (%.1f%% kept)\n",
+              label_for_log, n_orig, nrow(df), 100 * nrow(df) / n_orig))
+  
+  # Filter 2: exclude reaction = 0 (timeout / missing).
+  n_pre <- nrow(df)
+  df <- df %>% dplyr::filter(reaction != 0)
+  cat(sprintf("[%s] Filter reaction != 0: %d -> %d trials (%d removed)\n",
+              label_for_log, n_pre, nrow(df), n_pre - nrow(df)))
+  
+  # Filter 3: RT range.
+  n_pre <- nrow(df)
+  df <- df %>% dplyr::filter(RT >= rt_lower_ms, RT <= rt_upper_ms)
+  cat(sprintf("[%s] Filter RT in [%d, %d] ms: %d -> %d trials (%d removed)\n",
+              label_for_log, rt_lower_ms, rt_upper_ms, n_pre, nrow(df),
+              n_pre - nrow(df)))
+  
+  # Construct factors and outcome variables.
+  df <- df %>%
+    dplyr::mutate(
+      offer_type = factor(
+        dplyr::case_when(
+          Offers_Other %in% c(5, 6) ~ "fair",
+          Offers_Other %in% c(8, 9) ~ "unfair"
+        ),
+        levels = c("fair", "unfair")
+      ),
+      emotion = factor(emotion, levels = c("neu", "aff", "dis", "dom", "enj")),
+      reaction = factor(
+        dplyr::case_when(
+          reaction == 1 ~ "accept",
+          reaction == 2 ~ "reject"
+        ),
+        levels = c("accept", "reject")
+      ),
+      reject_binary = ifelse(reaction == "reject", 1, 0),
+      # Log-RT for LMM. Avoids assumption of Gaussian RT and stabilizes
+      # variance for the typical RT skew distribution (cf. Lo & Andrews, 2015).
+      logRT = log(RT)
+    )
+  
+  cat(sprintf("[%s] Final: %d trials, %d subjects.\n",
+              label_for_log, nrow(df),
+              dplyr::n_distinct(df$participant_id_internal)))
+  
+  # Sanity check: print accept/reject distribution by offer_type.
+  cat(sprintf("[%s] Distribution reaction x offer_type:\n", label_for_log))
+  print(table(df$reaction, df$offer_type))
+  
+  df
+}
+
+# Single-experiment loader. Standardizes id within experiment but does not
+# prefix with Exp label (single-exp analyses do not need cross-exp uniqueness).
+# Returns a tibble with participant_id_internal = standardized id.
+load_single_experiment <- function(path_trials, exp_label) {
+  if (!file.exists(path_trials)) {
+    stop(sprintf("Data file missing for %s: %s", exp_label, path_trials))
+  }
+  
+  df <- readr::read_csv(path_trials, show_col_types = FALSE)
+  cat(sprintf("[Load %s] Raw N = %d trials, %d subjects (raw ids).\n",
+              exp_label, nrow(df), dplyr::n_distinct(df$participant_id)))
+  
+  # Standardize ids within experiment. For single-exp stages, the internal id
+  # equals the standardized form (e.g., "Vp0001" for both E1 and E2 raw inputs
+  # which differ in case).
+  df$participant_id_internal <- standardize_id_within_exp(df$participant_id)
+  
+  clean_and_filter(df, label_for_log = exp_label)
+}
+
+# Integrative loader. Loads E1 and E2 separately, applies cross-experiment
+# uniqueness prefix to participant ids, then concatenates. Adds Exp column.
+# Uniqueness rationale: although E1 raw ids ("Vp0001") and E2 raw ids
+# ("VP0001") differ in case, downstream as.factor would silently treat them
+# as different levels which could be confusing. More importantly, after
+# standardize_id_within_exp both become "Vp0001" which is the EXACT scenario
+# we must avoid. The prefix "<Exp>_" makes the resulting id strings unique
+# regardless of any case-folding behavior anywhere downstream.
+load_integrative <- function(path_E1, path_E2) {
+  if (!file.exists(path_E1)) stop(sprintf("E1 data missing: %s", path_E1))
+  if (!file.exists(path_E2)) stop(sprintf("E2 data missing: %s", path_E2))
+  
+  load_one <- function(path, label) {
+    d <- readr::read_csv(path, show_col_types = FALSE)
+    cat(sprintf("[Load Integrative/%s] Raw N = %d trials, %d subjects.\n",
+                label, nrow(d), dplyr::n_distinct(d$participant_id)))
+    d$participant_id_internal <- paste0(label, "_",
+                                         standardize_id_within_exp(d$participant_id))
+    d$Exp <- label
+    d
+  }
+  
+  df_e1 <- load_one(path_E1, "E1")
+  df_e2 <- load_one(path_E2, "E2")
+  
+  # Schema verification: emotion / reaction / Offers_Other levels must match
+  # across experiments. If they diverge silently, downstream factor levels
+  # could be inconsistent and Type III ANOVA contrasts would mis-interpret.
+  emo_e1 <- sort(unique(df_e1$emotion))
+  emo_e2 <- sort(unique(df_e2$emotion))
+  if (!identical(emo_e1, emo_e2)) {
+    stop(sprintf("emotion levels differ between E1 and E2:\nE1: %s\nE2: %s",
+                 paste(emo_e1, collapse=","), paste(emo_e2, collapse=",")))
+  }
+  rxn_e1 <- sort(unique(df_e1$reaction))
+  rxn_e2 <- sort(unique(df_e2$reaction))
+  if (!identical(rxn_e1, rxn_e2)) {
+    stop(sprintf("reaction levels differ between E1 and E2:\nE1: %s\nE2: %s",
+                 paste(rxn_e1, collapse=","), paste(rxn_e2, collapse=",")))
+  }
+  off_e1 <- sort(unique(df_e1$Offers_Other))
+  off_e2 <- sort(unique(df_e2$Offers_Other))
+  if (!identical(off_e1, off_e2)) {
+    stop(sprintf("Offers_Other levels differ between E1 and E2:\nE1: %s\nE2: %s",
+                 paste(off_e1, collapse=","), paste(off_e2, collapse=",")))
+  }
+  cat("[Integrative] Schema verification passed: emotion, reaction, Offers_Other levels match across E1 and E2.\n")
+  
+  # Combine. Use bind_rows; column union semantics handle the N170 column
+  # which exists only in E2 (it becomes NA for E1 rows but is unused for
+  # behavioral analyses).
+  df_combined <- dplyr::bind_rows(df_e1, df_e2)
+  
+  cat(sprintf("[Integrative] Combined raw: %d trials, %d unique subjects.\n",
+              nrow(df_combined),
+              dplyr::n_distinct(df_combined$participant_id_internal)))
+  
+  # Set Exp as factor (between-subjects).
+  df_combined$Exp <- factor(df_combined$Exp, levels = c("E1", "E2"))
+  
+  clean_and_filter(df_combined, label_for_log = "Integrative")
+}
+
+check_uniqueness <- function(df, context_name) {
+  if (nrow(df) != dplyr::n_distinct(dplyr::select(df, participant_id_internal, index))) {
+    stop(sprintf("CRITICAL: duplicate (participant_id_internal, index) keys in %s.", context_name))
+  }
+}
+```
+
+``` {r bates-engine}
+# ==============================================================================
+# 4. Bates 5-step random-structure selection
+# ==============================================================================
+#
+# Generalizes the original two-factor engine to accept an arbitrary set of
+# within-subject random-slope candidates. This is necessary because:
+#   E1/E2 GLMM_rejection / LMM_RT_main: random_max_vars = c("emotion", "offer_type")
+#   E1/E2 LMM_RT_unfair:                random_max_vars = c("emotion", "reaction")
+#   Integrative GLMM_rejection / LMM_RT_main: same as single-exp (Exp is
+#                                              between-subjects, NOT in random)
+#   Integrative LMM_RT_unfair:          random_max_vars = c("emotion", "reaction")
+#
+# CRITICAL: Exp is between-subjects in Integrative stage. Each subject has
+# exactly one Exp value, so a random slope (0 + Exp | participant_id_internal)
+# is mathematically unidentifiable and must NOT appear in random_max_vars.
+#
+# Random-effect grouping uses participant_id_internal throughout (the
+# stage-appropriate uniquified id). This is set by the loader functions.
+#
+# RANDOM-EFFECT STRUCTURE (Bates 2015 / Matuschek 2017):
+#   Step 1: Maximal model (1 + <random_max_vars sum> | participant_id_internal)
+#           Interaction random slope omitted by design (typically unidentifiable
+#           with N_subjects ~30-60 in single-trial data).
+#   Step 2: Zero-correlation-parameter (ZCP) model
+#   Step 3: LRT-based backward elimination (alpha = 0.20, Matuschek et al. 2017)
+#   Step 4: Re-test correlation parameters on surviving slopes
+#   Step 5: rePCA dimensionality diagnostic
+# ==============================================================================
+
+# Helper: parse a fitted model's formula to identify which random slopes
+# survived Step 3.
+extract_surviving_slopes <- function(model) {
+  re_terms <- lme4::findbars(formula(model))
+  surviving <- character(0)
+  for (term in re_terms) {
+    rhs <- deparse(term[[2]])
+    rhs <- gsub("^\\s*0\\s*\\+\\s*", "", rhs)
+    rhs <- gsub("^\\s*1\\s*\\+\\s*", "", rhs)
+    rhs <- gsub("^\\s*1\\s*$",       "", rhs)
+    rhs <- trimws(rhs)
+    if (rhs == "" || rhs == "1") next
+    parts <- trimws(strsplit(rhs, "\\+")[[1]])
+    surviving <- c(surviving, parts)
+  }
+  unique(surviving)
+}
+
+# rePCA dimensionality summary as tidy data frame. Uses the model's actual
+# random grouping name; pass group_name explicitly.
+extract_repca_summary <- function(model, group_name = "participant_id_internal") {
+  empty_df <- data.frame(component = NA_integer_, sd = NA_real_,
+                         proportion_variance = NA_real_,
+                         cumulative_variance = NA_real_)
+  
+  if (inherits(model, "merMod")) {
+    pca_obj <- tryCatch(lme4::rePCA(model), error = function(e) NULL)
+    if (is.null(pca_obj)) return(empty_df)
+    # rePCA returns a list named by grouping factor. If the expected name is
+    # not present, fall back to the first available grouping.
+    if (!group_name %in% names(pca_obj)) {
+      if (length(pca_obj) >= 1) {
+        group_name <- names(pca_obj)[1]
+      } else {
+        return(empty_df)
+      }
+    }
+    imp <- summary(pca_obj[[group_name]])$importance
+    return(data.frame(
+      component = seq_len(ncol(imp)),
+      sd = imp["Standard deviation", ],
+      proportion_variance = imp["Proportion of Variance", ],
+      cumulative_variance = imp["Cumulative Proportion", ]
+    ))
+  }
+  
+  if (inherits(model, "glmmTMB")) {
+    # glmmTMB path: extract VarCorr -> compute SVD on combined cov matrix.
+    vc_list <- VarCorr(model)$cond
+    if (is.null(vc_list)) return(empty_df)
+    
+    relevant <- vc_list[names(vc_list) == group_name |
+                        grepl(paste0("^", group_name), names(vc_list))]
+    if (length(relevant) == 0) {
+      relevant <- vc_list
+    }
+    
+    cov_mats <- lapply(relevant, function(x) as.matrix(x))
+    total_dim <- sum(sapply(cov_mats, function(x) nrow(x)))
+    big_cov <- matrix(0, total_dim, total_dim)
+    pos <- 0
+    for (m in cov_mats) {
+      d <- nrow(m)
+      big_cov[(pos + 1):(pos + d), (pos + 1):(pos + d)] <- m
+      pos <- pos + d
+    }
+    
+    sv <- tryCatch(svd(big_cov)$d, error = function(e) NULL)
+    if (is.null(sv) || length(sv) == 0) return(empty_df)
+    
+    sv <- pmax(sv, 0)
+    sds <- sqrt(sv)
+    if (sum(sv) <= 0) return(empty_df)
+    prop <- sv / sum(sv)
+    cum_prop <- cumsum(prop)
+    
+    return(data.frame(
+      component = seq_along(sds),
+      sd = sds,
+      proportion_variance = prop,
+      cumulative_variance = cum_prop
+    ))
+  }
+  
+  empty_df
+}
+
+count_effective_dims <- function(repca_df, threshold = 0.999) {
+  if (all(is.na(repca_df$cumulative_variance))) return(NA_integer_)
+  hit <- which(repca_df$cumulative_variance >= threshold)
+  if (length(hit) == 0) nrow(repca_df) else hit[1]
+}
+
+# Step 4 helper: enumerate candidate correlated structures.
+# Generalized to accept arbitrary random grouping variable name.
+add_correlations_step4 <- function(model_zcp_reduced, fixed_str, data,
+                                   group_name = "participant_id_internal",
+                                   model_family = "gaussian", alpha_lrt = 0.20) {
+  if (!inherits(model_zcp_reduced, c("merMod", "glmmTMB"))) {
+    progress_log("[Step 4] Reduced model is not a mixed model; skipping correlation tests.",
+                 indent = 1)
+    return(model_zcp_reduced)
+  }
+  
+  surviving <- extract_surviving_slopes(model_zcp_reduced)
+  
+  if (length(surviving) == 0) {
+    progress_log("[Step 4] Reduced model has only random intercept; no correlations to test.",
+                 indent = 1)
+    # SAFETY: explicit refit to clear buildmer's @call data placeholder.
+    f_int_only <- formula(model_zcp_reduced)
+    m_int_only <- if (model_family == "binomial") {
+      glmmTMB::glmmTMB(f_int_only, data = data,
+                       family = binomial(link = "logit"),
+                       control = custom_control_glmmTMB,
+                       REML = FALSE)
+    } else {
+      lme4::lmer(f_int_only, data = data, REML = TRUE,
+                 control = custom_control_lmer)
+    }
+    attr(m_int_only, "step4_selected") <- "RandomIntercept_only"
+    return(m_int_only)
+  }
+  
+  candidates <- list()
+  candidates[["ZCP_reference"]] <- formula(model_zcp_reduced)
+  
+  all_str <- paste(surviving, collapse = " + ")
+  candidates[["All_correlated"]] <- as.formula(
+    paste(fixed_str, "+ (1 +", all_str, "|", group_name, ")")
+  )
+  
+  if (length(surviving) > 1) {
+    for (i in seq_along(surviving)) {
+      others <- setdiff(surviving, surviving[i])
+      if (length(others) > 0) {
+        others_terms <- paste(
+          sprintf("(0 + %s | %s)", others, group_name),
+          collapse = " + "
+        )
+        cand_str <- paste(fixed_str,
+                          sprintf("+ (1 + %s | %s)", surviving[i], group_name),
+                          "+", others_terms)
+      } else {
+        cand_str <- paste(fixed_str,
+                          sprintf("+ (1 + %s | %s)", surviving[i], group_name))
+      }
+      candidates[[paste0("Int_with_", surviving[i])]] <- as.formula(cand_str)
+    }
+  }
+  
+  total_cands <- length(candidates)
+  progress_log(sprintf("[Step 4] Fitting %d candidate correlated structures (%s)...",
+                       total_cands, model_family), indent = 1)
+  
+  fits <- list()
+  cand_idx <- 0
+  for (nm in names(candidates)) {
+    cand_idx <- cand_idx + 1
+    progress_log(sprintf("[Step 4 %d/%d] Trying '%s'...",
+                         cand_idx, total_cands, nm), indent = 2)
+    t_cand <- Sys.time()
+    
+    fit <- tryCatch({
+      if (model_family == "binomial") {
+        glmmTMB::glmmTMB(candidates[[nm]], data = data,
+                         family = binomial(link = "logit"),
+                         control = custom_control_glmmTMB,
+                         REML = FALSE)
+      } else {
+        lme4::lmer(candidates[[nm]], data = data, REML = FALSE,
+                   control = custom_control_lmer)
+      }
+    }, error = function(e) NULL)
+    
+    is_singular_check <- function(m) {
+      if (inherits(m, "glmmTMB")) {
+        vc <- VarCorr(m)$cond
+        if (is.null(vc)) return(FALSE)
+        vars <- unlist(lapply(vc, function(x) diag(as.matrix(x))))
+        any(vars < 1e-6)
+      } else {
+        lme4::isSingular(m, tol = 1e-4)
+      }
+    }
+    
+    if (!is.null(fit) && !is_singular_check(fit)) {
+      fits[[nm]] <- fit
+      progress_log(sprintf("[Step 4 %d/%d] '%s' converged (%s).",
+                           cand_idx, total_cands, nm, format_elapsed(t_cand)),
+                   indent = 3)
+    } else if (!is.null(fit)) {
+      progress_log(sprintf("[Step 4 %d/%d] '%s' singular; excluded (%s).",
+                           cand_idx, total_cands, nm, format_elapsed(t_cand)),
+                   indent = 3)
+    } else {
+      progress_log(sprintf("[Step 4 %d/%d] '%s' failed to converge (%s).",
+                           cand_idx, total_cands, nm, format_elapsed(t_cand)),
+                   indent = 3)
+    }
+  }
+  
+  if (length(fits) == 0) {
+    progress_log("[Step 4] All candidates singular; data does not support random slopes.",
+                 indent = 1)
+    progress_log("[Step 4] Refitting with random-intercept-only structure.", indent = 2)
+    
+    fixed_only_part <- nobars(formula(model_zcp_reduced))
+    f_min <- as.formula(paste(deparse(fixed_only_part),
+                              sprintf("+ (1 | %s)", group_name)))
+    
+    m_min <- if (model_family == "binomial") {
+      glmmTMB::glmmTMB(f_min, data = data,
+                       family = binomial(link = "logit"),
+                       control = custom_control_glmmTMB,
+                       REML = FALSE)
+    } else {
+      lme4::lmer(f_min, data = data, REML = TRUE,
+                 control = custom_control_lmer)
+    }
+    
+    attr(m_min, "step4_selected") <- "RandomIntercept_only"
+    return(m_min)
+  }
+  
+  if (length(fits) == 1) {
+    progress_log("[Step 4] Only ZCP candidate viable; correlations not added.", indent = 1)
+    f_zcp_only <- formula(model_zcp_reduced)
+    if (model_family == "binomial") {
+      return(glmmTMB::glmmTMB(f_zcp_only, data = data,
+                              family = binomial(link = "logit"),
+                              control = custom_control_glmmTMB,
+                              REML = FALSE))
+    } else {
+      return(lme4::lmer(f_zcp_only, data = data, REML = TRUE,
+                        control = custom_control_lmer))
+    }
+  }
+  
+  reference_fit <- fits[["ZCP_reference"]]
+  lrt_table <- data.frame(model = character(), df_diff = integer(),
+                          chisq = numeric(), p_value = numeric(),
+                          AIC = numeric(), stringsAsFactors = FALSE)
+  
+  if (is.null(reference_fit)) {
+    progress_log("[Step 4] ZCP_reference singular; selecting best converged candidate by AIC.",
+                 indent = 1)
+    aics <- sapply(fits, AIC)
+    best_name <- names(fits)[which.min(aics)]
+    best_fit  <- fits[[best_name]]
+    
+    for (nm in names(fits)) {
+      lrt_table <- rbind(lrt_table, data.frame(
+        model = nm,
+        df_diff = NA_integer_,
+        chisq = NA_real_,
+        p_value = NA_real_,
+        AIC = aics[nm],
+        stringsAsFactors = FALSE
+      ))
+    }
+  } else {
+    best_name <- "ZCP_reference"
+    best_fit  <- reference_fit
+    
+    for (nm in setdiff(names(fits), "ZCP_reference")) {
+      cand <- fits[[nm]]
+      lrt <- tryCatch(anova(reference_fit, cand), error = function(e) NULL)
+      if (is.null(lrt) || nrow(lrt) < 2) next
+      
+      p_val <- lrt$"Pr(>Chisq)"[2]
+      if (is.na(p_val)) next
+      
+      lrt_table <- rbind(lrt_table, data.frame(
+        model = nm,
+        df_diff = lrt$Df[2],
+        chisq = lrt$Chisq[2],
+        p_value = p_val,
+        AIC = AIC(cand),
+        stringsAsFactors = FALSE
+      ))
+      
+      if (p_val < alpha_lrt && AIC(cand) < AIC(best_fit)) {
+        best_name <- nm
+        best_fit  <- cand
+      }
+    }
+  }
+  
+  attr(best_fit, "step4_lrt_table") <- lrt_table
+  attr(best_fit, "step4_selected") <- best_name
+  
+  progress_log(sprintf("[Step 4] Selected: %s (alpha_LRT = %.2f).",
+                       best_name, alpha_lrt), indent = 1)
+  
+  if (model_family == "binomial") {
+    best_fit
+  } else {
+    f_best <- formula(best_fit)
+    m_reml <- lme4::lmer(f_best, data = data, REML = TRUE,
+                         control = custom_control_lmer)
+    for (an in c("step4_lrt_table", "step4_selected")) {
+      a <- attr(best_fit, an)
+      if (!is.null(a)) attr(m_reml, an) <- a
+    }
+    m_reml
+  }
+}
+
+# ==============================================================================
+# Main Bates 5-step engine. Branches on model_family. Generalized for any
+# random-slope variables and arbitrary random grouping (default
+# participant_id_internal).
+#
+# Inputs:
+#   data:               clean trial-level data frame
+#   outcome_var:        name of dependent variable
+#   fixed_terms:        right-hand side of fixed effects (without intercept)
+#                       e.g., "(emotion + offer_type)^2",
+#                             "(Exp + emotion + offer_type)^3"
+#   include_terms:      character vector of fixed effects to force-keep in Step 3
+#   model_family:       "gaussian" (LMM) or "binomial" (GLMM)
+#   random_max_vars:    within-subject factors to enter as random slopes
+#   group_name:         random grouping variable (default participant_id_internal)
+#   timeout_sec:        per-stage buildmer timeout (default 1800s)
+# ==============================================================================
+fit_stage1_bates <- function(data, outcome_var, fixed_terms, include_terms,
+                             model_family = "gaussian",
+                             random_max_vars = c("emotion", "offer_type"),
+                             group_name = "participant_id_internal",
+                             timeout_sec = 1800) {
+  
+  fixed_str <- sprintf("%s ~ %s", outcome_var, fixed_terms)
+  
+  fixed_include_str <- paste(include_terms,
+                              sprintf("+ (1 | %s)", group_name))
+  fixed_include <- as.formula(sprintf("~ %s", fixed_include_str))
+  
+  diag_log <- list(
+    outcome = outcome_var,
+    family = model_family,
+    n_obs = nrow(data),
+    n_subjects = dplyr::n_distinct(data[[group_name]]),
+    random_max_vars = random_max_vars,
+    group_name = group_name,
+    timeout_sec = timeout_sec,
+    step1_status = NA_character_,
+    step1_pca = NULL,
+    step2_status = NA_character_,
+    step3_final_formula = NA_character_,
+    step4_status = NA_character_,
+    step5_pca = NULL
+  )
+  
+  random_max_str <- paste("(1 +", paste(random_max_vars, collapse = " + "),
+                          "|", group_name, ")")
+  
+  fit_func <- function(formula, data, REML_flag = FALSE) {
+    if (model_family == "binomial") {
+      glmmTMB::glmmTMB(formula, data = data,
+                       family = binomial(link = "logit"),
+                       control = custom_control_glmmTMB,
+                       REML = REML_flag)
+    } else {
+      lme4::lmer(formula, data = data, REML = REML_flag,
+                 control = custom_control_lmer)
+    }
+  }
+  
+  is_singular_check <- function(m) {
+    if (inherits(m, "glmmTMB")) {
+      vc <- VarCorr(m)$cond
+      if (is.null(vc)) return(FALSE)
+      vars <- unlist(lapply(vc, function(x) diag(as.matrix(x))))
+      any(vars < 1e-6)
+    } else {
+      lme4::isSingular(m, tol = 1e-4)
+    }
+  }
+  
+  # ---- STEP 1: Barr-style maximal model ----
+  progress_log(sprintf("[%s | %s] Stage 1: Bates 5-step random-structure selection",
+                       outcome_var, model_family))
+  progress_log(sprintf("Data: N = %d trials, %d subjects (group = %s).",
+                       nrow(data), dplyr::n_distinct(data[[group_name]]),
+                       group_name), indent = 1)
+  progress_log(sprintf("Fixed terms: %s", fixed_terms), indent = 1)
+  progress_log(sprintf("Forced include: %s",
+                       paste(include_terms, collapse = ", ")), indent = 1)
+  progress_log(sprintf("Random max vars: %s",
+                       paste(random_max_vars, collapse = ", ")), indent = 1)
+  progress_log(sprintf("buildmer timeout: %d sec", timeout_sec), indent = 1)
+  
+  f_max <- as.formula(paste(fixed_str, "+", random_max_str))
+  
+  progress_log("[Step 1] Fitting design-justified maximal model with correlations...",
+               indent = 1)
+  t_step1 <- Sys.time()
+  m_max <- tryCatch(
+    fit_func(f_max, data, REML_flag = FALSE),
+    error = function(e) {
+      progress_log(sprintf("[ERROR] Maximal fit failed: %s", conditionMessage(e)),
+                   indent = 2)
+      NULL
+    }
+  )
+  progress_log(sprintf("[Step 1] elapsed: %s", format_elapsed(t_step1)),
+               indent = 2)
+  
+  if (!is.null(m_max)) {
+    is_sing <- is_singular_check(m_max)
+    diag_log$step1_status <- if (is_sing) "converged_singular" else "converged_clean"
+    diag_log$step1_pca <- extract_repca_summary(m_max, group_name = group_name)
+    progress_log(sprintf("[Step 1] Status: %s. Effective dims = %d / %d.",
+                         diag_log$step1_status,
+                         count_effective_dims(diag_log$step1_pca),
+                         nrow(diag_log$step1_pca)),
+                 indent = 2)
+  } else {
+    diag_log$step1_status <- "failed_to_converge"
+  }
+  
+  # ---- STEP 2: ZCP model ----
+  progress_log("[Step 2] Fitting zero-correlation-parameter model...", indent = 1)
+  t_step2 <- Sys.time()
+  
+  zcp_components <- c(
+    sprintf("(1 | %s)", group_name),
+    sapply(random_max_vars, function(v) {
+      sprintf("(0 + %s | %s)", v, group_name)
+    })
+  )
+  random_zcp <- paste(zcp_components, collapse = " + ")
+  f_zcp <- as.formula(paste(fixed_str, "+", random_zcp))
+  
+  m_zcp <- tryCatch(fit_func(f_zcp, data, REML_flag = FALSE),
+                    error = function(e) NULL)
+  progress_log(sprintf("[Step 2] elapsed: %s", format_elapsed(t_step2)), indent = 2)
+  
+  if (is.null(m_zcp)) {
+    progress_log("[Step 2] [ERROR] ZCP fit failed; falling back to random-intercept-only.",
+                 indent = 2)
+    diag_log$step2_status <- "failed"
+    f_minimal <- as.formula(paste(fixed_str, sprintf("+ (1 | %s)", group_name)))
+    m_zcp <- fit_func(f_minimal, data, REML_flag = FALSE)
+  } else {
+    is_sing_zcp <- is_singular_check(m_zcp)
+    diag_log$step2_status <- if (is_sing_zcp) "converged_singular" else "converged_clean"
+    progress_log(sprintf("[Step 2] Status: %s.", diag_log$step2_status), indent = 2)
+  }
+  
+  # ---- STEP 3: buildmer LRT-based random-structure simplification ----
+  progress_log("[Step 3] LRT-based backward elimination (buildmer, alpha = 0.20)...",
+               indent = 1)
+  progress_log(paste("This step iteratively tests model terms via LRT and may fit",
+                     "many candidate models. With large N or complex random",
+                     "structures, expect several minutes."),
+               indent = 2)
+  t_step3 <- Sys.time()
+  
+  if (model_family == "binomial") {
+    progress_log("[Step 3] Engine: buildglmmTMB (glmmTMB-based LRT elimination).",
+                 indent = 2)
+    bm_ctrl <- buildmer::buildmerControl(
+      include = fixed_include,
+      direction = c("order", "backward"),
+      crit = "LRT",
+      elim = buildmer::LRTalpha(0.20),
+      quiet = FALSE,
+      ddf = "Wald"
+    )
+    
+    bm_res <- run_buildmer_protected(
+      buildmer::buildglmmTMB,
+      formula = f_zcp, data = data,
+      family = binomial(link = "logit"),
+      buildmerControl = bm_ctrl,
+      timeout_sec = timeout_sec
+    )
+    
+    diag_log$step3_method <- "buildglmmTMB_LRT"
+    
+  } else {
+    progress_log("[Step 3] Engine: buildmer (lme4-based LRT elimination).", indent = 2)
+    bm_ctrl <- buildmer::buildmerControl(
+      include = fixed_include,
+      direction = c("order", "backward"),
+      crit = "LRT",
+      elim = buildmer::LRTalpha(0.20),
+      quiet = FALSE,
+      args = list(control = custom_control_lmer)
+    )
+    
+    bm_res <- run_buildmer_protected(
+      buildmer::buildmer,
+      formula = f_zcp, data = data,
+      buildmerControl = bm_ctrl,
+      timeout_sec = timeout_sec
+    )
+    
+    diag_log$step3_method <- "buildmer_LRT"
+  }
+  
+  if (is.null(bm_res)) {
+    progress_log("[Step 3] buildmer failed or timed out; retaining ZCP model.",
+                 indent = 2)
+    m_reduced <- m_zcp
+    diag_log$step3_fallback <- "ZCP_after_buildmer_failure"
+  } else {
+    m_reduced <- tryCatch({
+      bm_res@model
+    }, error = function(e) {
+      progress_log(sprintf("[WARN] Could not extract @model: %s; retaining ZCP.",
+                           conditionMessage(e)), indent = 2)
+      m_zcp
+    })
+    diag_log$step3_fallback <- NA_character_
+  }
+  
+  progress_log(sprintf("[Step 3] elapsed: %s", format_elapsed(t_step3)), indent = 2)
+  
+  if (!inherits(m_reduced, c("merMod", "glmmTMB"))) {
+    progress_log("[WARN] Reduced model lost all random effects; refitting with intercept-only.",
+                 indent = 2)
+    reduced_fixed_str_recovered <- paste(deparse(formula(m_reduced)), collapse = " ")
+    f_recover <- as.formula(paste(reduced_fixed_str_recovered,
+                                  sprintf("+ (1 | %s)", group_name)))
+    m_reduced <- fit_func(f_recover, data, REML_flag = FALSE)
+  }
+  
+  diag_log$step3_final_formula <- paste(deparse(formula(m_reduced)), collapse = " ")
+  progress_log(sprintf("[Step 3] Reduced formula: %s",
+                       stringr::str_squish(diag_log$step3_final_formula)),
+               indent = 2)
+  
+  # ---- STEP 4: Test correlation parameters on surviving slopes ----
+  progress_log("[Step 4] Testing correlation parameters on surviving slopes...",
+               indent = 1)
+  t_step4 <- Sys.time()
+  
+  reduced_fixed <- nobars(formula(m_reduced))
+  reduced_fixed_str <- paste(deparse(reduced_fixed), collapse = " ")
+  
+  m_final <- add_correlations_step4(m_reduced, reduced_fixed_str, data,
+                                    group_name = group_name,
+                                    model_family = model_family,
+                                    alpha_lrt = 0.20)
+  diag_log$step4_status <- attr(m_final, "step4_selected") %||% "ZCP_kept"
+  progress_log(sprintf("[Step 4] elapsed: %s. Selected: %s.",
+                       format_elapsed(t_step4), diag_log$step4_status),
+               indent = 2)
+  
+  # ---- STEP 5: rePCA diagnostic ----
+  diag_log$step5_pca <- extract_repca_summary(m_final, group_name = group_name)
+  step5_eff <- count_effective_dims(diag_log$step5_pca)
+  step5_nom <- nrow(diag_log$step5_pca)
+  progress_log(sprintf("[Step 5] Final model dimensionality: %s effective / %s nominal.",
+                       if (is.na(step5_eff)) "NA" else as.character(step5_eff),
+                       if (is.na(step5_nom)) "NA" else as.character(step5_nom)),
+               indent = 1)
+  
+  # ---- Defensive REML guard for LMM ----
+  if (model_family == "gaussian" && inherits(m_final, "merMod")) {
+    is_reml <- tryCatch(lme4::isREML(m_final), error = function(e) FALSE)
+    if (!isTRUE(is_reml)) {
+      progress_log("[Final] Refitting LMM with REML=TRUE for Satterthwaite compatibility.",
+                   indent = 1)
+      m_final_reml <- tryCatch(
+        update(m_final, REML = TRUE, control = custom_control_lmer),
+        error = function(e) {
+          progress_log(sprintf("[Final] REML refit failed: %s; retaining ML fit.",
+                               conditionMessage(e)), indent = 2)
+          NULL
+        }
+      )
+      if (!is.null(m_final_reml)) {
+        existing_attrs <- attributes(m_final)[c("step4_selected",
+                                                "step4_lrt_table")]
+        for (an in names(existing_attrs)) {
+          if (!is.null(existing_attrs[[an]])) {
+            attr(m_final_reml, an) <- existing_attrs[[an]]
+          }
+        }
+        m_final <- m_final_reml
+      }
+    }
+  }
+  
+  # ---- Defensive lmerTest class upgrade for LMM ----
+  if (model_family == "gaussian" && inherits(m_final, "merMod") &&
+      !inherits(m_final, "lmerModLmerTest")) {
+    m_final_lt <- tryCatch(
+      lmerTest::as_lmerModLmerTest(m_final),
+      error = function(e) {
+        progress_log(sprintf("[Final] lmerTest class upgrade failed: %s",
+                             conditionMessage(e)), indent = 2)
+        NULL
+      }
+    )
+    if (!is.null(m_final_lt)) {
+      existing_attrs <- attributes(m_final)[c("step4_selected",
+                                              "step4_lrt_table")]
+      for (an in names(existing_attrs)) {
+        if (!is.null(existing_attrs[[an]])) {
+          attr(m_final_lt, an) <- existing_attrs[[an]]
+        }
+      }
+      m_final <- m_final_lt
+      progress_log("[Final] LMM upgraded to lmerModLmerTest for Satt/KR dispatch.",
+                   indent = 1)
+    }
+  }
+  
+  attr(m_final, "bates_diag") <- diag_log
+  m_final
+}
+```
+
+``` {r run-and-report-2way}
+# ==============================================================================
+# 5. Stage 1 Runner: 2-way analysis (E1 / E2 single-experiment).
+# ==============================================================================
+#
+# Used for E1 and E2 stages. The 3-way Integrative variant is below in
+# run_behavior_analysis_3way.
+#
+# This function:
+#   1. Fits the Stage 1 model via Bates 5-step.
+#   2. Runs Type III ANOVA with Satterthwaite -> KR -> Wald cascade (LMM)
+#      or Wald only (GLMM).
+#   3. Decomposes interactions if omnibus p < 0.05 (confirmatory) or
+#      0.05 <= p < 0.10 (marginal -> Supplementary).
+#   4. Reports main effects, post-hoc contrasts, descriptives, R-squared.
+#   5. Writes REPRODUCIBILITY.txt, markdown tables, RDS model object, Excel.
+run_behavior_analysis <- function(data, analysis_name, outcome_var, fixed_terms,
+                                  include_terms, model_family, out_dir, exp_version,
+                                  posthoc_factors = NULL,
+                                  random_max_vars = c("emotion", "offer_type"),
+                                  timeout_sec = 1800) {
+  
+  if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
+  
+  progress_log(sprintf(">>> Analysis: %s [%s] (N_subj = %d, N_trial = %d)",
+                       analysis_name, exp_version,
+                       dplyr::n_distinct(data$participant_id_internal), nrow(data)))
+  
+  # ---- Fit Stage 1 model via Bates 5-step ----
+  FINAL_MODEL <- fit_stage1_bates(data, outcome_var, fixed_terms,
+                                  include_terms, model_family,
+                                  random_max_vars = random_max_vars,
+                                  group_name = "participant_id_internal",
+                                  timeout_sec = timeout_sec)
+  diag_log <- attr(FINAL_MODEL, "bates_diag")
+  
+  formula_str <- paste(deparse(formula(FINAL_MODEL)), collapse = " ")
+  progress_log(sprintf("[Final model] %s", stringr::str_squish(formula_str)),
+               indent = 1)
+  
+  # ---- Type III ANOVA ----
+  progress_log("[ANOVA] Computing Type III tests...", indent = 1)
+  t_anova <- Sys.time()
+  
+  if (model_family == "binomial") {
+    anova_res <- car::Anova(FINAL_MODEL, type = 3, test.statistic = "Chisq")
+    diag_log$anova_method <- "Wald_chi_square_GLMM"
+  } else {
+    if (inherits(FINAL_MODEL, "merMod") &&
+        !inherits(FINAL_MODEL, "lmerModLmerTest")) {
+      FINAL_MODEL_lt <- tryCatch(
+        lmerTest::as_lmerModLmerTest(FINAL_MODEL),
+        error = function(e) NULL
+      )
+      if (!is.null(FINAL_MODEL_lt)) FINAL_MODEL <- FINAL_MODEL_lt
+    }
+    
+    anova_res <- NULL
+    method_used <- NA_character_
+    
+    # Attempt 1: Satterthwaite.
+    anova_res <- tryCatch({
+      res <- suppressWarnings(anova(FINAL_MODEL, type = 3, ddf = "Satterthwaite"))
+      if (any(grepl("^Pr", colnames(res)))) {
+        method_used <- "Satterthwaite_F"
+        res
+      } else {
+        progress_log("[ANOVA] Satterthwaite returned no p-value column; trying Kenward-Roger.",
+                     indent = 2)
+        NULL
+      }
+    }, error = function(e) {
+      progress_log(sprintf("[ANOVA] Satterthwaite errored (%s); trying Kenward-Roger.",
+                           conditionMessage(e)), indent = 2)
+      NULL
+    })
+    
+    # Attempt 2: Kenward-Roger.
+    if (is.null(anova_res)) {
+      anova_res <- tryCatch({
+        res <- suppressWarnings(anova(FINAL_MODEL, type = 3, ddf = "Kenward-Roger"))
+        if (any(grepl("^Pr", colnames(res)))) {
+          method_used <- "Kenward_Roger_F"
+          res
+        } else {
+          progress_log("[ANOVA] Kenward-Roger returned no p-value column; falling back to Wald.",
+                       indent = 2)
+          NULL
+        }
+      }, error = function(e) {
+        progress_log(sprintf("[ANOVA] Kenward-Roger errored (%s); falling back to Wald.",
+                             conditionMessage(e)), indent = 2)
+        NULL
+      })
+    }
+    
+    # Attempt 3: Wald.
+    if (is.null(anova_res)) {
+      anova_res <- car::Anova(FINAL_MODEL, type = 3, test.statistic = "Chisq")
+      method_used <- "Wald_chi_square"
+    }
+    
+    diag_log$anova_method <- method_used
+  }
+  
+  progress_log(sprintf("[ANOVA] Method: %s. Elapsed: %s.",
+                       diag_log$anova_method, format_elapsed(t_anova)),
+               indent = 2)
+  
+  anova_apa <- format_anova_apa(anova_res, FINAL_MODEL)
+  print(anova_apa %>% dplyr::select(Effect, APA_Report, Sig))
+  
+  # ---- Post-hoc decomposition ----
+  progress_log("[Post-hoc] Extracting marginal means and contrasts...", indent = 1)
+  
+  target_2way <- if ("emotion:offer_type" %in% rownames(anova_res)) {
+    "emotion:offer_type"
+  } else if ("emotion:reaction" %in% rownames(anova_res)) {
+    "emotion:reaction"
+  } else NA_character_
+  
+  p_int_2way <- NA_real_
+  if (!is.na(target_2way) && target_2way %in% rownames(anova_res)) {
+    for (pcol in c("Pr(>F)", "Pr(>Chisq)")) {
+      if (pcol %in% colnames(anova_res)) {
+        val <- suppressWarnings(as.numeric(anova_res[target_2way, pcol]))
+        if (length(val) == 1 && !is.na(val)) {
+          p_int_2way <- val; break
+        }
+      }
+    }
+  }
+  if (is.na(p_int_2way)) p_int_2way <- 1.0
+  
+  list_of_tables <- list(
+    "ANOVA_Main" = anova_apa,
+    "Model_Formula" = data.frame(Formula = formula_str),
+    "Model_Coefficients" = format_coefs(FINAL_MODEL),
+    "R2_NakagawaSchielzeth" = extract_r2_table(FINAL_MODEL, analysis_name)
+  )
+  
+  if (is.null(posthoc_factors)) {
+    if (analysis_name == "LMM_RT_unfair") {
+      posthoc_factors <- list(within = "reaction", between = "emotion")
+    } else {
+      posthoc_factors <- list(within = "offer_type", between = "emotion")
+    }
+  }
+  f_within <- posthoc_factors$within
+  f_between <- posthoc_factors$between
+  
+  scale_hint <- dplyr::case_when(
+    model_family == "binomial" ~ "logit",
+    outcome_var == "logRT"     ~ "logRT",
+    TRUE                        ~ "raw"
+  )
+  
+  pairs_with_ci <- function(emm, adjust = "fdr") {
+    pp <- pairs(emm, adjust = adjust)
+    summary(pp, infer = c(TRUE, TRUE))
+  }
+  
+  posthoc_status <- dplyr::case_when(
+    p_int_2way < confirmatory_alpha             ~ "Confirmatory",
+    p_int_2way < marginal_threshold             ~ "Exploratory_Marginal",
+    TRUE                                         ~ "Not_triggered"
+  )
+  
+  list_of_supp_tables <- list()
+  
+  if (posthoc_status %in% c("Confirmatory", "Exploratory_Marginal")) {
+    target_list <- if (posthoc_status == "Confirmatory") "list_of_tables" else "list_of_supp_tables"
+    progress_log(sprintf("[Post-hoc] Interaction p = %.4f -> %s. Routing simple effects to %s.",
+                         p_int_2way, posthoc_status,
+                         ifelse(target_list == "list_of_tables", "main", "Supplementary")),
+                 indent = 1)
+    
+    progress_log(sprintf("[Post-hoc 1/3] %s | %s (FDR)...", f_within, f_between),
+                 indent = 2)
+    t_ph <- Sys.time()
+    f1 <- as.formula(sprintf("~ %s | %s", f_within, f_between))
+    so_em <- format_posthoc_apa(
+      pairs_with_ci(emmeans::emmeans(FINAL_MODEL, f1), adjust = "fdr"),
+      scale_hint = scale_hint
+    )
+    progress_log(sprintf("[Post-hoc 1/3] done (%s).", format_elapsed(t_ph)), indent = 3)
+    so_em$Status <- posthoc_status
+    
+    progress_log(sprintf("[Post-hoc 2/3] %s | %s (FDR)...", f_between, f_within),
+                 indent = 2)
+    t_ph <- Sys.time()
+    f2 <- as.formula(sprintf("~ %s | %s", f_between, f_within))
+    se_off <- format_posthoc_apa(
+      pairs_with_ci(emmeans::emmeans(FINAL_MODEL, f2), adjust = "fdr"),
+      scale_hint = scale_hint
+    )
+    progress_log(sprintf("[Post-hoc 2/3] done (%s).", format_elapsed(t_ph)), indent = 3)
+    se_off$Status <- posthoc_status
+    
+    progress_log("[Post-hoc 3/3] interaction contrasts (FDR)...", indent = 2)
+    t_ph <- Sys.time()
+    f3 <- as.formula(sprintf("~ %s * %s", f_between, f_within))
+    int_contr <- format_posthoc_apa(
+      summary(contrast(emmeans::emmeans(FINAL_MODEL, f3),
+                       interaction = "pairwise", adjust = "fdr"),
+              infer = c(TRUE, TRUE)),
+      scale_hint = scale_hint
+    )
+    progress_log(sprintf("[Post-hoc 3/3] done (%s).", format_elapsed(t_ph)), indent = 3)
+    int_contr$Status <- posthoc_status
+    
+    if (posthoc_status == "Confirmatory") {
+      list_of_tables[[sprintf("Simple_%s_by_%s", f_within, f_between)]] <- so_em
+      list_of_tables[[sprintf("Simple_%s_by_%s", f_between, f_within)]] <- se_off
+      list_of_tables[["Interaction_Contrasts"]] <- int_contr
+    } else {
+      list_of_supp_tables[[sprintf("MARGINAL_Simple_%s_by_%s", f_within, f_between)]] <- so_em
+      list_of_supp_tables[[sprintf("MARGINAL_Simple_%s_by_%s", f_between, f_within)]] <- se_off
+      list_of_supp_tables[["MARGINAL_Interaction_Contrasts"]] <- int_contr
+    }
+    
+  } else {
+    progress_log(sprintf("[Post-hoc] Interaction p = %.4f -> Reporting main effects only.",
+                         p_int_2way), indent = 1)
+  }
+  
+  # Always extract main effects.
+  progress_log(sprintf("[Main effect] %s pairwise (FDR)...", f_between), indent = 2)
+  t_me <- Sys.time()
+  list_of_tables[[sprintf("Main_Effect_%s", f_between)]] <- format_posthoc_apa(
+    pairs_with_ci(emmeans::emmeans(FINAL_MODEL,
+                                   as.formula(sprintf("~ %s", f_between))),
+                  adjust = "fdr"),
+    scale_hint = scale_hint
+  )
+  progress_log(sprintf("[Main effect %s] done (%s).", f_between, format_elapsed(t_me)),
+               indent = 3)
+  
+  progress_log(sprintf("[Main effect] %s pairwise (Tukey)...", f_within), indent = 2)
+  t_me <- Sys.time()
+  list_of_tables[[sprintf("Main_Effect_%s", f_within)]] <- format_posthoc_apa(
+    pairs_with_ci(emmeans::emmeans(FINAL_MODEL,
+                                   as.formula(sprintf("~ %s", f_within))),
+                  adjust = "tukey"),
+    scale_hint = scale_hint
+  )
+  progress_log(sprintf("[Main effect %s] done (%s).", f_within, format_elapsed(t_me)),
+               indent = 3)
+  
+  progress_log("[Descriptive] estimated marginal means...", indent = 2)
+  t_me <- Sys.time()
+  list_of_tables[["Descriptive_Means"]] <- beautify_labels(kill_scipen(
+    as.data.frame(emmeans::emmeans(FINAL_MODEL,
+                                   as.formula(sprintf("~ %s * %s", f_within, f_between))))
+  ))
+  progress_log(sprintf("[Descriptive] done (%s).", format_elapsed(t_me)), indent = 3)
+  
+  progress_log("[Descriptive] cell-level raw statistics...", indent = 2)
+  list_of_tables[["Cell_Descriptives"]] <- format_descriptives_table(
+    data, group_vars = c(f_between, f_within)
+  )
+  
+  # ---- Reporting Layer ----
+  write_outputs_common(
+    FINAL_MODEL = FINAL_MODEL,
+    list_of_tables = list_of_tables,
+    list_of_supp_tables = list_of_supp_tables,
+    analysis_name = analysis_name,
+    exp_version = exp_version,
+    out_dir = out_dir,
+    formula_str = formula_str,
+    diag_log = diag_log,
+    anova_apa = anova_apa,
+    model_family = model_family,
+    outcome_var = outcome_var
+  )
+  
+  progress_log(">>> Analysis complete.", indent = 1)
+  invisible(FINAL_MODEL)
+}
+
+# ==============================================================================
+# 6. Stage 1 Runner: 3-way Integrative analysis.
+# ==============================================================================
+#
+# Used for Integrative stage only. The 3-way model has the form:
+#   outcome ~ Exp * (emotion + offer_type)^2  [for GLMM_rejection / LMM_RT_main]
+#   outcome ~ Exp * (emotion + reaction)^2    [for LMM_RT_unfair]
+#
+# Post-hoc decomposition follows the Maxwell-Delaney layered strategy:
+#   1. Always report omnibus 3-way Exp:emotion:offer_type
+#   2. If 3-way p < confirmatory_alpha:
+#      - Decompose into per-Exp 2-way (emotion x offer_type within E1, within E2)
+#      - Report interaction-of-interactions contrasts (does emotion x offer_type
+#        differ between Exp?)
+#   3. If 3-way 0.05 <= p < 0.10:
+#      - Same decomposition but routed to Supplementary
+#   4. If 3-way not significant:
+#      - Report 2-way Exp:emotion, Exp:offer_type, emotion:offer_type
+#      - Decompose each based on its own significance
+#      - Report main effects only for factors NOT in any significant 2-way
+run_behavior_analysis_3way <- function(data, analysis_name, outcome_var,
+                                       fixed_terms, include_terms,
+                                       model_family, out_dir, exp_version,
+                                       posthoc_factors = NULL,
+                                       random_max_vars = c("emotion", "offer_type"),
+                                       timeout_sec = 3600) {
+  
+  if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
+  
+  progress_log(sprintf(">>> Analysis (3-way): %s [%s] (N_subj = %d, N_trial = %d)",
+                       analysis_name, exp_version,
+                       dplyr::n_distinct(data$participant_id_internal), nrow(data)))
+  
+  # ---- Fit Stage 1 model via Bates 5-step ----
+  FINAL_MODEL <- fit_stage1_bates(data, outcome_var, fixed_terms,
+                                  include_terms, model_family,
+                                  random_max_vars = random_max_vars,
+                                  group_name = "participant_id_internal",
+                                  timeout_sec = timeout_sec)
+  diag_log <- attr(FINAL_MODEL, "bates_diag")
+  
+  formula_str <- paste(deparse(formula(FINAL_MODEL)), collapse = " ")
+  progress_log(sprintf("[Final model] %s", stringr::str_squish(formula_str)),
+               indent = 1)
+  
+  # ---- Type III ANOVA (same cascade as 2-way) ----
+  progress_log("[ANOVA] Computing Type III tests...", indent = 1)
+  t_anova <- Sys.time()
+  
+  if (model_family == "binomial") {
+    anova_res <- car::Anova(FINAL_MODEL, type = 3, test.statistic = "Chisq")
+    diag_log$anova_method <- "Wald_chi_square_GLMM"
+  } else {
+    if (inherits(FINAL_MODEL, "merMod") &&
+        !inherits(FINAL_MODEL, "lmerModLmerTest")) {
+      FINAL_MODEL_lt <- tryCatch(
+        lmerTest::as_lmerModLmerTest(FINAL_MODEL),
+        error = function(e) NULL
+      )
+      if (!is.null(FINAL_MODEL_lt)) FINAL_MODEL <- FINAL_MODEL_lt
+    }
+    
+    anova_res <- NULL
+    method_used <- NA_character_
+    
+    anova_res <- tryCatch({
+      res <- suppressWarnings(anova(FINAL_MODEL, type = 3, ddf = "Satterthwaite"))
+      if (any(grepl("^Pr", colnames(res)))) {
+        method_used <- "Satterthwaite_F"; res
+      } else NULL
+    }, error = function(e) NULL)
+    
+    if (is.null(anova_res)) {
+      anova_res <- tryCatch({
+        res <- suppressWarnings(anova(FINAL_MODEL, type = 3, ddf = "Kenward-Roger"))
+        if (any(grepl("^Pr", colnames(res)))) {
+          method_used <- "Kenward_Roger_F"; res
+        } else NULL
+      }, error = function(e) NULL)
+    }
+    
+    if (is.null(anova_res)) {
+      anova_res <- car::Anova(FINAL_MODEL, type = 3, test.statistic = "Chisq")
+      method_used <- "Wald_chi_square"
+    }
+    
+    diag_log$anova_method <- method_used
+  }
+  
+  progress_log(sprintf("[ANOVA] Method: %s. Elapsed: %s.",
+                       diag_log$anova_method, format_elapsed(t_anova)),
+               indent = 2)
+  
+  anova_apa <- format_anova_apa(anova_res, FINAL_MODEL)
+  print(anova_apa %>% dplyr::select(Effect, APA_Report, Sig))
+  
+  # ---- Determine factor names from posthoc_factors ----
+  # For Integrative GLMM_rejection / LMM_RT_main: factors = c("Exp", "emotion", "offer_type")
+  # For Integrative LMM_RT_unfair:                factors = c("Exp", "emotion", "reaction")
+  if (is.null(posthoc_factors)) {
+    if (analysis_name == "LMM_RT_unfair") {
+      posthoc_factors <- list(exp = "Exp", between = "emotion", within = "reaction")
+    } else {
+      posthoc_factors <- list(exp = "Exp", between = "emotion", within = "offer_type")
+    }
+  }
+  f_exp     <- posthoc_factors$exp
+  f_between <- posthoc_factors$between
+  f_within  <- posthoc_factors$within
+  
+  scale_hint <- dplyr::case_when(
+    model_family == "binomial" ~ "logit",
+    outcome_var == "logRT"     ~ "logRT",
+    TRUE                        ~ "raw"
+  )
+  
+  pairs_with_ci <- function(emm, adjust = "fdr") {
+    pp <- pairs(emm, adjust = adjust)
+    summary(pp, infer = c(TRUE, TRUE))
+  }
+  
+  # ---- Helper: extract p-value for a named effect from anova table ----
+  get_p_for_effect <- function(anova_obj, effect_name) {
+    if (!effect_name %in% rownames(anova_obj)) return(NA_real_)
+    for (pcol in c("Pr(>F)", "Pr(>Chisq)")) {
+      if (pcol %in% colnames(anova_obj)) {
+        val <- suppressWarnings(as.numeric(anova_obj[effect_name, pcol]))
+        if (length(val) == 1 && !is.na(val)) return(val)
+      }
+    }
+    NA_real_
+  }
+  
+  # ---- Extract p-values for all relevant terms ----
+  # Effect name order can vary by car::Anova vs anova(lmerTest) output; try
+  # both orderings.
+  try_p <- function(...) {
+    candidates <- c(...)
+    for (nm in candidates) {
+      p <- get_p_for_effect(anova_res, nm)
+      if (!is.na(p)) return(p)
+    }
+    NA_real_
+  }
+  
+  p_3way <- try_p(paste(f_exp, f_between, f_within, sep = ":"),
+                  paste(f_exp, f_within, f_between, sep = ":"),
+                  paste(f_between, f_exp, f_within, sep = ":"))
+  p_exp_emo <- try_p(paste(f_exp, f_between, sep = ":"),
+                     paste(f_between, f_exp, sep = ":"))
+  p_exp_off <- try_p(paste(f_exp, f_within, sep = ":"),
+                     paste(f_within, f_exp, sep = ":"))
+  p_emo_off <- try_p(paste(f_between, f_within, sep = ":"),
+                     paste(f_within, f_between, sep = ":"))
+  p_exp_main <- try_p(f_exp)
+  p_emo_main <- try_p(f_between)
+  p_off_main <- try_p(f_within)
+  
+  progress_log(sprintf("[3-way decomposition] p_3way=%.4f, p_exp_emo=%.4f, p_exp_off=%.4f, p_emo_off=%.4f",
+                       p_3way %||% NA, p_exp_emo %||% NA,
+                       p_exp_off %||% NA, p_emo_off %||% NA), indent = 1)
+  
+  # Helper to classify p-value into status.
+  classify <- function(p) {
+    if (is.na(p)) return("Not_triggered")
+    if (p < confirmatory_alpha) return("Confirmatory")
+    if (p < marginal_threshold) return("Exploratory_Marginal")
+    "Not_triggered"
+  }
+  
+  status_3way <- classify(p_3way)
+  
+  list_of_tables <- list(
+    "ANOVA_Main" = anova_apa,
+    "Model_Formula" = data.frame(Formula = formula_str),
+    "Model_Coefficients" = format_coefs(FINAL_MODEL),
+    "R2_NakagawaSchielzeth" = extract_r2_table(FINAL_MODEL, analysis_name)
+  )
+  list_of_supp_tables <- list()
+  
+  # Helper to route a posthoc table by its status (confirmatory vs marginal).
+  route_table <- function(name, tbl, status) {
+    if (status == "Confirmatory") {
+      list_of_tables[[name]] <<- tbl
+    } else if (status == "Exploratory_Marginal") {
+      list_of_supp_tables[[paste0("MARGINAL_", name)]] <<- tbl
+    }
+  }
+  
+  # ====== DECOMPOSITION LAYER ======
+  
+  if (status_3way %in% c("Confirmatory", "Exploratory_Marginal")) {
+    # ---- Branch A: 3-way is (at least marginally) significant ----
+    # Report per-Exp emotion x within-factor interaction, plus
+    # interaction-of-interactions contrast.
+    progress_log(sprintf("[3-way DECOMP] Branch A: 3-way p=%.4f -> %s. Per-Exp decomposition.",
+                         p_3way, status_3way), indent = 1)
+    
+    # A1: simple emotion x within-factor interaction within each Exp.
+    # We do this via emmeans::joint_tests with by=Exp, which gives per-Exp
+    # joint tests of every fixed effect interaction inside Exp.
+    progress_log("[3-way DECOMP A1] Joint tests within each Exp...", indent = 2)
+    t_jt <- Sys.time()
+    joint_per_exp <- tryCatch({
+      jt <- emmeans::joint_tests(FINAL_MODEL, by = f_exp)
+      beautify_labels(kill_scipen(as.data.frame(jt)))
+    }, error = function(e) {
+      progress_log(sprintf("[WARN] joint_tests failed: %s", conditionMessage(e)),
+                   indent = 3)
+      NULL
+    })
+    progress_log(sprintf("[3-way DECOMP A1] done (%s).", format_elapsed(t_jt)),
+                 indent = 3)
+    if (!is.null(joint_per_exp)) {
+      route_table("JointTests_within_Exp", joint_per_exp, status_3way)
+    }
+    
+    # A2: simple "within-factor" effect within each (Exp, between-factor) cell.
+    # E.g., effect of offer_type at each (Exp, emotion).
+    progress_log(sprintf("[3-way DECOMP A2] %s | %s * %s (FDR)...",
+                         f_within, f_between, f_exp), indent = 2)
+    t_ph <- Sys.time()
+    f_A2 <- as.formula(sprintf("~ %s | %s * %s", f_within, f_between, f_exp))
+    tbl_A2 <- format_posthoc_apa(
+      pairs_with_ci(emmeans::emmeans(FINAL_MODEL, f_A2), adjust = "fdr"),
+      scale_hint = scale_hint
+    )
+    tbl_A2$Status <- status_3way
+    progress_log(sprintf("[3-way DECOMP A2] done (%s).", format_elapsed(t_ph)),
+                 indent = 3)
+    route_table(sprintf("Simple_%s_by_%s_x_%s", f_within, f_between, f_exp),
+                tbl_A2, status_3way)
+    
+    # A3: simple "between-factor" effect within each (Exp, within-factor) cell.
+    # E.g., emotion pairwise at each (Exp, offer_type).
+    progress_log(sprintf("[3-way DECOMP A3] %s | %s * %s (FDR)...",
+                         f_between, f_within, f_exp), indent = 2)
+    t_ph <- Sys.time()
+    f_A3 <- as.formula(sprintf("~ %s | %s * %s", f_between, f_within, f_exp))
+    tbl_A3 <- format_posthoc_apa(
+      pairs_with_ci(emmeans::emmeans(FINAL_MODEL, f_A3), adjust = "fdr"),
+      scale_hint = scale_hint
+    )
+    tbl_A3$Status <- status_3way
+    progress_log(sprintf("[3-way DECOMP A3] done (%s).", format_elapsed(t_ph)),
+                 indent = 3)
+    route_table(sprintf("Simple_%s_by_%s_x_%s", f_between, f_within, f_exp),
+                tbl_A3, status_3way)
+    
+    # A4: Interaction-of-interactions. Does the (emotion x within-factor)
+    # interaction pattern differ between E1 and E2?
+    # Formula: ~ between * within | Exp, then interaction = "pairwise" gives
+    # the interaction contrast at each Exp; we then need to contrast THOSE
+    # across Exp. emmeans's contrast(..., interaction=...) returns the
+    # per-Exp interaction effect; comparing across Exp requires another step.
+    # Simpler: do the cross-Exp interaction contrast directly:
+    #   ~ between * within * Exp, interaction = "pairwise"
+    progress_log("[3-way DECOMP A4] Interaction-of-interactions contrasts (FDR)...",
+                 indent = 2)
+    t_ph <- Sys.time()
+    f_A4 <- as.formula(sprintf("~ %s * %s * %s", f_between, f_within, f_exp))
+    tbl_A4 <- format_posthoc_apa(
+      summary(contrast(emmeans::emmeans(FINAL_MODEL, f_A4),
+                       interaction = "pairwise", adjust = "fdr"),
+              infer = c(TRUE, TRUE)),
+      scale_hint = scale_hint
+    )
+    tbl_A4$Status <- status_3way
+    progress_log(sprintf("[3-way DECOMP A4] done (%s).", format_elapsed(t_ph)),
+                 indent = 3)
+    route_table("Interaction_of_Interactions_3way", tbl_A4, status_3way)
+    
+  } else {
+    # ---- Branch B: 3-way not significant ----
+    # Report each 2-way interaction with its own decomposition.
+    progress_log(sprintf("[3-way DECOMP] Branch B: 3-way p=%.4f -> Not_triggered. Per-2-way decomposition.",
+                         p_3way %||% NA), indent = 1)
+    
+    factors_in_sig_2way <- c()
+    
+    # B1: emotion x within-factor (the core within-subject pattern, pooled
+    # across Exp).
+    s_emo_off <- classify(p_emo_off)
+    if (s_emo_off %in% c("Confirmatory", "Exploratory_Marginal")) {
+      progress_log(sprintf("[3-way DECOMP B1] %s x %s 2-way (p=%.4f, %s).",
+                           f_between, f_within, p_emo_off, s_emo_off), indent = 2)
+      f_B1a <- as.formula(sprintf("~ %s | %s", f_within, f_between))
+      tbl_B1a <- format_posthoc_apa(
+        pairs_with_ci(emmeans::emmeans(FINAL_MODEL, f_B1a), adjust = "fdr"),
+        scale_hint = scale_hint)
+      tbl_B1a$Status <- s_emo_off
+      route_table(sprintf("Simple_%s_by_%s", f_within, f_between), tbl_B1a, s_emo_off)
+      
+      f_B1b <- as.formula(sprintf("~ %s | %s", f_between, f_within))
+      tbl_B1b <- format_posthoc_apa(
+        pairs_with_ci(emmeans::emmeans(FINAL_MODEL, f_B1b), adjust = "fdr"),
+        scale_hint = scale_hint)
+      tbl_B1b$Status <- s_emo_off
+      route_table(sprintf("Simple_%s_by_%s", f_between, f_within), tbl_B1b, s_emo_off)
+      
+      factors_in_sig_2way <- c(factors_in_sig_2way, f_between, f_within)
+    }
+    
+    # B2: Exp x emotion.
+    s_exp_emo <- classify(p_exp_emo)
+    if (s_exp_emo %in% c("Confirmatory", "Exploratory_Marginal")) {
+      progress_log(sprintf("[3-way DECOMP B2] %s x %s 2-way (p=%.4f, %s).",
+                           f_exp, f_between, p_exp_emo, s_exp_emo), indent = 2)
+      f_B2 <- as.formula(sprintf("~ %s | %s", f_between, f_exp))
+      tbl_B2 <- format_posthoc_apa(
+        pairs_with_ci(emmeans::emmeans(FINAL_MODEL, f_B2), adjust = "fdr"),
+        scale_hint = scale_hint)
+      tbl_B2$Status <- s_exp_emo
+      route_table(sprintf("Simple_%s_by_%s", f_between, f_exp), tbl_B2, s_exp_emo)
+      factors_in_sig_2way <- c(factors_in_sig_2way, f_exp, f_between)
+    }
+    
+    # B3: Exp x within-factor.
+    s_exp_off <- classify(p_exp_off)
+    if (s_exp_off %in% c("Confirmatory", "Exploratory_Marginal")) {
+      progress_log(sprintf("[3-way DECOMP B3] %s x %s 2-way (p=%.4f, %s).",
+                           f_exp, f_within, p_exp_off, s_exp_off), indent = 2)
+      f_B3 <- as.formula(sprintf("~ %s | %s", f_within, f_exp))
+      tbl_B3 <- format_posthoc_apa(
+        pairs_with_ci(emmeans::emmeans(FINAL_MODEL, f_B3), adjust = "fdr"),
+        scale_hint = scale_hint)
+      tbl_B3$Status <- s_exp_off
+      route_table(sprintf("Simple_%s_by_%s", f_within, f_exp), tbl_B3, s_exp_off)
+      factors_in_sig_2way <- c(factors_in_sig_2way, f_exp, f_within)
+    }
+    
+    # B4: Main effects for factors NOT involved in any significant 2-way.
+    factors_in_sig_2way <- unique(factors_in_sig_2way)
+    for (fnm in c(f_exp, f_between, f_within)) {
+      if (fnm %in% factors_in_sig_2way) next
+      p_main <- switch(fnm, "Exp" = p_exp_main,
+                       "emotion" = p_emo_main,
+                       "offer_type" = p_off_main,
+                       "reaction" = p_off_main,
+                       NA)
+      s_main <- classify(p_main)
+      if (s_main %in% c("Confirmatory", "Exploratory_Marginal")) {
+        progress_log(sprintf("[3-way DECOMP B4] Main effect %s (p=%.4f, %s).",
+                             fnm, p_main, s_main), indent = 2)
+        f_B4 <- as.formula(sprintf("~ %s", fnm))
+        tbl_B4 <- format_posthoc_apa(
+          pairs_with_ci(emmeans::emmeans(FINAL_MODEL, f_B4),
+                        adjust = "tukey"),
+          scale_hint = scale_hint)
+        tbl_B4$Status <- s_main
+        route_table(sprintf("MainEffect_%s", fnm), tbl_B4, s_main)
+      }
+    }
+  }
+  
+  # ---- ALWAYS report descriptive emmeans and cell-level statistics ----
+  progress_log("[Descriptive] Estimated marginal means (3-way grid)...", indent = 2)
+  t_me <- Sys.time()
+  list_of_tables[["Descriptive_Means"]] <- beautify_labels(kill_scipen(
+    as.data.frame(emmeans::emmeans(FINAL_MODEL,
+                                   as.formula(sprintf("~ %s * %s * %s",
+                                                       f_exp, f_between, f_within))))
+  ))
+  progress_log(sprintf("[Descriptive] done (%s).", format_elapsed(t_me)), indent = 3)
+  
+  progress_log("[Descriptive] Cell-level raw statistics...", indent = 2)
+  list_of_tables[["Cell_Descriptives"]] <- format_descriptives_table(
+    data, group_vars = c(f_exp, f_between, f_within)
+  )
+  
+  # ---- Reporting Layer ----
+  write_outputs_common(
+    FINAL_MODEL = FINAL_MODEL,
+    list_of_tables = list_of_tables,
+    list_of_supp_tables = list_of_supp_tables,
+    analysis_name = analysis_name,
+    exp_version = exp_version,
+    out_dir = out_dir,
+    formula_str = formula_str,
+    diag_log = diag_log,
+    anova_apa = anova_apa,
+    model_family = model_family,
+    outcome_var = outcome_var
+  )
+  
+  progress_log(">>> Analysis (3-way) complete.", indent = 1)
+  invisible(FINAL_MODEL)
+}
+
+# ==============================================================================
+# Shared output writer used by both 2-way and 3-way runners.
+# ==============================================================================
+write_outputs_common <- function(FINAL_MODEL, list_of_tables, list_of_supp_tables,
+                                  analysis_name, exp_version, out_dir,
+                                  formula_str, diag_log, anova_apa,
+                                  model_family, outcome_var) {
+  
+  # 1. REPRODUCIBILITY metadata.
+  sink(file.path(out_dir, "REPRODUCIBILITY.txt"))
+  cat("# Reproducibility log for behavioral analysis:", analysis_name, "\n")
+  cat("# Stage:", exp_version, "\n")
+  cat("# Generated:", format(Sys.time(), "%Y-%m-%d %H:%M:%S"), "\n\n")
+  cat("## Final formula:\n")
+  cat(formula_str, "\n\n")
+  cat("## Software versions:\n")
+  cat("R:        ", R.version.string, "\n")
+  cat("lme4:     ", as.character(packageVersion("lme4")), "\n")
+  cat("lmerTest: ", as.character(packageVersion("lmerTest")), "\n")
+  cat("glmmTMB:  ", as.character(packageVersion("glmmTMB")), "\n")
+  cat("buildmer: ", as.character(packageVersion("buildmer")), "\n")
+  cat("emmeans:  ", as.character(packageVersion("emmeans")), "\n\n")
+  cat("## Model family:    ", model_family, "\n")
+  cat("## Engine:          ", if (inherits(FINAL_MODEL, "glmmTMB")) "glmmTMB"
+                              else if (inherits(FINAL_MODEL, "merMod")) "lme4"
+                              else class(FINAL_MODEL)[1], "\n")
+  cat("## Outcome variable:", outcome_var, "\n")
+  cat("## Convergence:\n")
+  
+  is_sing_final <- if (inherits(FINAL_MODEL, "glmmTMB")) {
+    vc <- VarCorr(FINAL_MODEL)$cond
+    if (is.null(vc)) FALSE
+    else any(unlist(lapply(vc, function(x) diag(as.matrix(x)))) < 1e-6)
+  } else {
+    lme4::isSingular(FINAL_MODEL, tol = 1e-4)
+  }
+  cat("Singular fit:", is_sing_final, "\n")
+  cat("Observations:", nobs(FINAL_MODEL), "\n")
+  
+  ngrps_final <- if (inherits(FINAL_MODEL, "glmmTMB")) {
+    ng <- summary(FINAL_MODEL)$ngrps$cond
+    ng[1]
+  } else {
+    lme4::ngrps(FINAL_MODEL)[1]
+  }
+  cat("Subjects:    ", ngrps_final, "\n\n")
+  cat("## Bates 5-step diagnostic log:\n")
+  
+  step3_method_str <- diag_log$step3_method %||% "buildmer_LRT"
+  if (step3_method_str == "buildglmmTMB_LRT") {
+    cat("Step 3 method:               buildmer::buildglmmTMB() LRT (GLMM)\n")
+  } else {
+    cat("Step 3 method:               buildmer::buildmer() LRT (LMM)\n")
+  }
+  cat("Term ordering criterion:     LRT (default)\n")
+  cat("Term elimination criterion:  LRTalpha(0.20) (Matuschek et al., 2017)\n")
+  cat("Buildmer timeout (sec):      ", diag_log$timeout_sec %||% "NA", "\n")
+  cat("Engineering protections:     lmerTest detached during buildmer call;\n")
+  cat("                             withTimeout protection; ZCP fallback on failure.\n")
+  if (!is.na(diag_log$step3_fallback %||% NA_character_)) {
+    cat("Step 3 fallback triggered:  ", diag_log$step3_fallback, "\n")
+  }
+  cat("Random max vars:             ",
+      paste(diag_log$random_max_vars, collapse = ", "), "\n")
+  cat("Group name:                  ", diag_log$group_name, "\n")
+  cat("Step 1 (Maximal):           ", diag_log$step1_status, "\n")
+  if (!is.null(diag_log$step1_pca)) {
+    cat("  Step 1 effective/nominal: ",
+        count_effective_dims(diag_log$step1_pca), "/",
+        nrow(diag_log$step1_pca), "\n")
+  }
+  cat("Step 2 (ZCP):               ", diag_log$step2_status, "\n")
+  cat("Step 3 final formula:       ", diag_log$step3_final_formula %||% "n/a", "\n")
+  cat("Step 4 (correlations):      ", diag_log$step4_status, "\n")
+  cat("Step 5 (final dims):        ",
+      count_effective_dims(diag_log$step5_pca), "/",
+      nrow(diag_log$step5_pca), "\n")
+  cat("\n## Inferential method:\n")
+  cat("ANOVA test:                 ", diag_log$anova_method %||% "Wald_chi_square", "\n")
+  if (identical(diag_log$anova_method, "Wald_chi_square")) {
+    cat("Note: Satterthwaite was attempted but failed (no p-value column or\n")
+    cat("error). Wald chi-square (car::Anova) used as fallback.\n")
+  }
+  sink()
+  
+  # 2. Full model summary.
+  sink(file.path(out_dir, "summary_text.txt"))
+  print(summary(FINAL_MODEL))
+  sink()
+  
+  # 3. ANOVA table in markdown.
+  writeLines(
+    knitr::kable(anova_apa, format = "markdown",
+                 caption = sprintf("Type III ANOVA (%s), %s.",
+                                   diag_log$anova_method %||% "unknown", analysis_name)),
+    con = file.path(out_dir, "anova_apa.md")
+  )
+  
+  # 4. Post-hoc tables (main).
+  for (nm in names(list_of_tables)) {
+    safe_nm <- gsub("[^A-Za-z0-9_]", "_", nm)
+    writeLines(
+      knitr::kable(list_of_tables[[nm]], format = "markdown",
+                   caption = sprintf("%s -- %s", analysis_name, nm)),
+      con = file.path(out_dir, sprintf("posthoc_%s.md", safe_nm))
+    )
+  }
+  
+  # 5. Step 4 LRT (when applicable).
+  step4_lrt <- attr(FINAL_MODEL, "step4_lrt_table")
+  if (!is.null(step4_lrt) && nrow(step4_lrt) > 0) {
+    writeLines(
+      knitr::kable(kill_scipen(step4_lrt), format = "markdown",
+                   caption = sprintf("Step 4 candidate-correlation LRT, %s.", analysis_name)),
+      con = file.path(out_dir, "step4_correlation_lrt.md")
+    )
+  }
+  
+  # 6. Bates rePCA.
+  if (!is.null(diag_log$step5_pca) && !all(is.na(diag_log$step5_pca$component))) {
+    writeLines(
+      knitr::kable(kill_scipen(diag_log$step5_pca), format = "markdown",
+                   caption = sprintf("Final-model rePCA dimensionality, %s.", analysis_name)),
+      con = file.path(out_dir, "step5_rePCA.md")
+    )
+  }
+  
+  # 7. Supplementary marginal tables.
+  if (length(list_of_supp_tables) > 0) {
+    # Suppl directory sits alongside per-analysis output, NOT inside out_dir.
+    # We compute it by walking up one level (out_dir is e.g.
+    # results/Behavior/E1_TwoStage_Bates/GLMM_Rejection/; parent is the stage
+    # root, and Supplementary/ is a sibling of GLMM_Rejection/).
+    stage_root <- dirname(out_dir)
+    supp_subdir <- file.path(stage_root, "Supplementary",
+                             sprintf("%s_marginal_contrasts", analysis_name))
+    if (!dir.exists(supp_subdir)) dir.create(supp_subdir, recursive = TRUE)
+    for (nm in names(list_of_supp_tables)) {
+      safe_nm <- gsub("[^A-Za-z0-9_]", "_", nm)
+      writeLines(
+        knitr::kable(list_of_supp_tables[[nm]], format = "markdown",
+                     caption = sprintf("%s -- %s (omnibus interaction p in [%.2f, %.2f); EXPLORATORY ONLY)",
+                                       analysis_name, nm,
+                                       confirmatory_alpha, marginal_threshold)),
+        con = file.path(supp_subdir, sprintf("%s.md", safe_nm))
+      )
+    }
+    progress_log(sprintf("[Supplementary] %d marginal table(s) written to %s",
+                         length(list_of_supp_tables),
+                         file.path("Supplementary",
+                                   sprintf("%s_marginal_contrasts", analysis_name))),
+                 indent = 1)
+  }
+  
+  # 8. Save the fitted model object for downstream re-extraction.
+  rds_path <- file.path(out_dir, sprintf("final_model_%s.rds", analysis_name))
+  saveRDS(FINAL_MODEL, file = rds_path)
+  progress_log(sprintf("[Save] Model object: %s", basename(rds_path)), indent = 1)
+  
+  # 9. Excel export.
+  wb <- openxlsx::createWorkbook()
+  for (sheet_name in names(list_of_tables)) {
+    safe_sheet <- substr(gsub("[^A-Za-z0-9_]", "_", sheet_name), 1, 31)
+    openxlsx::addWorksheet(wb, safe_sheet)
+    openxlsx::writeData(wb, safe_sheet, list_of_tables[[sheet_name]])
+    openxlsx::addStyle(wb, safe_sheet,
+      openxlsx::createStyle(textDecoration = "bold", border = "Bottom"),
+      rows = 1, cols = 1:ncol(list_of_tables[[sheet_name]]))
+  }
+  openxlsx::saveWorkbook(wb,
+    file.path(out_dir, sprintf("STATS_%s_%s.xlsx", exp_version, analysis_name)),
+    overwrite = TRUE)
+}
+```
+
+``` {r multi-summary}
+# ==============================================================================
+# Multi-analysis side-by-side summary report for one stage.
+# Produces both HTML (via sjPlot::tab_model) and markdown fallback.
+# ==============================================================================
+report_behavior_multi <- function(model_list, exp_version, out_dir) {
+  if (length(model_list) == 0) return(invisible(NULL))
+  
+  out_html <- file.path(out_dir, sprintf("Behavior_AllAnalyses_%s.html", exp_version))
+  out_md   <- file.path(out_dir, sprintf("Behavior_AllAnalyses_%s.md", exp_version))
+  
+  # ---- HTML output via sjPlot::tab_model ----
+  tab_model_succeeded <- FALSE
+  tryCatch({
+    sjPlot::tab_model(
+      model_list,
+      show.se = TRUE, show.stat = TRUE, show.ci = FALSE,
+      string.se = "SE", string.stat = "stat", string.p = "p-value",
+      show.re.var = TRUE, show.obs = TRUE, show.icc = FALSE,
+      show.r2 = TRUE, show.loglik = TRUE, show.dev = TRUE,
+      emph.p = TRUE, p.style = "numeric_stars",
+      file = out_html,
+      dv.labels = names(model_list)
+    )
+    if (file.exists(out_html) && file.size(out_html) > 0) {
+      cat(sprintf("[Multi-analysis HTML] %s\n", basename(out_html)))
+      tab_model_succeeded <- TRUE
+    } else {
+      cat(sprintf("[WARN] tab_model returned without error but no file written: %s\n",
+                  out_html))
+    }
+  }, error = function(e) {
+    cat(sprintf("[WARN] tab_model failed: %s\n", conditionMessage(e)))
+  })
+  
+  # ---- Markdown fallback ----
+  tryCatch({
+    rows <- list()
+    methods_log <- character(0)
+    for (a_name in names(model_list)) {
+      mdl <- model_list[[a_name]]
+      
+      anova_obj <- NULL
+      method_used <- NA_character_
+      
+      if (inherits(mdl, c("glmerMod", "glmmTMB"))) {
+        anova_obj <- tryCatch(
+          car::Anova(mdl, type = 3, test.statistic = "Chisq"),
+          error = function(e) NULL
+        )
+        if (!is.null(anova_obj)) method_used <- "Wald chi-square (GLMM)"
+      } else if (inherits(mdl, "merMod")) {
+        if (!inherits(mdl, "lmerModLmerTest")) {
+          mdl_upgraded <- tryCatch(
+            lmerTest::as_lmerModLmerTest(mdl),
+            error = function(e) NULL
+          )
+          if (!is.null(mdl_upgraded)) mdl <- mdl_upgraded
+        }
+        
+        anova_obj <- tryCatch({
+          res <- suppressWarnings(anova(mdl, type = 3, ddf = "Satterthwaite"))
+          if (any(grepl("^Pr", colnames(res)))) {
+            method_used <- "Satterthwaite F"; res
+          } else NULL
+        }, error = function(e) NULL)
+        
+        if (is.null(anova_obj)) {
+          anova_obj <- tryCatch({
+            res <- suppressWarnings(anova(mdl, type = 3, ddf = "Kenward-Roger"))
+            if (any(grepl("^Pr", colnames(res)))) {
+              method_used <- "Kenward-Roger F"; res
+            } else NULL
+          }, error = function(e) NULL)
+        }
+        
+        if (is.null(anova_obj)) {
+          anova_obj <- tryCatch(
+            car::Anova(mdl, type = 3, test.statistic = "Chisq"),
+            error = function(e) NULL
+          )
+          if (!is.null(anova_obj)) {
+            method_used <- "Wald chi-square (LMM fallback)"
+          }
+        }
+      }
+      
+      if (is.null(anova_obj)) next
+      
+      methods_log <- c(methods_log, sprintf("%s: %s", a_name, method_used))
+      apa <- format_anova_apa(anova_obj, mdl)
+      apa$Analysis <- a_name
+      apa$Method <- method_used
+      rows[[a_name]] <- apa[, c("Analysis", "Effect", "APA_Report", "Sig", "Method")]
+    }
+    
+    if (length(rows) > 0) {
+      combined <- do.call(rbind, rows)
+      writeLines(
+        c(sprintf("# Behavioral Analysis Summary, %s", exp_version),
+          sprintf("Generated: %s", format(Sys.time(), "%Y-%m-%d %H:%M:%S")),
+          "",
+          "Type III ANOVA tests. LMM analyses use a Satterthwaite -> ",
+          "Kenward-Roger -> Wald cascade (lmerTest, pbkrtest, car). GLMM ",
+          "analyses use Wald chi-square (car::Anova) as the only valid ",
+          "method (Satterthwaite is undefined for non-Gaussian likelihoods). ",
+          "The actual method used per analysis is shown in the Method column.",
+          "",
+          "## Methods used per analysis:",
+          paste0("- ", methods_log),
+          "",
+          knitr::kable(combined, format = "markdown",
+                       caption = sprintf("Behavioral fixed-effect tests across %d analyses.",
+                                         length(rows)))),
+        con = out_md
+      )
+      cat(sprintf("[Multi-analysis Markdown] %s\n", basename(out_md)))
+    }
+  }, error = function(e) {
+    cat(sprintf("[WARN] Markdown multi-analysis summary failed: %s\n",
+                conditionMessage(e)))
+  })
+  
+  invisible(list(html_ok = tab_model_succeeded, html_path = out_html, md_path = out_md))
+}
+```
+
+``` {r execution-three-stage}
+# ==============================================================================
+# 7. Execution: Three-Stage Loop
+# ==============================================================================
+# For each stage (E1, E2, Integrative):
+#   1. Build stage-specific output directory tree.
+#   2. Load data (single-experiment loader or integrative loader).
+#   3. Build subset for unfair-only analysis.
+#   4. Run all configured analyses.
+#   5. Write stage-level multi-analysis summary.
+#   6. Write stage-specific Methods paragraph.
+
+# Pipeline-wide accumulator for cross-stage final summary.
+all_stage_models <- list()
+pipeline_t0 <- Sys.time()
+
+for (stage in stages_to_run) {
+  
+  progress_log(sprintf("\n%s\n>>> STAGE: %s (cumulative pipeline elapsed: %s)\n%s",
+                       strrep("=", 70), stage,
+                       format_elapsed(pipeline_t0),
+                       strrep("=", 70)))
+  
+  # ---- Stage-specific output directory ----
+  out_root_stage <- file.path(out_root_base, sprintf("%s_TwoStage_Bates", stage))
+  out_glmm       <- file.path(out_root_stage, "GLMM_Rejection")
+  out_lmm_main   <- file.path(out_root_stage, "LMM_RT_main")
+  out_lmm_unfair <- file.path(out_root_stage, "LMM_RT_unfair")
+  out_tables     <- file.path(out_root_stage, "Tables_Manuscript")
+  out_suppl      <- file.path(out_root_stage, "Supplementary")
+  for (d in c(out_root_stage, out_glmm, out_lmm_main, out_lmm_unfair,
+              out_tables, out_suppl)) {
+    if (!dir.exists(d)) dir.create(d, recursive = TRUE)
+  }
+  
+  # ---- Per-stage buildmer timeout ----
+  stage_timeout <- buildmer_timeout_map[[stage]] %||% 1800
+  progress_log(sprintf("[%s] buildmer timeout set to %d sec.",
+                       stage, stage_timeout))
+  
+  # ---- Load data ----
+  if (stage %in% c("E1", "E2")) {
+    path_pipeline <- here("data", paste0("02_Pipeline_Output_", stage))
+    path_trials <- file.path(path_pipeline, "Method_Regression",
+                              "Stimulus_Locked", "trials.csv")
+    if (!file.exists(path_trials)) {
+      stop(sprintf("Trial file not found for %s: %s\nVerify upstream preprocessing.",
+                   stage, path_trials))
+    }
+    
+    cat(sprintf("\n--- Loading and preparing behavioral data for %s ---\n", stage))
+    df_clean <- load_single_experiment(path_trials, stage)
+    
+  } else if (stage == "Integrative") {
+    path_E1 <- here("data", "02_Pipeline_Output_E1",
+                    "Method_Regression", "Stimulus_Locked", "trials.csv")
+    path_E2 <- here("data", "02_Pipeline_Output_E2",
+                    "Method_Regression", "Stimulus_Locked", "trials.csv")
+    
+    cat("\n--- Loading and preparing INTEGRATIVE behavioral data (E1 + E2) ---\n")
+    df_clean <- load_integrative(path_E1, path_E2)
+    
+  } else {
+    stop(sprintf("Unknown stage: %s", stage))
+  }
+  
+  # ---- Subset for unfair-only analysis ----
+  df_unfair <- df_clean %>% dplyr::filter(offer_type == "unfair")
+  cat(sprintf("\n[%s] Unfair-only subset: %d trials, %d subjects\n",
+              stage, nrow(df_unfair),
+              dplyr::n_distinct(df_unfair$participant_id_internal)))
+  
+  # ---- Uniqueness check ----
+  check_uniqueness(df_clean,
+                    sprintf("df_clean (%s)", stage))
+  check_uniqueness(df_unfair,
+                    sprintf("df_unfair (%s)", stage))
+  
+  # ---- Run all configured analyses ----
+  behavior_models <- list()
+  total_analyses <- length(analyses_to_run)
+  stage_t0 <- Sys.time()
+  
+  for (a_idx in seq_along(analyses_to_run)) {
+    a_name <- analyses_to_run[a_idx]
+    
+    progress_log(sprintf(">>> [%s | %d/%d] Analysis: %s (stage elapsed: %s)",
+                         stage, a_idx, total_analyses, a_name,
+                         format_elapsed(stage_t0)))
+    
+    # ---- Configure analysis: differs between single-exp and Integrative ----
+    config <- NULL
+    
+    if (stage %in% c("E1", "E2")) {
+      # ---- 2-way model configurations ----
+      config <- switch(a_name,
+        "GLMM_rejection" = list(
+          mode = "2way",
+          data = df_clean,
+          outcome = "reject_binary",
+          fixed_terms = "(emotion + offer_type)^2",
+          include = c("emotion", "offer_type", "emotion:offer_type"),
+          family = "binomial",
+          out = out_glmm,
+          posthoc = list(within = "offer_type", between = "emotion"),
+          random_max_vars = c("emotion", "offer_type")
+        ),
+        "LMM_RT_main" = list(
+          mode = "2way",
+          data = df_clean,
+          outcome = "logRT",
+          fixed_terms = "(emotion + offer_type)^2",
+          include = c("emotion", "offer_type", "emotion:offer_type"),
+          family = "gaussian",
+          out = out_lmm_main,
+          posthoc = list(within = "offer_type", between = "emotion"),
+          random_max_vars = c("emotion", "offer_type")
+        ),
+        "LMM_RT_unfair" = list(
+          mode = "2way",
+          data = df_unfair,
+          outcome = "logRT",
+          fixed_terms = "(emotion + reaction)^2",
+          include = c("emotion", "reaction", "emotion:reaction"),
+          family = "gaussian",
+          out = out_lmm_unfair,
+          posthoc = list(within = "reaction", between = "emotion"),
+          random_max_vars = c("emotion", "reaction")
+        ),
+        NULL
+      )
+      
+    } else if (stage == "Integrative") {
+      # ---- 3-way model configurations ----
+      # Exp is between-subjects: enters as fixed factor but NOT in random
+      # slopes. The 3-way fixed structure uses ^3 to include all interactions
+      # up to Exp x emotion x within-factor.
+      config <- switch(a_name,
+        "GLMM_rejection" = list(
+          mode = "3way",
+          data = df_clean,
+          outcome = "reject_binary",
+          fixed_terms = "(Exp + emotion + offer_type)^3",
+          include = c("Exp", "emotion", "offer_type",
+                      "Exp:emotion", "Exp:offer_type", "emotion:offer_type",
+                      "Exp:emotion:offer_type"),
+          family = "binomial",
+          out = out_glmm,
+          posthoc = list(exp = "Exp", between = "emotion", within = "offer_type"),
+          random_max_vars = c("emotion", "offer_type")
+        ),
+        "LMM_RT_main" = list(
+          mode = "3way",
+          data = df_clean,
+          outcome = "logRT",
+          fixed_terms = "(Exp + emotion + offer_type)^3",
+          include = c("Exp", "emotion", "offer_type",
+                      "Exp:emotion", "Exp:offer_type", "emotion:offer_type",
+                      "Exp:emotion:offer_type"),
+          family = "gaussian",
+          out = out_lmm_main,
+          posthoc = list(exp = "Exp", between = "emotion", within = "offer_type"),
+          random_max_vars = c("emotion", "offer_type")
+        ),
+        "LMM_RT_unfair" = list(
+          mode = "3way",
+          data = df_unfair,
+          outcome = "logRT",
+          fixed_terms = "(Exp + emotion + reaction)^3",
+          include = c("Exp", "emotion", "reaction",
+                      "Exp:emotion", "Exp:reaction", "emotion:reaction",
+                      "Exp:emotion:reaction"),
+          family = "gaussian",
+          out = out_lmm_unfair,
+          posthoc = list(exp = "Exp", between = "emotion", within = "reaction"),
+          random_max_vars = c("emotion", "reaction")
+        ),
+        NULL
+      )
+    }
+    
+    if (is.null(config)) {
+      progress_log(sprintf("[SKIP] Unknown analysis or unsupported stage/analysis combination: %s | %s",
+                           stage, a_name))
+      next
+    }
+    
+    # ---- Dispatch to 2-way or 3-way runner ----
+    fit <- tryCatch({
+      if (config$mode == "2way") {
+        run_behavior_analysis(
+          data = config$data,
+          analysis_name = a_name,
+          outcome_var = config$outcome,
+          fixed_terms = config$fixed_terms,
+          include_terms = config$include,
+          model_family = config$family,
+          out_dir = config$out,
+          exp_version = stage,
+          posthoc_factors = config$posthoc,
+          random_max_vars = config$random_max_vars,
+          timeout_sec = stage_timeout
+        )
+      } else {
+        run_behavior_analysis_3way(
+          data = config$data,
+          analysis_name = a_name,
+          outcome_var = config$outcome,
+          fixed_terms = config$fixed_terms,
+          include_terms = config$include,
+          model_family = config$family,
+          out_dir = config$out,
+          exp_version = stage,
+          posthoc_factors = config$posthoc,
+          random_max_vars = config$random_max_vars,
+          timeout_sec = stage_timeout
+        )
+      }
+    }, error = function(e) {
+      progress_log(sprintf("[ERROR] %s | %s failed: %s",
+                           stage, a_name, conditionMessage(e)))
+      NULL
+    })
+    
+    if (!is.null(fit)) {
+      behavior_models[[a_name]] <- fit
+    }
+    progress_log(sprintf(">>> [%s | %d/%d] %s complete.",
+                         stage, a_idx, total_analyses, a_name))
+  }
+  
+  # ---- Stage-level multi-analysis summary table ----
+  report_behavior_multi(behavior_models, stage, out_tables)
+  
+  # ---- Stage-specific Methods paragraph ----
+  # Note: per-stage Methods text is generated inside this loop so that the
+  # sample-size summary inside it reflects the data actually used by the
+  # current stage.
+  if (stage %in% c("E1", "E2")) {
+    stage_subtitle <- sprintf("Experiment %s (single-experiment analyses)", stage)
+    stage_models_summary <- sprintf(
+      "Models fitted in this stage:\n
+1. **Rejection rate (GLMM_rejection):** binomial mixed-effects model on reject_binary
+   with predictors emotion (5 levels) x offer type (fair, unfair) and their interaction.
+
+2. **Response time, main analysis (LMM_RT_main):** linear mixed-effects model on
+   log RT with predictors emotion x offer type and their interaction. Reaction was
+   deliberately NOT included as a covariate (collider; Rohrer, 2018).
+
+3. **Response time, unfair-only (LMM_RT_unfair):** linear mixed-effects model
+   on log RT restricted to unfair trials, with predictors emotion x reaction
+   and their interaction. This stratum parallels HDDM decision-dynamics
+   modeling.")
+  } else if (stage == "Integrative") {
+    stage_subtitle <- "Integrative cross-experiment analysis (E1 + E2 pooled)"
+    stage_models_summary <- sprintf(
+      "Models fitted in this stage:\n
+All three analyses below are 3-way mixed-effects models with Experiment (E1
+sequential vs E2 simultaneous) as a between-subjects factor. Participant ids
+were uniquified across experiments via the prefix '<Exp>_' to prevent any
+collision between E1 and E2 numeric ids.
+
+1. **Rejection rate (GLMM_rejection):** binomial mixed-effects model on
+   reject_binary with predictors Experiment x emotion x offer type (full
+   3-way interaction).
+
+2. **Response time, main analysis (LMM_RT_main):** linear mixed-effects model
+   on log RT with predictors Experiment x emotion x offer type (full 3-way
+   interaction). Reaction not included (collider; Rohrer, 2018).
+
+3. **Response time, unfair-only (LMM_RT_unfair):** linear mixed-effects model
+   on log RT restricted to unfair trials, with Experiment x emotion x
+   reaction.
+
+Post-hoc decomposition for 3-way models follows the Maxwell-Delaney layered
+strategy: when the 3-way interaction is significant, simple effects are
+decomposed per Experiment. When the 3-way is not significant, lower-order
+2-way interactions are evaluated independently and main effects reported
+only for factors NOT participating in any significant 2-way interaction.")
+  } else {
+    stage_subtitle <- sprintf("Stage %s", stage)
+    stage_models_summary <- "Unknown stage."
+  }
+  
+  methods_paragraph <- sprintf(
+'# Methods Paragraph (Behavioral Analyses, Stage %s)
+
+%s
+
+Generated: %s
+
+## Statistical Analysis
+
+Behavioral data were analyzed using mixed-effects models in R (%s) with the
+lme4 (%s) and lmerTest (%s) packages, with binomial models fitted via glmmTMB
+(%s). Categorical predictors used sum-to-zero contrasts (R option contr.sum)
+to support valid Type III tests in the presence of interactions (Schad,
+Vasishth, Hohenstein, & Kliegl, 2020). Trials were excluded if the
+participant did not respond (reaction = 0), if response time fell outside
+%d-%d ms, or if the offer was the medium-fairness filler (Offers_Other = 7).
+
+%s
+
+### Random-effects structure
+
+Random-effects structures were selected following the parsimonious-Bates
+protocol (Bates, Kliegl, Vasishth, & Baayen, 2015; Matuschek, Kliegl,
+Vasishth, Baayen, & Bates, 2017). Starting from the design-justified maximal
+model (random intercepts and slopes for within-subject factors by
+participant), zero-correlation parameter (ZCP) models were fitted, then
+non-supported variance components were removed via likelihood-ratio tests
+with elimination alpha = 0.20 using the buildmer package. Correlation
+parameters between surviving slopes were tested in a final step.
+Random-effects dimensionality was diagnosed via rePCA (Bates et al., 2015).
+
+For the Integrative analysis, Experiment was modeled as a between-subjects
+factor (each participant belongs to exactly one experiment). Random slopes
+for Experiment by participant are unidentifiable by design and were
+therefore not included. Participant ids were prefixed by the experiment
+label ("E1_", "E2_") to guarantee uniqueness across experiments.
+
+Stimulus identity was counterbalanced across participants via a Latin-square
+design and was not modeled as a separate random effect (cf. Westfall, Kenny,
+& Judd, 2014).
+
+### Inferential strategy
+
+For linear mixed models, fixed-effect inference used a Type III F-test with
+denominator degrees of freedom approximated via a cascading method
+preference: Satterthwaite (Kuznetsova, Brockhoff, & Christensen, 2017;
+Luke, 2017) was attempted first; on numerical failure, Kenward-Roger
+(Kenward & Roger, 1997; via the pbkrtest backend) was attempted; Wald
+chi-square (car::Anova) was used only as a final fallback. The method
+actually used per analysis is reported in the supplementary REPRODUCIBILITY
+log. For the binomial model, Wald chi-square tests were used because
+Satterthwaite and Kenward-Roger are not defined for non-Gaussian
+likelihoods (the residual variance term they require does not exist in
+binomial likelihoods, where Var(y) is determined by the mean structure as
+p(1-p)).
+
+Post-hoc contrasts were computed using the emmeans package (Lenth, 2024)
+with asymptotic standard errors and false-discovery-rate (FDR) correction
+within each effect family.
+
+### Effect-size reporting
+
+For Gaussian models, partial eta-squared with 95%% confidence intervals are
+reported alongside F-tests (effectsize::eta_squared). For the binomial
+model, partial eta-squared is not defined; odds ratios with 95%% CIs are
+reported for fixed-effect contrasts, and marginal/conditional R-squared
+(Nakagawa-Schielzeth, 2013) are reported for overall model fit. For
+log-RT contrasts, percent RT change is reported as (exp(b) - 1) x 100.
+
+### Post-hoc gating
+
+For 2-way analyses (single-experiment stages E1 and E2), simple-effect
+decompositions of the emotion x offer_type (or emotion x reaction)
+interaction were performed only when the omnibus interaction p < %.2f.
+Effects with %.2f <= p < %.2f were computed but reported only in
+supplementary materials, never as confirmatory evidence.
+
+For 3-way analyses (Integrative stage), decomposition was layered:
+(a) if the 3-way Experiment x emotion x within-factor interaction was
+significant (p < %.2f), simple effects were decomposed per Experiment;
+(b) if 0.05 <= 3-way p < 0.10, the same decomposition was performed but
+written to Supplementary; (c) if the 3-way was not significant, each 2-way
+interaction was evaluated independently and main effects reported only for
+factors not participating in any significant 2-way interaction.
+
+## Sample
+
+%d trials from %d unique participants entered the main analyses in this stage;
+the unfair-only stratum included %d trials.
+
+',
+    stage,
+    stage_subtitle,
+    format(Sys.time(), "%Y-%m-%d %H:%M:%S"),
+    paste(R.version$major, R.version$minor, sep = "."),
+    as.character(packageVersion("lme4")),
+    as.character(packageVersion("lmerTest")),
+    as.character(packageVersion("glmmTMB")),
+    rt_lower_ms, rt_upper_ms,
+    stage_models_summary,
+    confirmatory_alpha, confirmatory_alpha, marginal_threshold,
+    confirmatory_alpha,
+    nrow(df_clean),
+    dplyr::n_distinct(df_clean$participant_id_internal),
+    nrow(df_unfair)
+  )
+  
+  writeLines(methods_paragraph,
+             con = file.path(out_tables,
+                             sprintf("Methods_paragraph_%s.md", stage)))
+  cat(sprintf("[Methods] Methods_paragraph_%s.md written.\n", stage))
+  
+  # ---- Accumulate models for cross-stage view ----
+  all_stage_models[[stage]] <- behavior_models
+  
+  cat(sprintf("\n[%s pipeline complete] Fitted %d/%d analyses in stage %s.\n",
+              stage, length(behavior_models), total_analyses, stage))
+}
+
+cat(sprintf("\n\n========================================\n   ALL STAGES COMPLETE.\n   Total elapsed: %s\n   Output root: %s\n========================================\n",
+            format_elapsed(pipeline_t0), out_root_base))
+```
+
+``` {r session-info}
+# ==============================================================================
+# 8. Session Information
+# ==============================================================================
+sink(file.path(out_root_base, "SESSION_INFO.txt"))
+print(sessionInfo())
+sink()
+
+cat("\n>>> Session info written to:", file.path(out_root_base, "SESSION_INFO.txt"), "\n")
+sessionInfo()
+```

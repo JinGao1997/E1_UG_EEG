@@ -60,7 +60,7 @@ import matplotlib.lines as mlines
 # ==============================================================================
 # 1) Global Configuration
 # ==============================================================================
-EXPERIMENT_VERSION = "E2"  # Default. Override with --e1, --e2, --crossexp.
+EXPERIMENT_VERSION = "E1"  # Default. Override with --e1, --e2, --crossexp.
                             # Cross-experiment is not yet implemented in
                             # the upstream R pipeline (planned for next round).
 ERROR_BAR_TYPE = "SE"

@@ -25,7 +25,7 @@ knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
 # ==============================================================================
 
 # Experiment identifier. Matches upstream Python pre-processing output nomenclature.
-experiment_id <- "E1" 
+experiment_id <- "E2" 
 
 # Parent directory containing all component-specific subdirectories.
 root_dir <- "C:/Code/UG_ERP_Project/results/EEG" 
@@ -124,12 +124,15 @@ component_specs <- list(
   testN170 = list(win_ms = c(150, 350), roi = c("P7", "P8", "PO7", "PO8"), source_comp = "N170"),
   testEPN = list(win_ms = c(200, 400), roi = c("PO7", "PO8", "P7", "P8", "O1", "O2"), source_comp = "EPN"),
   testFRN = list(win_ms = testfrn_window, roi = c("F3", "Fz", "F4", "FC1", "FC2", "Cz"), source_comp = "FRN"),
-  testN400 = list(win_ms = c(300, 500), roi = c("Cz", "CPz", "Pz"), source_comp = "N400"),
-  testLPP = list(win_ms = c(400, 600), roi = c("Pz", "Cz", "C1", "C2", "CP1", "CP2"), source_comp = "LPP_offer")
+  # Exploratory wide window: 300-900 ms covers the canonical N400 (300-500 ms)
+  # and the LPP/late-positivity range (500-900 ms) in a single sweep. Single-panel
+  # topomap (mean over 300-900 ms) is intentionally coarse — interpretation lives
+  # in the 40-ms time_course_grids, not in this averaged map.
+  testN400 = list(win_ms = c(300, 900), roi = c("Cz", "CPz", "Pz"), source_comp = "N400"),
+  testLPP  = list(win_ms = c(300, 900), roi = c("Pz", "Cz", "C1", "C2", "CP1", "CP2"), source_comp = "LPP_offer")
 )
 
 # Formal nomenclature aligned with upstream Python pipeline ('enj' mapped to Reward).
-# Keys represent internal logic; Values represent publication-ready presentation labels.
 emotion_list <- c("aff", "dis", "dom", "enj")
 emotion_labels <- c(neu = "Neutral", aff = "Affiliative", dis = "Disgust", dom = "Dominance", enj = "Reward")
 offer_types  <- c("fair", "unfair")
@@ -390,7 +393,7 @@ for (comp_name in names(component_specs)) {
   }
   
   chanlocs <- read_csv(chan_file, show_col_types = FALSE, lazy = FALSE) %>% rename(electrode = channel)
-  methods_to_run <- c("Regression", "Standard")
+  methods_to_run <- c("Standard")  #"Regression","Standard"
   
   # ============================================================================
   # v2.3: Cross-method shared color scale (Regression-led)

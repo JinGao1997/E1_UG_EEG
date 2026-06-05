@@ -1,5 +1,5 @@
 # Baseline Balance Pre-Check: EPN
-Generated: 2026-05-05 13:28:33
+Generated: 2026-05-19 11:46:24
 
 ## Purpose
 Diagnostic test of whether mean baseline amplitude differs across

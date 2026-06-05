@@ -1,6 +1,6 @@
 # Methods Paragraph (EEG Single-trial LMM, E1)
 
-Generated: 2026-05-05 13:31:26
+Generated: 2026-05-19 11:49:00
 
 ## Statistical Analysis
 

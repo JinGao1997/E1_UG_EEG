@@ -1,5 +1,5 @@
 # Stage 1 ANOVA Summary, E2
-Generated: 2026-05-05 12:11:11
+Generated: 2026-05-19 10:02:47
 
 Type III ANOVA tests. LMM analyses use a Satterthwaite -> 
 Kenward-Roger -> Wald cascade (lmerTest, pbkrtest, car). All EEG

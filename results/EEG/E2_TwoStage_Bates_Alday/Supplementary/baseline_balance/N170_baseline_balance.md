@@ -1,5 +1,5 @@
 # Baseline Balance Pre-Check: N170
-Generated: 2026-05-05 12:06:31
+Generated: 2026-05-19 09:58:19
 
 ## Purpose
 Diagnostic test of whether mean baseline amplitude differs across

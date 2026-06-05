@@ -1,5 +1,5 @@
 # Baseline Balance Pre-Check: FRN
-Generated: 2026-05-05 13:24:21
+Generated: 2026-05-19 11:42:36
 
 ## Purpose
 Diagnostic test of whether mean baseline amplitude differs across

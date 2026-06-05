@@ -1,5 +1,5 @@
 # Baseline Balance Pre-Check: LPP_offer
-Generated: 2026-05-05 12:04:38
+Generated: 2026-05-19 09:56:33
 
 ## Purpose
 Diagnostic test of whether mean baseline amplitude differs across
