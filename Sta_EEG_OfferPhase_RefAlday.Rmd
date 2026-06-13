@@ -39,63 +39,63 @@ options(contrasts = c("contr.sum", "contr.poly"))
 # Global Settings & Analysis Targets (SINGLE SOURCE OF TRUTH)
 # ------------------------------------------------------------------------------
 # Set experiment version to match upstream preprocessing pipeline output.
-experiment_version <- "E1"  # Options: "E1" or "E2"
+experiment_version <- "E2"  # Options: "E1" or "E2"
 
 # ------------------------------------------------------------------------------
 # Stage 2 trait architecture (v2.2: dual-track confirmatory/exploratory design).
 #
 # RATIONALE FOR THE SPLIT
-# Trait moderation tests are partitioned into two methodological tracks based on
-# the strength of prior UG-ERP literature supporting each trait as an a priori
-# moderator. Traits with established literature support are tested as
-# confirmatory hypotheses via single-stage LMM with three-way trait-by-emotion-
-# by-offer_type interactions (the statistically valid implementation of cross-
-# level moderation; see Snijders & Bosker, 2012, ch. 5-6). Traits without such
-# direct support are screened in a secondary BLUP-based exploratory analysis,
-# explicitly hypothesis-generating rather than confirmatory.
+# Trait variables are partitioned by their THEORETICAL ROLE (not lumped as one
+# covariate set), addressing the over-fitting/multicollinearity risk of dumping
+# many correlated questionnaires into one model:
 #
-# This division replaces the v2 grouped-FDR design (in which all 10 traits
-# entered the same BLUP framework with within-group FDR) and addresses two
-# methodological concerns: (a) BLUP-then-correlate is known to suffer shrinkage
-# bias and incorrect SE propagation (Hofmann & Rovine, 2007; Rouder & Haaf,
-# 2019), making it unsuitable for confirmatory inference; (b) treating all 10
-# traits as equivalent obscures the literature-grounded prioritisation of the
-# confirmatory subset.
+# (A) CONFIRMATORY MODERATORS (single-stage LMM moderation, n = 2)
+#   SVO_angle            : social value orientation; established UG-ERP moderator
+#                          (e.g., Wu et al., 2021, SCAN, on prosocial vs proself
+#                          differences in MFN/P3).
+#   Negative_Affectivity : trait anxiety / Neuroticism analogue; established FRN
+#                          moderator across feedback paradigms (Gu et al., 2010;
+#                          Gu et al., 2014; Banica et al., 2021).
+#   Tested as confirmatory hypotheses via single-stage LMM with the three-way
+#   trait-by-emotion-by-offer_type interaction (the statistically valid
+#   implementation of cross-level moderation; Snijders & Bosker, 2012, ch. 5-6).
 #
-# CONFIRMATORY TRAITS (single-stage LMM, n = 5)
-#   Rating_1, Rating_2, Rating_3 : cover-story belief checks; design-internal
-#                                  manipulation moderators (face/offer realism
-#                                  and self-reported manipulation strength).
-#   SVO_angle                    : social value orientation; established UG-ERP
-#                                  moderator (e.g., Wu et al., 2021, SCAN, on
-#                                  prosocial vs proself differences in MFN/P3).
-#   Negative_Affectivity         : trait anxiety / Neuroticism analogue;
-#                                  established FRN moderator across feedback
-#                                  paradigms (Gu et al., 2010; Gu et al., 2014;
-#                                  Banica et al., 2021).
+# (B) NUISANCE COVARIATES (separate main-effect control model, n = 3)
+#   Rating_1, Rating_2, Rating_3 : cover-story belief checks (manipulation
+#                          checks), NOT theoretical moderators (decision 2026-06).
+#                          They enter a SEPARATE control model as grand-mean-
+#                          centered MAIN-EFFECT covariates (no interaction), to
+#                          verify the emotion x offer_type effects are robust to
+#                          belief strength. The primary Stage 1 inference is left
+#                          untouched. See run_covariate_control_check().
 #
-# EXPLORATORY PID-5-BF TRAITS (BLUP-based screen, n = 5)
-#   Detachment, Antagonism, Disinhibition, Anankastia, Psychoticism : the five
-#   remaining PID-5-BF maladaptive personality dimensions. These constructs are
-#   theoretically distinct (Krueger et al., 2012) but lack direct UG-ERP
-#   literature support; they are reported in Supplementary Materials as
-#   hypothesis-generating findings only.
+# (C) EXPLORATORY PID-5-BF TRAITS (BLUP-based screen, n = 5)
+#   Detachment, Antagonism, Disinhibition, Anankastia, Psychoticism : five
+#   PID-5-BF dimensions (Krueger et al., 2012) lacking direct UG-ERP literature
+#   support; screened in a secondary BLUP-based exploratory analysis (BLUP-then-
+#   correlate suffers shrinkage/SE bias, Hofmann & Rovine 2007; Rouder & Haaf
+#   2019), reported in Supplementary Materials as hypothesis-generating only.
 # ------------------------------------------------------------------------------
-confirmatory_traits <- c("Rating_1", "Rating_2", "Rating_3",
-                         "SVO_angle", "Negative_Affectivity")
+confirmatory_traits <- c("SVO_angle", "Negative_Affectivity")
+
+# Cover-story belief checks handled as nuisance covariates (main-effect control),
+# NOT as moderators (decision: 2026-06).
+rating_covariates <- c("Rating_1", "Rating_2", "Rating_3")
 
 exploratory_pid_traits <- c("Detachment", "Antagonism", "Disinhibition",
                             "Anankastia", "Psychoticism")
 
 # Retained for back-compatibility with the BLUP exploratory engine, which uses
 # a named-list structure to drive output directory naming. Only the PID group
-# is populated; Rating and SVO+NegAff are now handled by the single-stage path.
+# is populated; SVO+NegAff use the single-stage moderation path; Ratings use the
+# nuisance-covariate control path.
 stage2_trait_groups <- list(
   Exploratory_PID5BF = exploratory_pid_traits
 )
 
 # Flat union retained for covariate loading (load_covariates filters by this).
-stage2_traits <- c(confirmatory_traits, exploratory_pid_traits)
+# Includes rating_covariates so the nuisance-covariate control model can use them.
+stage2_traits <- c(confirmatory_traits, rating_covariates, exploratory_pid_traits)
 
 # ------------------------------------------------------------------------------
 # Trial-level inclusion criteria
@@ -124,33 +124,26 @@ confirmatory_alpha  <- 0.05
 marginal_threshold  <- 0.10
 
 # Component definitions per experimental design.
-# 
-# CONFIRMATORY components are present in BOTH experiments (E1 ∩ E2) and
-# constitute the cross-experiment conceptual replication evidence:
-#   FRN, N400, LPP_offer.
-# 
-# EXPLORATORY components differ between experiments and are not directly
-# comparable cross-experiment:
-#   E1: EPN (offer-locked; face occurred prior, so EPN here reflects offer
-#       processing, NOT face-evoked perception).
-#   E2: N170, EPN (face-evoked / face+offer simultaneous; functionally
-#       distinct from E1 EPN).
-# 
+#
+# The offer-locked analysis extracts two CONFIRMATORY components, present in
+# BOTH experiments (E1 ∩ E2) and constituting the cross-experiment conceptual
+# replication evidence:
+#   FRN, P3.
+#
 # Status per component is propagated to REPRODUCIBILITY.txt and Methods
 # paragraph. All components run the same Stage 1 LMM pipeline; the
 # confirmatory/exploratory distinction is a reporting-layer label.
-# 
+#
 # CPP (response-locked) was previously included; v2 removes it as out of
 # scope for the offer-phase analysis.
-if (experiment_version == "E1") {
-  confirmatory_components <- c("FRN", "N400", "LPP_offer")
-  exploratory_components  <- c("EPN")
-} else if (experiment_version == "E2") {
-  confirmatory_components <- c("FRN", "N400", "LPP_offer")
-  exploratory_components  <- c("N170", "EPN")
-} else {
-  stop("Configuration Error: Unknown experiment_version.")
+comp_csv <- here::here("config", "erp_components.csv")
+if (!file.exists(comp_csv)) {
+  stop(sprintf("Component config not found: %s", comp_csv))
 }
+comp_def <- readr::read_csv(comp_csv, show_col_types = FALSE)
+comp_def <- comp_def[comp_def$experiment == experiment_version, ]
+confirmatory_components <- comp_def$comp_name[comp_def$role == "confirmatory"]
+exploratory_components  <- comp_def$comp_name[comp_def$role == "exploratory"]
 analyze_stim_components <- c(confirmatory_components, exploratory_components)
 
 # Helper to return component status for downstream reporting.
@@ -219,19 +212,23 @@ out_stage1          <- file.path(out_root, "Stage1_TrialLevel")
 out_stage2          <- file.path(out_root, "Stage2_TraitModeration")
 out_stage2_confirm  <- file.path(out_stage2, "Confirmatory_SingleStage")
 out_stage2_explore  <- file.path(out_stage2, "Exploratory_BLUP_PID5BF")
+out_stage2_covctrl  <- file.path(out_stage2, "Covariate_Control_Ratings")
 out_tables          <- file.path(out_root, "Tables_Manuscript")
 out_suppl           <- file.path(out_root, "Supplementary")
 for (d in c(out_stage1, out_stage2, out_stage2_confirm, out_stage2_explore,
-            out_tables, out_suppl)) {
+            out_stage2_covctrl, out_tables, out_suppl)) {
   if (!dir.exists(d)) dir.create(d, recursive = TRUE)
 }
 
 cat(sprintf("Pipeline initialized for Experiment: %s\nRoot: %s\n",
             experiment_version, out_root))
-cat(sprintf("Stage 2 architecture (v2.2):\n"))
-cat(sprintf("  Confirmatory single-stage moderation (%d traits): %s\n",
+cat(sprintf("Stage 2 architecture:\n"))
+cat(sprintf("  Confirmatory moderators (%d): %s\n",
             length(confirmatory_traits),
             paste(confirmatory_traits, collapse = ", ")))
+cat(sprintf("  Nuisance covariates / control model (%d): %s\n",
+            length(rating_covariates),
+            paste(rating_covariates, collapse = ", ")))
 cat(sprintf("  Exploratory BLUP screen (%d PID-5-BF traits): %s\n",
             length(exploratory_pid_traits),
             paste(exploratory_pid_traits, collapse = ", ")))
@@ -1973,16 +1970,17 @@ report_stage1_multi <- function(model_list, exp_version, out_dir) {
 # Stage 2 implements two methodologically distinct tracks:
 #
 #   (A) CONFIRMATORY SINGLE-STAGE MODERATION (run_stage2_singlestage_moderation)
-#       For each of the five traits with established UG-ERP literature support
-#       (Rating_1, Rating_2, Rating_3, SVO_angle, Negative_Affectivity), refit a
-#       single-stage LMM containing the full trait-by-emotion-by-offer_type
-#       three-way interaction, plus the Alday baseline covariate. The same
-#       random-effects structure as the corresponding Stage 1 fit is reused.
-#       Type III F-tests with cascading Satterthwaite -> Kenward-Roger -> Wald
-#       inference, identical to Stage 1. FDR correction is applied within each
-#       trait family (across components and the three trait-by-condition
-#       interaction terms). This is the statistically valid implementation of
-#       cross-level moderation and is appropriate for confirmatory inference.
+#       For each of the two traits with established UG-ERP literature support
+#       (SVO_angle, Negative_Affectivity), refit a single-stage LMM containing
+#       the full trait-by-emotion-by-offer_type three-way interaction, plus the
+#       Alday baseline covariate. The same random-effects structure as the
+#       corresponding Stage 1 fit is reused. Type III F-tests with cascading
+#       Satterthwaite -> Kenward-Roger -> Wald inference, identical to Stage 1.
+#       FDR correction is applied within each trait family (across components and
+#       the three trait-by-condition interaction terms). This is the statistically
+#       valid implementation of cross-level moderation, appropriate for
+#       confirmatory inference. (Cover-story belief ratings Rating_1/2/3 are NOT
+#       moderators here; they enter the Track C nuisance-covariate control model.)
 #
 #   (B) EXPLORATORY BLUP SCREEN (extract_blups + compute_blup_trait_table +
 #       run_stage2_blup_correlation, retained from v2.1)
@@ -2781,8 +2779,8 @@ cat(sprintf("\n[Stage 1 complete] Fitted %d/%d components.\n",
 # ==============================================================================
 # 8. Stage 2 Execution (v2.2 dual-track)
 # ==============================================================================
-# Track A: Confirmatory single-stage moderation for traits with established
-# UG-ERP literature support (Rating_1/2/3, SVO_angle, Negative_Affectivity).
+# Track A: Confirmatory single-stage moderation for the two traits with
+# established UG-ERP literature support (SVO_angle, Negative_Affectivity).
 # Each (component x trait) cell is refitted as a single LMM containing the
 # full three-way trait*emotion*offer_type interaction.
 #
@@ -2790,10 +2788,115 @@ cat(sprintf("\n[Stage 1 complete] Fitted %d/%d components.\n",
 # personality dimensions lacking direct UG-ERP literature. Output goes to
 # Supplementary; explicitly hypothesis-generating, not interpreted as
 # confirmatory evidence.
+#
+# Track C: Nuisance-covariate control model for the three cover-story belief
+# ratings (Rating_1/2/3) as grand-mean-centered main effects (no interaction).
 # ==============================================================================
 
 stage2_confirmatory_results <- NULL
 stage2_exploratory_results  <- NULL
+
+# ------------------------------------------------------------------------------
+# Nuisance-covariate control check (Rating_1/2/3).
+# The three cover-story belief ratings are manipulation checks, NOT theoretical
+# moderators (decision 2026-06). They enter a SEPARATE control model as grand-
+# mean-centered MAIN-EFFECT covariates (no interaction), leaving the primary
+# Stage 1 inference untouched. Purpose: confirm the emotion x offer_type effects
+# are robust to controlling for belief strength, and report each rating's main-
+# effect association with amplitude. Output: Stage2_TraitModeration/
+# Covariate_Control_Ratings/. `design_rhs` is the design portion of the fixed
+# effects ("emotion * offer_type" for the offer phase).
+# ------------------------------------------------------------------------------
+run_covariate_control_check <- function(stage1_models, stage1_data, df_traits,
+                                        rating_covs, out_dir,
+                                        design_rhs = "emotion * offer_type") {
+  if (is.null(df_traits) || length(stage1_models) == 0) {
+    cat("[Covariate control] No models or covariates; skipping.\n"); return(invisible(NULL))
+  }
+  available <- intersect(rating_covs, names(df_traits))
+  if (length(available) == 0) {
+    cat("[Covariate control] No rating covariates in covariate file; skipping.\n")
+    return(invisible(NULL))
+  }
+  if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
+  cat(sprintf("\n=== Stage 2C: Ratings as nuisance covariates (control model) ===\n"))
+  cat(sprintf("[Covariate control] Ratings: %s\n", paste(available, collapse = ", ")))
+
+  for (comp_name in names(stage1_models)) {
+    m1   <- stage1_models[[comp_name]]
+    df_c <- stage1_data[[comp_name]]
+    if (is.null(m1) || is.null(df_c)) next
+
+    f_stage1  <- stats::formula(m1)
+    response  <- as.character(f_stage1[[2L]])
+    re_terms  <- lme4::findbars(f_stage1)
+    re_string <- if (length(re_terms) > 0)
+      paste0("(", sapply(re_terms, deparse), ")", collapse = " + ")
+    else "(1 | participant_id)"
+
+    # Grand-mean center each available rating present in this component's data.
+    rating_terms <- c()
+    for (rc in available) {
+      if (!rc %in% names(df_c)) next
+      cc <- paste0(rc, "_c")
+      df_c[[cc]] <- df_c[[rc]] - mean(df_c[[rc]], na.rm = TRUE)
+      rating_terms <- c(rating_terms, cc)
+    }
+    if (length(rating_terms) == 0) {
+      cat(sprintf("  [%s] no rating columns present; skipping.\n", comp_name)); next
+    }
+    df_c <- df_c[stats::complete.cases(df_c[, rating_terms, drop = FALSE]), ]
+    if (nrow(df_c) == 0) next
+
+    baseline_term <- if ("Baseline_c" %in% all.vars(f_stage1)) " + Baseline_c" else ""
+    f_ctrl <- stats::as.formula(sprintf(
+      "%s ~ %s + %s%s + %s", response, design_rhs,
+      paste(rating_terms, collapse = " + "), baseline_term, re_string))
+
+    fit <- tryCatch(
+      suppressWarnings(suppressMessages(
+        lmerTest::lmer(f_ctrl, data = df_c, REML = TRUE, control = custom_control))),
+      error = function(e) {
+        cat(sprintf("  [%s] control model failed: %s\n", comp_name, conditionMessage(e))); NULL })
+    if (is.null(fit)) next
+    if (!inherits(fit, "lmerModLmerTest"))
+      fit <- tryCatch(lmerTest::as_lmerModLmerTest(fit), error = function(e) fit)
+
+    res <- tryCatch(suppressWarnings(anova(fit, type = 3, ddf = "Satterthwaite")),
+                    error = function(e) NULL)
+    if (is.null(res) || !any(grepl("^Pr", colnames(res))))
+      res <- tryCatch(suppressWarnings(anova(fit, type = 3, ddf = "Kenward-Roger")),
+                      error = function(e) NULL)
+    if (is.null(res))
+      res <- tryCatch(car::Anova(fit, type = 3, test.statistic = "Chisq"), error = function(e) NULL)
+
+    anova_apa <- if (!is.null(res)) format_anova_apa(res, fit) else NULL
+    coefs <- tryCatch(format_coefs(fit), error = function(e) NULL)
+
+    comp_dir <- file.path(out_dir, comp_name)
+    if (!dir.exists(comp_dir)) dir.create(comp_dir, recursive = TRUE)
+    writeLines(c(
+      sprintf("# Nuisance-covariate control (Ratings): %s", comp_name),
+      sprintf("Generated: %s", format(Sys.time(), "%Y-%m-%d %H:%M:%S")),
+      "",
+      sprintf("Model: %s", paste(deparse(f_ctrl), collapse = " ")),
+      "",
+      "Ratings (Rating_1/2/3) enter as grand-mean-centered MAIN-EFFECT nuisance",
+      "covariates (no interaction). This checks whether the emotion x offer_type",
+      "effects are robust to controlling for cover-story belief strength, and",
+      "reports each rating's main-effect association with amplitude. NOT a",
+      "moderation test; the primary Stage 1 inference is unchanged.",
+      "",
+      "## Type III ANOVA (design effects controlling for ratings)",
+      if (!is.null(anova_apa)) knitr::kable(anova_apa, format = "markdown", row.names = FALSE) else "ANOVA failed.",
+      "",
+      "## Fixed-effect coefficients (incl. rating covariates)",
+      if (!is.null(coefs)) knitr::kable(coefs, format = "markdown", row.names = FALSE) else "Coefficient extraction failed."
+    ), file.path(comp_dir, "covariate_control.md"))
+    cat(sprintf("  [%s] control model done.\n", comp_name))
+  }
+  invisible(out_dir)
+}
 
 # ---- Track A: Confirmatory single-stage moderation ----
 if (length(stage1_models) > 0 && length(stage1_data) > 0 && !is.null(df_covs)) {
@@ -2862,6 +2965,20 @@ if (length(stage1_blups) > 0 && !is.null(df_covs)) {
   cat("\n[Stage 2B skipped] No BLUPs or no covariates available.\n")
 }
 
+# ---- Track C: Ratings as nuisance covariates (main-effect control model) ----
+if (length(stage1_models) > 0 && length(stage1_data) > 0 && !is.null(df_covs)) {
+  run_covariate_control_check(
+    stage1_models = stage1_models,
+    stage1_data   = stage1_data,
+    df_traits     = df_covs,
+    rating_covs   = rating_covariates,
+    out_dir       = out_stage2_covctrl,
+    design_rhs    = "emotion * offer_type"
+  )
+} else {
+  cat("\n[Stage 2C skipped] Insufficient inputs for covariate-control model.\n")
+}
+
 # Aggregate handle for downstream chunks (e.g., Methods paragraph generation).
 stage2_results <- list(
   confirmatory = stage2_confirmatory_results,
@@ -2911,13 +3028,12 @@ if (length(stage1_models) > 0) {
 design_desc <- if (experiment_version == "E1") {
   paste("Experiment 1 used a sequential design: face was presented before",
         "the offer. Offer-phase EEG epochs are therefore not contaminated",
-        "by simultaneous face-evoked components, so EPN in this experiment",
-        "is interpreted as offer-locked rather than face-locked.")
+        "by simultaneous face-evoked activity, so the offer-evoked components",
+        "(FRN, P3) reflect offer processing.")
 } else {
   paste("Experiment 2 used a simultaneous design: face and offer were",
-        "presented together. Offer-phase EEG epochs therefore contain both",
-        "face-evoked early components (N170, EPN) and offer-evoked components",
-        "(FRN, N400, LPP_offer).")
+        "presented together. The offer-evoked components (FRN, P3) are",
+        "analyzed identically to Experiment 1.")
 }
 
 writeLines(c(
@@ -3022,32 +3138,37 @@ writeLines(c(
   "were computed but reported only in supplementary materials, never",
   "as confirmatory evidence.",
   "",
-  "### Stage 2: trait moderation analyses (dual-track design)",
+  "### Stage 2: individual-difference analyses (trait role by theory)",
   "",
-  "Stage 2 implements two methodologically distinct tracks based on the",
-  "strength of prior literature support for each trait as an a priori",
-  "moderator of UG-related ERP responses.",
+  "Stage 2 partitioned the individual-difference measures by their",
+  "theoretical role rather than entering them as a single covariate block.",
   "",
-  "Five traits with established UG-ERP literature support entered a",
-  "confirmatory single-stage moderation analysis: three cover-story",
-  "belief ratings (Rating_1: self-reported manipulation strength;",
-  "Rating_2: belief that offers came from real individuals; Rating_3:",
-  "belief that facial stimuli depicted real individuals), Social Value",
-  "Orientation (SVO_angle), and Negative Affectivity. For each trait,",
-  "a single linear mixed-effects model was refit containing the full",
-  "trait x emotion x offer_type three-way interaction together with",
-  "the Alday baseline covariate, reusing the random-effects structure",
-  "selected at Stage 1. This is the statistically valid implementation",
-  "of cross-level moderation (Snijders & Bosker, 2012, ch. 5) and",
-  "avoids the BLUP shrinkage and standard-error misspecification that",
-  "complicate two-stage BLUP-then-correlate inference (Hofmann &",
-  "Rovine, 2007; Rouder & Haaf, 2019). Type III F-tests with",
-  "cascading Satterthwaite -> Kenward-Roger -> Wald inference were",
-  "applied as in Stage 1. Within each trait, Benjamini-Hochberg FDR",
-  "correction was applied across components and the three trait-by-",
-  "condition interaction terms.",
+  "(A) Two traits with established UG-ERP literature support - Social Value",
+  "Orientation (SVO_angle) and Negative Affectivity - were tested as",
+  "confirmatory MODERATORS. For each, a single linear mixed-effects model",
+  "was refit containing the full trait x emotion x offer_type three-way",
+  "interaction together with the Alday baseline covariate, reusing the",
+  "random-effects structure selected at Stage 1. This is the statistically",
+  "valid implementation of cross-level moderation (Snijders & Bosker, 2012,",
+  "ch. 5) and avoids the BLUP shrinkage and standard-error misspecification",
+  "that complicate two-stage BLUP-then-correlate inference (Hofmann &",
+  "Rovine, 2007; Rouder & Haaf, 2019). Type III F-tests with cascading",
+  "Satterthwaite -> Kenward-Roger -> Wald inference were applied as in",
+  "Stage 1. Within each trait, Benjamini-Hochberg FDR correction was",
+  "applied across components and the three trait-by-condition interaction",
+  "terms.",
   "",
-  "The five remaining PID-5-BF maladaptive personality dimensions",
+  "(B) The three cover-story belief ratings (Rating_1: self-reported",
+  "manipulation strength; Rating_2: belief that offers came from real",
+  "individuals; Rating_3: belief that facial stimuli depicted real",
+  "individuals) are manipulation checks, not theoretical moderators. They",
+  "were entered as grand-mean-centered MAIN-EFFECT NUISANCE COVARIATES (no",
+  "interaction) in a separate control model, to verify the emotion x",
+  "offer_type effects are robust to controlling for belief strength and to",
+  "report each rating's main-effect association with amplitude. The primary",
+  "Stage 1 inference was left unchanged.",
+  "",
+  "(C) The five remaining PID-5-BF maladaptive personality dimensions",
   "(Detachment, Antagonism, Disinhibition, Anankastia, Psychoticism)",
   "lack direct UG-ERP literature support and were screened in a",
   "secondary BLUP-based exploratory analysis. Per-participant BLUPs",

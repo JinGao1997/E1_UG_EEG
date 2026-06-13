@@ -133,6 +133,17 @@ Processed/
 Problematic_data/
 _LOCAL_ONLY_BACKUP/
 
+# Local-only reference library: copyrighted paper PDFs and full-text/markdown
+# conversions. Must NOT be published to the public repo (see docs/README +
+# CLAUDE.md: references are local-only).
+docs/references/
+
+# Project-specific Claude Code instructions: keep local, do not upload.
+.claude/CLAUDE.md
+
+# Scratch / one-off patcher scripts.
+_*.py
+
 
 ############################################
 # 6) results/: ignore outputs by default
@@ -224,6 +235,11 @@ log/
 !requirements.txt
 !environment.yml
 !.gitignore
+
+# Single source of truth for ERP component definitions (small text config,
+# not data) — must be tracked despite the global *.csv ignore.
+!config/erp_components.csv
+!config/erp_components_face_E1.csv
 
 
 ############################################

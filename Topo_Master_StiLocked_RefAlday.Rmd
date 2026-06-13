@@ -102,35 +102,34 @@ THEME_CONFIG <- list(
 # ==============================================================================
 # 1.3 COMPONENT & SPATIOTEMPORAL DEFINITIONS
 # ==============================================================================
-# Dynamic FRN window logic mirroring upstream Python architecture constraints.
-frn_window <- if (experiment_id == "E1") c(250, 300) else c(200, 250)
+# Components (windows + ROIs) are read from the single source of truth shared
+# with the pipeline, stats, and waveform scripts:
+#   config/erp_components.csv  (t_min/t_max/test_tmin/test_tmax in SECONDS;
+#   roi pipe-delimited). For each component this builds two specs: the primary
+# window (<Comp>) and a wider exploratory sweep (test<Comp>) for the time-course
+# grids. Topography windows are expressed here in milliseconds (win_ms).
+comp_csv <- here::here("config", "erp_components.csv")
+if (!file.exists(comp_csv)) {
+  stop(sprintf("Component config not found: %s", comp_csv))
+}
+comp_def <- readr::read_csv(comp_csv, show_col_types = FALSE)
+comp_def <- comp_def[comp_def$experiment == experiment_id, ]
 
-# Component parameter definitions synchronized with preprocessing models.
-# v2.1: testFRN window now branches on experiment_id, mirroring the FRN logic
-# above (frn_window). Previously testFRN was hardcoded to (200, 250) ms which
-# is the E2 component window; for E1 the FRN component sits at (250, 300) ms,
-# so testFRN should expand around that. The other test* windows are stable
-# across experiments because their target components (N170, EPN, N400, LPP)
-# do not differ in window between E1 and E2 in the upstream specification.
-testfrn_window <- if (experiment_id == "E1") c(200, 350) else c(150, 300)
-
-component_specs <- list(
-  N170 = list(win_ms = c(150, 200), roi = c("P7", "P8", "PO7", "PO8"), source_comp = "N170"),
-  EPN = list(win_ms = c(250, 350), roi = c("PO7", "PO8", "P7", "P8", "O1", "O2"), source_comp = "EPN"),
-  FRN = list(win_ms = frn_window, roi = c("F3", "Fz", "F4", "FC1", "FC2", "Cz"), source_comp = "FRN"),
-  N400 = list(win_ms = c(350, 450), roi = c("Cz", "CPz", "Pz"), source_comp = "N400"),
-  LPP_offer = list(win_ms = c(500, 800), roi = c("Pz", "Cz", "C1", "C2", "CP1", "CP2"), source_comp = "LPP_offer"),
-  
-  testN170 = list(win_ms = c(150, 350), roi = c("P7", "P8", "PO7", "PO8"), source_comp = "N170"),
-  testEPN = list(win_ms = c(200, 400), roi = c("PO7", "PO8", "P7", "P8", "O1", "O2"), source_comp = "EPN"),
-  testFRN = list(win_ms = testfrn_window, roi = c("F3", "Fz", "F4", "FC1", "FC2", "Cz"), source_comp = "FRN"),
-  # Exploratory wide window: 300-900 ms covers the canonical N400 (300-500 ms)
-  # and the LPP/late-positivity range (500-900 ms) in a single sweep. Single-panel
-  # topomap (mean over 300-900 ms) is intentionally coarse — interpretation lives
-  # in the 40-ms time_course_grids, not in this averaged map.
-  testN400 = list(win_ms = c(300, 900), roi = c("Cz", "CPz", "Pz"), source_comp = "N400"),
-  testLPP  = list(win_ms = c(300, 900), roi = c("Pz", "Cz", "C1", "C2", "CP1", "CP2"), source_comp = "LPP_offer")
-)
+component_specs <- list()
+for (i in seq_len(nrow(comp_def))) {
+  cn  <- comp_def$comp_name[i]
+  roi <- strsplit(comp_def$roi[i], "|", fixed = TRUE)[[1]]
+  component_specs[[cn]] <- list(
+    win_ms      = as.integer(round(c(comp_def$t_min[i], comp_def$t_max[i]) * 1000)),
+    roi         = roi,
+    source_comp = cn
+  )
+  component_specs[[paste0("test", cn)]] <- list(
+    win_ms      = as.integer(round(c(comp_def$test_tmin[i], comp_def$test_tmax[i]) * 1000)),
+    roi         = roi,
+    source_comp = cn
+  )
+}
 
 # Formal nomenclature aligned with upstream Python pipeline ('enj' mapped to Reward).
 emotion_list <- c("aff", "dis", "dom", "enj")
@@ -393,7 +392,7 @@ for (comp_name in names(component_specs)) {
   }
   
   chanlocs <- read_csv(chan_file, show_col_types = FALSE, lazy = FALSE) %>% rename(electrode = channel)
-  methods_to_run <- c("Standard")  #"Regression","Standard"
+  methods_to_run <- c("Regression")  #"Regression","Standard"
   
   # ============================================================================
   # v2.3: Cross-method shared color scale (Regression-led)
@@ -413,7 +412,7 @@ for (comp_name in names(component_specs)) {
   #
   # Container initialized as NULL; populated when method=="Regression" runs;
   # consumed when method=="Standard" runs. If Regression is skipped (e.g. for
-  # exploratory windows like testN170 where target_source != comp_name in a
+  # exploratory test* windows where target_source != comp_name in a
   # way that bypasses Regression), Standard falls back to its own limits.
   shared_lims <- list(
     raw  = NULL, main = NULL,

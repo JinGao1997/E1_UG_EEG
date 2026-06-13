@@ -30,7 +30,7 @@ v2.1   — Aligned with upstream LMM analyses (Sta_EEG_OfferPhase_RefAlday.Rmd v
 Description:
     Unified visualization pipeline for both Experiment 1 (E1) and Experiment 2 (E2).
     Generates publication-ready regression-corrected ERP waveforms and QC plots.
-    Fully synchronized with upstream preprocessing architecture (N170, EPN, FRN, N400, LPP_offer).
+    Component definitions are read from config/erp_components.csv (single source of truth).
     
     STATISTICAL MODEL (REGRESSION METHOD) DYNAMICS:
     - Base model: Signal ~ Intercept + Emotion + Offer + Emo*Offer + Baseline
@@ -100,15 +100,24 @@ warnings.filterwarnings('ignore')
 # Switch between 'E1' and 'E2' to dynamically adjust component lists and windows
 EXPERIMENT_VERSION = 'E2'  
 
-# Dynamically set component targets and FRN windows based on upstream preprocessing
-if EXPERIMENT_VERSION == 'E1':
-    BATCH_COMPONENTS = ['EPN', 'FRN', 'N400', 'LPP_offer']
-    FRN_WINDOW = (0.250, 0.300)
-elif EXPERIMENT_VERSION == 'E2':
-    BATCH_COMPONENTS = ['N170', 'EPN', 'FRN', 'N400', 'LPP_offer']
-    FRN_WINDOW = (0.200, 0.250)
-else:
-    raise ValueError("Critical: EXPERIMENT_VERSION must be 'E1' or 'E2'.")
+# ------------------------------------------------------------------------------
+# Component definitions are read from the single source of truth shared with the
+# pipeline, stats, and topography scripts: config/erp_components.csv
+# (t_min/t_max in SECONDS; roi pipe-delimited). Edit ONLY that file to change a
+# window/ROI or add/remove a component.
+# ------------------------------------------------------------------------------
+def _find_component_config():
+    p = Path(__file__).resolve()
+    for parent in [p.parent] + list(p.parents):
+        candidate = parent / 'config' / 'erp_components.csv'
+        if candidate.exists():
+            return candidate
+    raise FileNotFoundError('config/erp_components.csv not found above ' + str(p))
+
+_COMP_CSV = _find_component_config()
+_COMP_DF = pd.read_csv(_COMP_CSV)
+_COMP_DF = _COMP_DF[_COMP_DF['experiment'] == EXPERIMENT_VERSION].reset_index(drop=True)
+BATCH_COMPONENTS = _COMP_DF['comp_name'].tolist()
 
 # ==============================================================================
 # 2. VISUAL CONFIGURATION
@@ -120,11 +129,8 @@ SMOOTHING_SIGMA = 1.2
 
 # [MANUAL SCALES] Y-Axis Settings (Microvolts): (Y_MIN, Y_MAX, TICK_STEP)
 SCALE_CONFIG = {
-    'N170': (-6.0, 8.0, 1.0),
-    'EPN':  (-6.0, 8.0, 1.0),
-    'FRN':  (-4.0, 3.0, 0.5),
-    'N400': (-3.5, 3.5, 0.5),
-    'LPP_offer': (-4.0, 4.0, 0.5)
+    row['comp_name']: (float(row['scale_min']), float(row['scale_max']), float(row['scale_step']))
+    for _, row in _COMP_DF.iterrows()
 }
 
 # ==============================================================================
@@ -132,7 +138,7 @@ SCALE_CONFIG = {
 # ==============================================================================
 
 # ANALYSIS_METHOD Options: 'All', 'Regression', 'Standard', 'QC'
-ANALYSIS_METHOD = 'Standard' 
+ANALYSIS_METHOD = 'All' 
 
 REJECT_PTP_THRESHOLD_UV = 200.0
 
@@ -173,36 +179,13 @@ OFFER_TYPES = ['fair', 'unfair']
 
 # Component Definitions synchronized with upstream preprocessing architecture
 COMPONENT_SPECS = {
-    'N170': {
-        'roi': ["P7", "P8", "PO7", "PO8"],
-        'window': (0.150, 0.200),
-        'plot_xlim': (-200, 1000),
-        'folder_name': 'Stimulus_Locked'
-    },
-    'EPN': {
-        'roi': ["PO7", "PO8", "P7", "P8", "O1", "O2"],
-        'window': (0.250, 0.350),
-        'plot_xlim': (-200, 1000),
-        'folder_name': 'Stimulus_Locked'
-    },
-    'FRN': {
-        'roi': ["F3", "Fz", "F4", "FC1", "FC2", "Cz"],
-        'window': FRN_WINDOW,
-        'plot_xlim': (-200, 1000),
-        'folder_name': 'Stimulus_Locked'
-    },
-    'N400': {
-        'roi': ["Cz", "CPz", "Pz"],
-        'window': (0.350, 0.450),
-        'plot_xlim': (-200, 1000),
-        'folder_name': 'Stimulus_Locked'
-    },
-    'LPP_offer': {
-        'roi': ["Pz", "Cz", "C1", "C2", "CP1", "CP2"],
-        'window': (0.500, 0.800),
+    row['comp_name']: {
+        'roi': str(row['roi']).split('|'),
+        'window': (float(row['t_min']), float(row['t_max'])),
         'plot_xlim': (-200, 1000),
         'folder_name': 'Stimulus_Locked'
     }
+    for _, row in _COMP_DF.iterrows()
 }
 
 # Full channel configuration for topographic mapping reconstruction
@@ -645,6 +628,50 @@ class VisualizationEngine:
         plt.close()
 
 
+def emit_difference_waves(viz, pdata, t_ms, title_suffix, out_dir, tag):
+    """Compute and plot Unfair-minus-Fair difference waves (collapsed + per-emotion).
+
+    Shared by the Regression (Alday, PRIMARY) and Standard (sensitivity) paths so
+    BOTH emit difference waves for EVERY component. `pdata` is a time-aligned dict
+    keyed '<offer>_<emo>' (offer in OFFER_TYPES, emo in COLORS); `t_ms` is the time
+    axis in milliseconds; `tag` labels the output files (e.g. 'Regression',
+    'Standard'). Difference is computed on condition means; Gaussian smoothing is
+    applied at plot time only, matching the condition-mean figures.
+
+    Replaces the previous `if TARGET_COMPONENT == 'FRN':` gate, which never fired
+    because the component names are FRN_pre / FRN_explor / LPP_pre / P3_explor
+    (the bare 'FRN' name no longer exists after the SSOT split), so NO difference
+    waves were emitted for any component.
+    """
+    draw_order = ['neu', 'aff', 'dis', 'dom', 'enj']
+    t_ms = np.asarray(t_ms, dtype=float)
+
+    diff_by_emotion = {}
+    for emo in draw_order:
+        u = pdata.get(f'unfair_{emo}')
+        f_ = pdata.get(f'fair_{emo}')
+        if u is not None and f_ is not None:
+            u = np.asarray(u, dtype=float)
+            f_ = np.asarray(f_, dtype=float)
+            if len(u) == len(t_ms) and len(f_) == len(t_ms):
+                diff_by_emotion[emo] = u - f_
+
+    unfair_stack = [np.asarray(pdata[f'unfair_{e}'], dtype=float)
+                    for e in draw_order if f'unfair_{e}' in pdata]
+    fair_stack = [np.asarray(pdata[f'fair_{e}'], dtype=float)
+                  for e in draw_order if f'fair_{e}' in pdata]
+    if unfair_stack and fair_stack:
+        diff_collapsed = (np.nanmean(np.vstack(unfair_stack), axis=0)
+                          - np.nanmean(np.vstack(fair_stack), axis=0))
+        viz.plot_difference_wave_collapsed(
+            diff_collapsed, t_ms, title_suffix,
+            out_dir / f"{TARGET_COMPONENT}_{tag}_Diff_Collapsed.tif")
+
+    if diff_by_emotion:
+        viz.plot_difference_wave_by_emotion(
+            diff_by_emotion, t_ms, title_suffix,
+            out_dir / f"{TARGET_COMPONENT}_{tag}_Diff_ByEmotion.tif")
+
 
 # ==============================================================================
 # 6. DATA INITIALIZATION & PARSING MODULE
@@ -815,13 +842,7 @@ def load_bl(path):
     if not path.exists(): return None
     df = pd.read_csv(path)
     
-    mapping = {
-        'N170': 'Baseline_N170',
-        'EPN':  'Baseline_EPN',
-        'FRN':  'Baseline_FRN',
-        'N400': 'Baseline_N400',
-        'LPP_offer': 'Baseline_LPP_offer'
-    }
+    mapping = {c: f'Baseline_{c}' for c in BATCH_COMPONENTS}
     
     tgt = mapping.get(TARGET_COMPONENT)
     
@@ -1268,6 +1289,11 @@ class RegressionAnalysis:
         self._save_waveform_csv(pure, times)
         self._save_lmm_provenance()  # New in v2.1: caption-source provenance.
 
+        # Difference waves on the Alday-corrected marginal means (PRIMARY path).
+        # `pure` is keyed '<offer>_<emo>'; times are in seconds.
+        emit_difference_waves(self.viz, pure, np.array(times) * 1000,
+                              "Regression-Corrected", self.out, "Regression")
+
         # =======================================================================
         # POSTER VISUALIZATIONS (Main Effects Calculation & Plotting)
         # =======================================================================
@@ -1288,20 +1314,22 @@ class RegressionAnalysis:
             poster_dir / f"{TARGET_COMPONENT}_MainEffect_Fairness.tif"
         )
 
-        # 2. Calculate and Plot Emotion Main Effect (Applicable ONLY to N400)
-        if TARGET_COMPONENT == 'N400':
-            emotion_me_data = {emo: [] for emo in COLORS}
-            for i in range(len(times)):
-                for emo in COLORS:
-                    # Average across offer types per timepoint, safely ignoring NaNs
-                    vals = [pure[f'{off}_{emo}'][i] for off in OFFER_TYPES if not np.isnan(pure[f'{off}_{emo}'][i])]
-                    emotion_me_data[emo].append(np.mean(vals) if vals else np.nan)
+        # 2. Calculate and Plot Emotion Main Effect (for EVERY component, mirroring
+        #    the Fairness main-effect plot above). Previously gated by
+        #    `if TARGET_COMPONENT == 'N400':` -- a stale name absent from the current
+        #    component set -- so this poster plot was never produced for any component.
+        emotion_me_data = {emo: [] for emo in COLORS}
+        for i in range(len(times)):
+            for emo in COLORS:
+                # Average across offer types per timepoint, safely ignoring NaNs
+                vals = [pure[f'{off}_{emo}'][i] for off in OFFER_TYPES if not np.isnan(pure[f'{off}_{emo}'][i])]
+                emotion_me_data[emo].append(np.mean(vals) if vals else np.nan)
 
-            self.viz.plot_emotion_main_effect(
-                emotion_me_data, np.array(times)*1000,
-                f"Regression-Corrected",
-                poster_dir / f"{TARGET_COMPONENT}_MainEffect_Emotion.tif"
-            )
+        self.viz.plot_emotion_main_effect(
+            emotion_me_data, np.array(times)*1000,
+            f"Regression-Corrected",
+            poster_dir / f"{TARGET_COMPONENT}_MainEffect_Emotion.tif"
+        )
 
     # --------------------------------------------------------------------------
     # Sanity 4 (Regression-mode only): epoch-window mean = trials.csv scalar
@@ -1688,49 +1716,13 @@ class StandardAnalysis:
         )
 
         # ----------------------------------------------------------------------
-        # FRN difference waves (Unfair minus Fair). Gated to FRN per analysis
-        # scope; the fairness contrast is the targeted effect for this
-        # frontocentral component. Reuses the time-aligned pdata built above.
+        # Difference waves (Unfair minus Fair) for EVERY component, via the shared
+        # helper. (Previously gated by `if TARGET_COMPONENT == 'FRN':`, which never
+        # fired after the component SSOT was split into FRN_pre / FRN_explor etc.,
+        # so no difference waves were ever produced.)
         # ----------------------------------------------------------------------
-        if TARGET_COMPONENT == 'FRN':
-            draw_order = ['neu', 'aff', 'dis', 'dom', 'enj']
-
-            # Per-emotion difference: unfair_<emo> - fair_<emo>. Difference is
-            # computed on raw condition means; Gaussian smoothing is applied at
-            # plot time only, matching the condition-mean figures.
-            diff_by_emotion = {}
-            for emo in draw_order:
-                u = pdata.get(f'unfair_{emo}')
-                f_ = pdata.get(f'fair_{emo}')
-                if u is not None and f_ is not None:
-                    diff_by_emotion[emo] = np.asarray(u, float) - np.asarray(f_, float)
-
-            # Collapsed difference: Grand_Unfair - Grand_Fair. Each grand mean is
-            # the UNWEIGHTED nanmean across the five emotion condition means (cell
-            # trial counts are not carried in the condition-averaged frame). For an
-            # approximately balanced design this matches the upstream trial-level
-            # Grand_Unfair/Grand_Fair localizer to within cell-count imbalance.
-            unfair_stack = [np.asarray(pdata[f'unfair_{e}'], float)
-                            for e in draw_order if f'unfair_{e}' in pdata]
-            fair_stack = [np.asarray(pdata[f'fair_{e}'], float)
-                          for e in draw_order if f'fair_{e}' in pdata]
-            if unfair_stack and fair_stack:
-                grand_unfair = np.nanmean(np.vstack(unfair_stack), axis=0)
-                grand_fair = np.nanmean(np.vstack(fair_stack), axis=0)
-                diff_collapsed = grand_unfair - grand_fair
-
-                self.viz.plot_difference_wave_collapsed(
-                    diff_collapsed, np.array(t_ms),
-                    "Standard Baseline",
-                    self.out / f"{TARGET_COMPONENT}_Standard_Diff_Collapsed.tif"
-                )
-
-            if diff_by_emotion:
-                self.viz.plot_difference_wave_by_emotion(
-                    diff_by_emotion, np.array(t_ms),
-                    "Standard Baseline",
-                    self.out / f"{TARGET_COMPONENT}_Standard_Diff_ByEmotion.tif"
-                )
+        emit_difference_waves(self.viz, pdata, np.array(t_ms),
+                              "Standard Baseline", self.out, "Standard")
 
 
 # ==============================================================================

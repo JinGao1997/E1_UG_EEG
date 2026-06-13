@@ -30,7 +30,7 @@ v2.1   — Aligned with upstream LMM analyses (Sta_EEG_OfferPhase_RefAlday.Rmd v
 Description:
     Unified visualization pipeline for both Experiment 1 (E1) and Experiment 2 (E2).
     Generates publication-ready regression-corrected ERP waveforms and QC plots.
-    Fully synchronized with upstream preprocessing architecture (N170, EPN, FRN, N400, LPP_offer).
+    Component definitions are read from config/erp_components.csv (single source of truth).
     
     STATISTICAL MODEL (REGRESSION METHOD) DYNAMICS:
     - Base model: Signal ~ Intercept + Emotion + Offer + Emo*Offer + Baseline
@@ -100,15 +100,24 @@ warnings.filterwarnings('ignore')
 # Switch between 'E1' and 'E2' to dynamically adjust component lists and windows
 EXPERIMENT_VERSION = 'E1'  
 
-# Dynamically set component targets and FRN windows based on upstream preprocessing
-if EXPERIMENT_VERSION == 'E1':
-    BATCH_COMPONENTS = ['EPN', 'FRN', 'N400', 'LPP_offer']
-    FRN_WINDOW = (0.250, 0.300)
-elif EXPERIMENT_VERSION == 'E2':
-    BATCH_COMPONENTS = ['N170', 'EPN', 'FRN', 'N400', 'LPP_offer']
-    FRN_WINDOW = (0.200, 0.250)
-else:
-    raise ValueError("Critical: EXPERIMENT_VERSION must be 'E1' or 'E2'.")
+# ------------------------------------------------------------------------------
+# Component definitions are read from the single source of truth shared with the
+# pipeline, stats, and topography scripts: config/erp_components.csv
+# (t_min/t_max in SECONDS; roi pipe-delimited). Edit ONLY that file to change a
+# window/ROI or add/remove a component.
+# ------------------------------------------------------------------------------
+def _find_component_config():
+    p = Path(__file__).resolve()
+    for parent in [p.parent] + list(p.parents):
+        candidate = parent / 'config' / 'erp_components.csv'
+        if candidate.exists():
+            return candidate
+    raise FileNotFoundError('config/erp_components.csv not found above ' + str(p))
+
+_COMP_CSV = _find_component_config()
+_COMP_DF = pd.read_csv(_COMP_CSV)
+_COMP_DF = _COMP_DF[_COMP_DF['experiment'] == EXPERIMENT_VERSION].reset_index(drop=True)
+BATCH_COMPONENTS = _COMP_DF['comp_name'].tolist()
 
 # ==============================================================================
 # 2. VISUAL CONFIGURATION
@@ -120,11 +129,8 @@ SMOOTHING_SIGMA = 1.2
 
 # [MANUAL SCALES] Y-Axis Settings (Microvolts): (Y_MIN, Y_MAX, TICK_STEP)
 SCALE_CONFIG = {
-    'N170': (-6.0, 8.0, 1.0),
-    'EPN':  (-6.0, 8.0, 1.0),
-    'FRN':  (-4.0, 3.0, 0.5),
-    'N400': (-3.5, 3.5, 0.5),
-    'LPP_offer': (-4.0, 4.0, 0.5)
+    row['comp_name']: (float(row['scale_min']), float(row['scale_max']), float(row['scale_step']))
+    for _, row in _COMP_DF.iterrows()
 }
 
 # ==============================================================================
@@ -173,36 +179,13 @@ OFFER_TYPES = ['fair', 'unfair']
 
 # Component Definitions synchronized with upstream preprocessing architecture
 COMPONENT_SPECS = {
-    'N170': {
-        'roi': ["P7", "P8", "PO7", "PO8"],
-        'window': (0.150, 0.200),
-        'plot_xlim': (-200, 1000),
-        'folder_name': 'Stimulus_Locked'
-    },
-    'EPN': {
-        'roi': ["PO7", "PO8", "P7", "P8", "O1", "O2"],
-        'window': (0.250, 0.350),
-        'plot_xlim': (-200, 1000),
-        'folder_name': 'Stimulus_Locked'
-    },
-    'FRN': {
-        'roi': ["F3", "Fz", "F4", "FC1", "FC2", "Cz"],
-        'window': FRN_WINDOW,
-        'plot_xlim': (-200, 1000),
-        'folder_name': 'Stimulus_Locked'
-    },
-    'N400': {
-        'roi': ["Cz", "CPz", "Pz"],
-        'window': (0.350, 0.450),
-        'plot_xlim': (-200, 1000),
-        'folder_name': 'Stimulus_Locked'
-    },
-    'LPP_offer': {
-        'roi': ["Pz", "Cz", "C1", "C2", "CP1", "CP2"],
-        'window': (0.500, 0.800),
+    row['comp_name']: {
+        'roi': str(row['roi']).split('|'),
+        'window': (float(row['t_min']), float(row['t_max'])),
         'plot_xlim': (-200, 1000),
         'folder_name': 'Stimulus_Locked'
     }
+    for _, row in _COMP_DF.iterrows()
 }
 
 # Full channel configuration for topographic mapping reconstruction
@@ -699,13 +682,7 @@ def load_bl(path):
     if not path.exists(): return None
     df = pd.read_csv(path)
     
-    mapping = {
-        'N170': 'Baseline_N170',
-        'EPN':  'Baseline_EPN',
-        'FRN':  'Baseline_FRN',
-        'N400': 'Baseline_N400',
-        'LPP_offer': 'Baseline_LPP_offer'
-    }
+    mapping = {c: f'Baseline_{c}' for c in BATCH_COMPONENTS}
     
     tgt = mapping.get(TARGET_COMPONENT)
     

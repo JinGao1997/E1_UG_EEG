@@ -1,0 +1,5 @@
+experiment,comp_name,t_min,t_max,roi,role,scale_min,scale_max,scale_step,test_tmin,test_tmax
+E1,P1,0.080,0.130,O1|O2|Oz|PO7|PO8,exploratory,-4.0,8.0,0.5,0.060,0.150
+E1,N170,0.130,0.200,TP9|TP10|P7|P8|PO9|PO10|O1|O2,confirmatory,-10.0,6.0,0.5,0.110,0.220
+E1,EPN,0.200,0.350,PO7|PO8|PO9|PO10|TP9|TP10,confirmatory,-8.0,8.0,0.5,0.180,0.380
+E1,LPP_face,0.500,0.800,Pz|Cz|C1|C2|CP1|CP2,exploratory,-4.0,10.0,0.5,0.450,0.850

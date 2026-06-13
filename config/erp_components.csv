@@ -1,0 +1,9 @@
+experiment,comp_name,t_min,t_max,roi,role,scale_min,scale_max,scale_step,test_tmin,test_tmax
+E1,FRN_pre,0.252,0.304,F3|Fz|F4|FC1|FC2|Cz,confirmatory,-4.0,3.0,0.5,0.200,0.350
+E2,FRN_pre,0.192,0.244,F3|Fz|F4|FC1|FC2|Cz,confirmatory,-4.0,3.0,0.5,0.150,0.300
+E1,LPP_pre,0.400,0.600,Pz|Cz|C1|C2|CP1|CP2,confirmatory,-4.0,4.0,0.5,0.350,0.700
+E2,LPP_pre,0.400,0.600,Pz|Cz|C1|C2|CP1|CP2,confirmatory,-4.0,4.0,0.5,0.350,0.700
+E1,FRN_explor,0.310,0.360,Fz|FC1|FC2|Cz,exploratory,-4.0,3.0,0.5,0.250,0.400
+E2,FRN_explor,0.324,0.376,Fz|FC1|FC2|Cz,exploratory,-4.0,3.0,0.5,0.250,0.400
+E1,P3_explor,0.490,0.590,Cz|CPz|Pz|CP1|CP2,exploratory,-4.0,4.0,0.5,0.300,0.900
+E2,P3_explor,0.490,0.590,Cz|CPz|Pz|CP1|CP2,exploratory,-4.0,4.0,0.5,0.300,0.900

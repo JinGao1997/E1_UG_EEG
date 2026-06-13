@@ -285,33 +285,34 @@ if (run_offer_phase) {
   cat(sprintf("Experiment: %s\n", experiment_version))
 
   # --------------------------------------------------------------------------
-  # Dynamic Time-Window Configuration based on Experiment Version
-  # P2 is globally removed. N170 is conditionally removed for E1.
+  # Component definitions (windows + ROIs) are read from the single source of
+  # truth shared by all stats and visualization scripts:
+  #   config/erp_components.csv  (t_min/t_max in SECONDS; roi pipe-delimited).
+  # To change a window/ROI, or add/remove a component, edit ONLY that file.
+  # Currently FRN and P3, identical for E1 and E2; windows/ROIs are data-driven
+  # from a Cartool topographic segmentation of the Unfair-Fair difference wave.
   # --------------------------------------------------------------------------
-  if (experiment_version == "E1") {
-    # Sequential Presentation: Emotion precedes Offer
-    # Note: N170 is NOT extracted here as it is locked to the prior face onset.
-    erp_config <- tibble::tribble(
-      ~comp_name,    ~t_min, ~t_max, ~roi_channels,
-      "EPN",         0.250,  0.350,  c("PO7","PO8","P7","P8","O1","O2"),
-      "FRN",         0.250,  0.300,  c("F3","Fz","F4","FC1","FC2","Cz"),
-      "N400",        0.350,  0.450,  c("Cz","CPz","Pz"),
-      "LPP_offer",   0.500,  0.800,  c("Pz","Cz","C1","C2","CP1","CP2")
-    )
-  } else if (experiment_version == "E2") {
-    # Simultaneous Presentation: Emotion and Offer at the same time
-    # Note: N170 is extracted since face and offer appear together.
-    erp_config <- tibble::tribble(
-      ~comp_name,    ~t_min, ~t_max, ~roi_channels,
-      "N170",        0.150,  0.200,  c("P7","P8","PO7","PO8"),
-      "EPN",         0.250,  0.350,  c("PO7","PO8","P7","P8","O1","O2"),
-      "FRN",         0.200,  0.250,  c("F3","Fz","F4","FC1","FC2","Cz"), # Shifted earlier
-      "N400",        0.350,  0.450,  c("Cz","CPz","Pz"),
-      "LPP_offer",   0.500,  0.800,  c("Pz","Cz","C1","C2","CP1","CP2")
-    )
-  } else {
-    stop("CRITICAL: experiment_version must be 'E1' or 'E2'.")
+  comp_csv <- here("config", "erp_components.csv")
+  if (!file.exists(comp_csv)) {
+    stop(sprintf("Component config not found: %s", comp_csv))
   }
+  comp_def <- readr::read_csv(comp_csv, show_col_types = FALSE)
+  required_cols <- c("experiment", "comp_name", "t_min", "t_max", "roi")
+  if (!all(required_cols %in% names(comp_def))) {
+    stop(sprintf("config/erp_components.csv must contain columns: %s",
+                 paste(required_cols, collapse = ", ")))
+  }
+  comp_def <- comp_def[comp_def$experiment == experiment_version, ]
+  if (nrow(comp_def) == 0) {
+    stop(sprintf("No component rows for experiment '%s' in config/erp_components.csv",
+                 experiment_version))
+  }
+  erp_config <- tibble::tibble(
+    comp_name    = comp_def$comp_name,
+    t_min        = comp_def$t_min,
+    t_max        = comp_def$t_max,
+    roi_channels = strsplit(comp_def$roi, "|", fixed = TRUE)
+  )
 
   if (!use_baseline_correction) {
     baseline_config <- erp_config %>%

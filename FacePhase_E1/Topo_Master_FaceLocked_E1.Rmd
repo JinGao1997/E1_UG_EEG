@@ -1,0 +1,215 @@
+---
+title: "Face-Locked Topographic Maps (E1)"
+subtitle: "Per-emotion scalp maps and emotion-minus-Neutral difference maps for the face-locked components (P1, N170, EPN, LPP_face). Downstream of Visualization_EEG_FaceLocked_E1.py."
+author: "Project Maintainer"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    code_folding: show
+    theme: flatly
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# 1. Configuration
+
+```{r config}
+# ==============================================================================
+# Face-phase topographic report (E1 only). Self-contained: reads ONLY the
+# face-phase visualization output (Visualization_EEG_FaceLocked_E1.py), which
+# is stored separately under results/EEG/FacePhase_E1/.
+#
+# Emotion is the sole face-phase factor, so there is no fair/unfair dimension.
+# For each component and method this renders: (a) five per-emotion scalp maps on
+# a shared color scale, and (b) four emotion-minus-Neutral difference maps on a
+# shared symmetric scale.
+# ==============================================================================
+if (!require("pacman")) install.packages("pacman")
+pacman::p_load(tidyverse, stringr, fs, here, scales)
+if (!require("eegUtils")) {
+  stop("Critical Package Missing: 'eegUtils'. Install via devtools::install_github('craddm/eegUtils')")
+}
+
+experiment_id <- "E1"   # face phase is E1-only
+
+# Position-independent root (unlike the offer Topo_Master, which hardcodes an
+# absolute path). All face-phase visualization output lives here.
+root_dir <- here::here("results", "EEG", "FacePhase_E1")
+if (!dir_exists(root_dir)) {
+  stop(sprintf("Face-phase viz output not found: %s\nRun Visualization_EEG_FaceLocked_E1.py first.", root_dir))
+}
+
+# Component windows + ROIs from the face component config (single source shared
+# with the preprocessing/stats/waveform scripts).
+comp_csv <- here::here("config", "erp_components_face_E1.csv")
+if (!file.exists(comp_csv)) stop(sprintf("Face component config not found: %s", comp_csv))
+comp_def <- readr::read_csv(comp_csv, show_col_types = FALSE)
+comp_def <- comp_def[comp_def$experiment == experiment_id, ]
+
+component_specs <- list()
+for (i in seq_len(nrow(comp_def))) {
+  cn <- comp_def$comp_name[i]
+  component_specs[[cn]] <- list(
+    win_ms = as.integer(round(c(comp_def$t_min[i], comp_def$t_max[i]) * 1000)),
+    roi    = strsplit(comp_def$roi[i], "|", fixed = TRUE)[[1]]
+  )
+}
+
+emotion_order  <- c("neu", "aff", "dis", "dom", "enj")
+emotion_labels <- c(neu = "Neutral", aff = "Affiliative", dis = "Disgust",
+                    dom = "Dominance", enj = "Reward")
+methods <- c(Regression_Results = "Alday (display baseline)",
+             Standard_Baseline  = "Traditional baseline")
+
+THEME_CONFIG <- list(
+  fig_width_single = 4.5, fig_height_single = 4.0,
+  font_family = "sans", size_title = 9, size_subtitle = 8, size_caption = 7,
+  size_legend_ttl = 8, size_legend_txt = 7,
+  dpi = 600, emit_png = TRUE, emit_pdf = FALSE,
+  topoplot_scaling = 0.9, plot_margin_mm = c(3, 3, 3, 3)
+)
+
+cat(sprintf("Face topo report initialized. Root: %s\n", root_dir))
+```
+
+# 2. Topographic Plotting Helper
+
+```{r helper}
+# Symmetric, zero-centered color limits with a 'nice' magnitude. Shared scale
+# keeps maps comparable within a component x method panel set.
+sym_limits <- function(values, pad = 1.05) {
+  v <- values[is.finite(values)]
+  if (length(v) == 0) return(c(-1, 1))
+  lim <- max(abs(v)) * pad
+  c(-lim, lim)
+}
+
+# Single topographic map via eegUtils::topoplot(). dat_long must carry columns
+# `electrode` and `amplitude`; chan_locs provides electrode positions (x, y).
+# Mirrors the proven call in Topo_Master_StiLocked_RefAlday.Rmd (RdBu palette,
+# head interpolation, ROI highlights, THEME_CONFIG scaling).
+plot_topo_face <- function(dat_long, chan_locs, roi, main_title, sub_title,
+                           caption_text, filename, limits) {
+  if (!"electrode" %in% names(dat_long)) {
+    warning("Spatial mapping failure: 'electrode' identifier absent."); return(NULL)
+  }
+  p <- topoplot(
+    dat_long, chan_locs = chan_locs, interp_limit = "head",
+    contour = TRUE, points = TRUE, highlights = roi,
+    palette = "RdBu", limits = limits, scaling = THEME_CONFIG$topoplot_scaling
+  ) +
+    labs(title = str_wrap(main_title, 50), subtitle = str_wrap(sub_title, 50),
+         caption = caption_text) +
+    theme(
+      text          = element_text(family = THEME_CONFIG$font_family),
+      plot.title    = element_text(size = THEME_CONFIG$size_title, face = "bold",
+                                   hjust = 0.5, margin = margin(t = 4, b = 2)),
+      plot.subtitle = element_text(size = THEME_CONFIG$size_subtitle, hjust = 0.5,
+                                   color = "grey20", margin = margin(b = 6)),
+      plot.caption  = element_text(size = THEME_CONFIG$size_caption, hjust = 0,
+                                   color = "grey30", lineheight = 1.1,
+                                   margin = margin(t = 6)),
+      legend.position = "right",
+      legend.title    = element_text(size = THEME_CONFIG$size_legend_ttl, face = "bold"),
+      legend.text     = element_text(size = THEME_CONFIG$size_legend_txt),
+      plot.margin     = margin(THEME_CONFIG$plot_margin_mm[1], THEME_CONFIG$plot_margin_mm[2],
+                               THEME_CONFIG$plot_margin_mm[3], THEME_CONFIG$plot_margin_mm[4], unit = "mm"),
+      panel.background = element_rect(fill = "white", color = NA),
+      plot.background  = element_rect(fill = "white", color = NA)
+    ) +
+    guides(fill = guide_colorbar(title = "Amplitude\n(µV)",
+                                 barheight = unit(3.0, "cm"), barwidth = unit(0.4, "cm"),
+                                 ticks.linewidth = 0.6, title.position = "top"))
+  base <- tools::file_path_sans_ext(filename)
+  if (THEME_CONFIG$emit_png) {
+    ggsave(paste0(base, ".png"), plot = p, device = "png",
+           width = THEME_CONFIG$fig_width_single, height = THEME_CONFIG$fig_height_single,
+           dpi = THEME_CONFIG$dpi, bg = "white")
+  }
+  if (THEME_CONFIG$emit_pdf) {
+    ggsave(paste0(base, ".pdf"), plot = p, device = cairo_pdf,
+           width = THEME_CONFIG$fig_width_single, height = THEME_CONFIG$fig_height_single, bg = "white")
+  }
+  invisible(p)
+}
+```
+
+# 3. Render maps for each component & method
+
+```{r render}
+for (comp_name in names(component_specs)) {
+  spec <- component_specs[[comp_name]]
+  win_str <- paste0(spec$win_ms[1], "-", spec$win_ms[2], " ms")
+  roi_str <- paste(spec$roi, collapse = ", ")
+
+  comp_dir <- file.path(root_dir, paste0("Results_", comp_name))
+  cat(sprintf("\n=== %s (%s) ===\n", comp_name, win_str))
+  if (!dir_exists(comp_dir)) { cat("  no results dir; skipping.\n"); next }
+
+  sessions <- dir_ls(comp_dir, glob = "*Session_*", type = "directory")
+  if (length(sessions) == 0) { cat("  no sessions; skipping.\n"); next }
+  current_session <- sessions[order(basename(sessions), decreasing = TRUE)][1]
+  cat(sprintf("  session: %s\n", basename(current_session)))
+
+  for (mdir in names(methods)) {
+    method_dir <- file.path(current_session, mdir)
+    topo_csv <- file.path(method_dir, "topomap_data_for_R", paste0(comp_name, "_topomap_data.csv"))
+    chan_csv <- file.path(method_dir, "channel_locations.csv")
+    if (!file.exists(topo_csv) || !file.exists(chan_csv)) {
+      cat(sprintf("  [%s] missing topo/chanloc CSV; skipping.\n", mdir)); next
+    }
+
+    chanlocs <- read_csv(chan_csv, show_col_types = FALSE, lazy = FALSE) %>%
+      rename(electrode = channel)
+    topo_long <- read_csv(topo_csv, show_col_types = FALSE, lazy = FALSE) %>%
+      rename(electrode = channel)
+
+    out_raw  <- file.path(method_dir, paste0("topoplots_R_", comp_name), "raw")
+    out_diff <- file.path(method_dir, paste0("topoplots_R_", comp_name), "diff")
+    dir_create(out_raw); dir_create(out_diff)
+
+    method_lbl <- methods[[mdir]]
+    cap <- sprintf("Face-locked %s, %s. Window %s. ROI: %s. Descriptive map of the window-mean amplitude; inference is in the LMM (Sta_EEG_FacePhase_E1.Rmd).",
+                   comp_name, method_lbl, win_str, roi_str)
+
+    # ---- (a) per-emotion raw maps on a shared scale ----
+    emo_cols <- intersect(emotion_order, names(topo_long))
+    if (length(emo_cols) > 0) {
+      raw_lim <- sym_limits(unlist(topo_long[emo_cols]))
+      for (emo in emo_cols) {
+        plot_topo_face(
+          dat_long = dplyr::select(topo_long, electrode, amplitude = dplyr::all_of(emo)),
+          chan_locs = chanlocs, roi = spec$roi,
+          main_title = sprintf("%s: %s", comp_name, emotion_labels[[emo]]),
+          sub_title = method_lbl, caption_text = cap,
+          filename = file.path(out_raw, paste0(comp_name, "_", emo, ".png")),
+          limits = raw_lim)
+      }
+    }
+
+    # ---- (b) emotion-minus-Neutral difference maps on a shared symmetric scale ----
+    diff_cols <- grep("^diff_", names(topo_long), value = TRUE)
+    if (length(diff_cols) > 0) {
+      diff_lim <- sym_limits(unlist(topo_long[diff_cols]))
+      for (dc in diff_cols) {
+        emo <- sub("^diff_", "", dc)
+        plot_topo_face(
+          dat_long = dplyr::select(topo_long, electrode, amplitude = dplyr::all_of(dc)),
+          chan_locs = chanlocs, roi = spec$roi,
+          main_title = sprintf("%s: %s - Neutral", comp_name, emotion_labels[[emo]]),
+          sub_title = paste0(method_lbl, " (difference)"), caption_text = cap,
+          filename = file.path(out_diff, paste0(comp_name, "_", emo, "_vs_neu.png")),
+          limits = diff_lim)
+      }
+    }
+    cat(sprintf("  [%s] rendered %d raw + %d diff maps.\n",
+                mdir, length(emo_cols), length(diff_cols)))
+  }
+}
+cat("\nFace topographic report complete.\n")
+```

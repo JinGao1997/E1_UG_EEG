@@ -1,6 +1,6 @@
 # Methods Paragraph (EEG Single-trial LMM, E2)
 
-Generated: 2026-05-19 10:07:02
+Generated: 2026-06-09 09:26:27
 
 ## Statistical Analysis
 
@@ -31,10 +31,10 @@ microvolt scale to preserve direct interpretation as voltage drift.
 
 ### Components and confirmatory framing
 
-Experiment 2 used a simultaneous design: face and offer were presented together. Offer-phase EEG epochs therefore contain both face-evoked early components (N170, EPN) and offer-evoked components (FRN, N400, LPP_offer).
+Experiment 2 used a simultaneous design: face and offer were presented together. The offer-evoked components (FRN, P3) are analyzed identically to Experiment 1.
 
-Components fitted as confirmatory analyses (present in both E1 and E2): FRN, N400, LPP_offer.
-Components fitted as exploratory analyses: N170, EPN.
+Components fitted as confirmatory analyses (present in both E1 and E2): FRN_pre, LPP_pre.
+Components fitted as exploratory analyses: FRN_explor, P3_explor.
 Cross-experiment conceptual replication is based on the confirmatory
 set; exploratory components are reported descriptively only and are
 not interpreted as evidence for or against pre-registered hypotheses.

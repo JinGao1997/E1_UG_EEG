@@ -490,3 +490,66 @@ The following items are not blocking but are documented for awareness:
   Consolidating them under a `scripts/visualization/` subdirectory
   would simplify discovery, but would require careful path-handling
   audits and is best deferred until after manuscript submission.
+
+## 10. Face phase (E1 only) — separate supplementary module
+
+The face-locked analysis (how the proposer's facial emotion is processed at
+*face onset*, before the offer appears) exists only for E1 (sequential design;
+in E2 face and offer are simultaneous, so there is no separable face phase). It
+is kept as a **self-contained, separately stored module** because it is expected
+to appear as supplementary material.
+
+**Scripts — all in one folder `FacePhase_E1/` (project root):**
+
+```
+FacePhase_E1/
+├── Pipline_UG_FacePhase_E1.Rmd          face-locked EEG preprocessing
+├── Sta_EEG_FacePhase_E1.Rmd             face-locked single-trial LMM (stats)
+├── Visualization_EEG_FaceLocked_E1.py   waveforms + emotion-minus-Neutral diff waves + topo CSVs
+└── Topo_Master_FaceLocked_E1.Rmd        topographic maps (downstream of the .py)
+```
+
+Paths are position-independent: the `.Rmd` use `here()` and the `.py` auto-detects
+the project root, so the scripts work from this subfolder without edits.
+
+**Config (shared SSOT, stays in `config/`):**
+`config/erp_components_face_E1.csv` — classic literature windows/ROIs for the
+face components **P1, N170, EPN, LPP_face** (separate from the offer
+`config/erp_components.csv`, so the offer pipeline is untouched).
+
+**Pipeline data (regenerable; stays in the `data/` tree, parallel to the offer phase):**
+`data/02_Pipeline_Output_E1/Method_{Regression,Standard}/Face_Locked/`
+(`trials.csv`, `ave.csv`, `channel_locations.csv`, `epochs/`).
+
+**Results — all under one folder `results/EEG/FacePhase_E1/`:**
+
+```
+results/EEG/FacePhase_E1/
+├── Bates_Alday/          PRIMARY stats (Alday baseline-as-covariate)
+│   ├── Stage1_TrialLevel/<comp>/         per-component LMM (REPRODUCIBILITY, anova_apa, r2, posthoc, .rds, ...)
+│   ├── Stage2_TraitModeration/
+│   │   ├── Confirmatory_SingleStage/      moderators: SVO_angle, Negative_Affectivity
+│   │   ├── Covariate_Control_Ratings/     Rating_1/2/3 as nuisance covariates
+│   │   └── Exploratory_BLUP_PID5BF/       PID-5-BF exploratory screen
+│   ├── Tables_Manuscript/  └── Supplementary/
+├── Bates_Traditional/    SENSITIVITY stats (Stage 2 disabled README)
+└── Results_<comp>/Session_<ts>/{Regression_Results,Standard_Baseline}/
+                          waveform + diff-wave figures, ROI CSVs, topomap_data_for_R/
+```
+
+### Design specifics (differ from the offer phase)
+
+- **Single factor `emotion`** (5 levels: neu/aff/dis/dom/enj), NOT
+  `emotion * offer_type`: at face onset the offer is not yet shown, so fairness
+  is not a factor and no 7:3 filler exclusion applies. Trial inclusion otherwise
+  matches the offer/behavioral analyses (`reaction != 0`, RT in [300, 3000] ms).
+- **Method toggle** `use_baseline_correction` in both `.Rmd` (FALSE = Alday primary
+  / `Method_Regression`; TRUE = traditional sensitivity / `Method_Standard`),
+  mirroring the offer pipeline. The Bates random-structure engine is reused
+  verbatim; only the fixed-effect structure is reduced to one factor.
+- **Triggers** `c(101:115, 201:215)` (E1 face-onset codes; see `.claude/CLAUDE.md`).
+- **Timing**: face 1500 ms -> fixation 500 ms -> offer (>= 2000 ms post face onset),
+  so the LPP_face 500-800 ms window is clear of offer-evoked activity.
+- **Stage 2 covariate roles** (same policy as the offer Alday script):
+  SVO_angle & Negative_Affectivity = moderators; Rating_1/2/3 = nuisance
+  covariates (separate main-effect control model); PID-5-BF = exploratory BLUP.

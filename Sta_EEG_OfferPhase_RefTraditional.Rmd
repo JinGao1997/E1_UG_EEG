@@ -112,33 +112,26 @@ confirmatory_alpha  <- 0.05
 marginal_threshold  <- 0.10
 
 # Component definitions per experimental design.
-# 
-# CONFIRMATORY components are present in BOTH experiments (E1 ∩ E2) and
-# constitute the cross-experiment conceptual replication evidence:
-#   FRN, N400, LPP_offer.
-# 
-# EXPLORATORY components differ between experiments and are not directly
-# comparable cross-experiment:
-#   E1: EPN (offer-locked; face occurred prior, so EPN here reflects offer
-#       processing, NOT face-evoked perception).
-#   E2: N170, EPN (face-evoked / face+offer simultaneous; functionally
-#       distinct from E1 EPN).
-# 
+#
+# The offer-locked analysis extracts two CONFIRMATORY components, present in
+# BOTH experiments (E1 ∩ E2) and constituting the cross-experiment conceptual
+# replication evidence:
+#   FRN, P3.
+#
 # Status per component is propagated to REPRODUCIBILITY.txt and Methods
 # paragraph. All components run the same Stage 1 LMM pipeline; the
 # confirmatory/exploratory distinction is a reporting-layer label.
-# 
+#
 # CPP (response-locked) was previously included; v2 removes it as out of
 # scope for the offer-phase analysis.
-if (experiment_version == "E1") {
-  confirmatory_components <- c("FRN", "N400", "LPP_offer")
-  exploratory_components  <- c("EPN")
-} else if (experiment_version == "E2") {
-  confirmatory_components <- c("FRN", "N400", "LPP_offer")
-  exploratory_components  <- c("N170", "EPN")
-} else {
-  stop("Configuration Error: Unknown experiment_version.")
+comp_csv <- here::here("config", "erp_components.csv")
+if (!file.exists(comp_csv)) {
+  stop(sprintf("Component config not found: %s", comp_csv))
 }
+comp_def <- readr::read_csv(comp_csv, show_col_types = FALSE)
+comp_def <- comp_def[comp_def$experiment == experiment_version, ]
+confirmatory_components <- comp_def$comp_name[comp_def$role == "confirmatory"]
+exploratory_components  <- comp_def$comp_name[comp_def$role == "exploratory"]
 analyze_stim_components <- c(confirmatory_components, exploratory_components)
 
 # Helper to return component status for downstream reporting.
@@ -2476,13 +2469,12 @@ if (length(stage1_models) > 0) {
 design_desc <- if (experiment_version == "E1") {
   paste("Experiment 1 used a sequential design: face was presented before",
         "the offer. Offer-phase EEG epochs are therefore not contaminated",
-        "by simultaneous face-evoked components, so EPN in this experiment",
-        "is interpreted as offer-locked rather than face-locked.")
+        "by simultaneous face-evoked activity, so the offer-evoked components",
+        "(FRN, P3) reflect offer processing.")
 } else {
   paste("Experiment 2 used a simultaneous design: face and offer were",
-        "presented together. Offer-phase EEG epochs therefore contain both",
-        "face-evoked early components (N170, EPN) and offer-evoked components",
-        "(FRN, N400, LPP_offer).")
+        "presented together. The offer-evoked components (FRN, P3) are",
+        "analyzed identically to Experiment 1.")
 }
 
 writeLines(c(

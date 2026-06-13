@@ -1,0 +1,347 @@
+---
+title: "Master Preprocessing Pipeline: E1 UG EEG (Face Phase)"
+subtitle: "Face-locked P1 / N170 / EPN / LPP_face — Regression(Alday) & Standard baselines"
+author: "Project Maintainer"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    code_folding: show
+    theme: flatly
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+# ==============================================================================
+# 1. Environment and Global Configuration
+# ==============================================================================
+# This is the FACE-PHASE counterpart of Pipline_UG_OfferPhase.Rmd, restricted
+# to Experiment 1 (E1, sequential design: face precedes offer). In E2 the face
+# and offer are simultaneous, so there is no separable face phase — hence this
+# script is E1-only by construction.
+#
+# It mirrors the offer-phase pipeline's structure (versioned paths, method
+# toggle, config-driven component windows, Baseline-as-covariate columns) so
+# the two phases share conventions, but it is otherwise self-contained: the
+# face-phase analysis is expected to appear as supplementary material.
+
+if (!require("pacman")) install.packages("pacman")
+if (!require("here"))   install.packages("here")
+pacman::p_load(tidyverse, reticulate, readr, stringr, here, fs)
+
+# -----------------------------------------------------------
+# Experiment Version (FIXED to E1; face phase is E1-only)
+# -----------------------------------------------------------
+# Kept as a variable so the versioned path scheme matches the offer pipeline,
+# but the face phase does not exist for E2 (simultaneous presentation).
+experiment_version <- "E1"
+if (experiment_version != "E1") {
+  stop("Face phase is defined only for E1 (sequential design). E2 has no separable face phase.")
+}
+
+# -----------------------------------------------------------
+# Method Configuration (SINGLE SOURCE OF TRUTH)
+# -----------------------------------------------------------
+# FALSE = Regression Method (PRIMARY): no baseline subtraction; baseline is
+#         extracted as Baseline_<comp> covariate columns -> Alday (2019).
+# TRUE  = Standard Method  (SENSITIVITY): subtract -200..0 ms baseline mean.
+use_baseline_correction <- FALSE
+
+# -----------------------------------------------------------
+# Baseline Parameters (only relevant when use_baseline_correction == TRUE)
+# -----------------------------------------------------------
+use_full_prestim_baseline <- FALSE
+
+baseline_arg <- NULL
+if (use_baseline_correction) {
+  if (use_full_prestim_baseline) {
+    baseline_arg <- list(NULL, 0.0)   # start of epoch to 0 ms
+  } else {
+    baseline_arg <- c(-0.2, 0.0)      # conventional -200..0 ms
+  }
+}
+
+# -----------------------------------------------------------
+# Phase Control
+# -----------------------------------------------------------
+run_face_phase <- TRUE
+
+# -----------------------------------------------------------
+# Path Definitions (versioned, mirrors the offer pipeline)
+# -----------------------------------------------------------
+path_py_pipeline_src <- here("python_modules", "hu-neuro-pipeline")
+
+path_raw_eeg     <- here("data", "00_Raw_Input", paste0("raw_all_cropped_", experiment_version))
+path_raw_log     <- here("data", "00_Raw_Input", paste0("csv_all_", experiment_version))
+
+path_csv_filtered <- here("data", paste0("01_Preprocessing_Logs_", experiment_version), "csv_filtered")
+path_csv_summary  <- here("data", paste0("01_Preprocessing_Logs_", experiment_version), "csv_summary")
+path_output_root  <- here("data", paste0("02_Pipeline_Output_", experiment_version))
+
+if (use_baseline_correction) {
+  path_suffix   <- "Standard_Baseline"
+  method_folder <- "Method_Standard"
+} else {
+  path_suffix   <- "No_Baseline"
+  method_folder <- "Method_Regression"
+}
+
+dir_face_name <- "Face_Locked"   # sibling of Stimulus_Locked / Response_Locked
+
+path_dest_face       <- file.path(path_output_root, method_folder, dir_face_name)
+path_dest_covariates <- file.path(path_output_root, "Covariates")
+path_dest_baseline   <- file.path(path_output_root, "Baseline_Raw")
+path_dest_report     <- file.path(path_dest_face, "report")
+
+dirs_to_create <- c(
+  path_csv_filtered, path_csv_summary, path_output_root,
+  path_dest_face, path_dest_covariates, path_dest_baseline, path_dest_report
+)
+purrr::walk(dirs_to_create, ~dir.create(., showWarnings = FALSE, recursive = TRUE))
+
+# Defensive check: raw-input directories must exist for E1.
+if (!dir.exists(path_raw_eeg)) {
+  stop(sprintf(
+    "Raw EEG directory not found:\n  %s\nExpected layout: data/00_Raw_Input/raw_all_cropped_E1/",
+    path_raw_eeg))
+}
+if (!dir.exists(path_raw_log)) {
+  stop(sprintf(
+    "Raw log directory not found:\n  %s\nExpected layout: data/00_Raw_Input/csv_all_E1/",
+    path_raw_log))
+}
+```
+
+# 2. Python Environment Initialization
+
+```{r Environment, include=FALSE}
+# Mirrors the offer pipeline exactly. NOTE: the offer pipeline successfully
+# epochs E1 .set files WITHOUT any S-format monkey patch (see results/EEG/
+# Results_*_E1/), so the vendored pipeline already handles E1 markers. The
+# legacy face script's get_events patch is therefore intentionally omitted.
+use_condaenv("r-reticulate", required = TRUE)
+py_pipeline_path <- path_py_pipeline_src
+
+py_run_string("
+import sys
+import os
+import importlib
+
+local_path = r.py_pipeline_path
+if os.path.exists(local_path):
+    if local_path not in sys.path:
+        sys.path.insert(0, local_path)
+
+try:
+    import pipeline
+    importlib.reload(pipeline)
+except ImportError as e:
+    print(f'Error: Could not import pipeline. {e}')
+")
+
+pipeline_mod <- import("pipeline")
+```
+
+# 3. Log Preprocessing
+
+```{r log-preprocessing}
+# Identical cleaning to the offer pipeline; idempotent (same csv_filtered output),
+# so this script does not depend on the offer pipeline having been run first.
+orig_logs <- list.files(path_raw_log, pattern = "\\.txt$", full.names = TRUE)
+cat("Processing", length(orig_logs), "log files for Experiment:", experiment_version, "\n")
+
+for (fpath in orig_logs) {
+  fb  <- file(fpath, "rb")
+  bom <- readBin(fb, "raw", n = 2)
+  close(fb)
+  encoding <- if (length(bom) == 2 && identical(bom, as.raw(c(0xFF, 0xFE)))) "UTF-16LE" else "UTF-8"
+
+  df <- read_delim(fpath, delim = "\t", col_types = cols(), show_col_types = FALSE,
+                   locale = locale(encoding = encoding))
+  n <- nrow(df)
+
+  df_trials <- df %>%
+    slice(1:(n - 3)) %>% filter(block != 7) %>%
+    mutate(emotion = str_extract(stim, "enj|dis|dom|neu|aff"))
+
+  df_summary <- df %>% slice((n - 2):n)
+
+  out_name         <- paste0(tools::file_path_sans_ext(basename(fpath)), ".csv")
+  out_name_summary <- paste0(tools::file_path_sans_ext(basename(fpath)), "_summaryPostRating.csv")
+
+  write_csv(df_trials,  file.path(path_csv_filtered, out_name))
+  write_csv(df_summary, file.path(path_dest_covariates, out_name_summary))
+}
+cat("Log preprocessing complete.\n")
+```
+
+# 4. Condition Definitions (Face Phase)
+
+```{r define-conditions}
+# ==============================================================================
+# Face-phase condition pooling.
+# ------------------------------------------------------------------------------
+# In E1 the face precedes the offer, so at face onset the offer is NOT yet known
+# and cannot be a meaningful factor — the only manipulated dimension is `emotion`
+# (5 facial expressions). Conditions are therefore split by emotion alone.
+#
+# Trial inclusion is kept ALIGNED with the offer-phase and behavioral analyses
+# (project always-on criterion): reaction > 0 AND RT in [300, 3000] ms. The face
+# and offer epochs come from the same trials, so using the same inclusion keeps
+# the two phases on an identical trial set. (This is stricter than the legacy
+# face script, which omitted the RT filter.)
+# ==============================================================================
+
+rt_lower_ms <- 300
+rt_upper_ms <- 3000
+incl <- sprintf("reaction>0 & RT >= %d & RT <= %d", rt_lower_ms, rt_upper_ms)
+
+face_average_by <- list(
+  Face_enj = sprintf("emotion=='enj' & %s", incl),
+  Face_aff = sprintf("emotion=='aff' & %s", incl),
+  Face_dis = sprintf("emotion=='dis' & %s", incl),
+  Face_dom = sprintf("emotion=='dom' & %s", incl),
+  Face_neu = sprintf("emotion=='neu' & %s", incl),
+  # Pooled smile cell (3 smile types) — used only as a permutation localizer.
+  Face_smile = sprintf("(emotion=='enj' | emotion=='aff' | emotion=='dom') & %s", incl)
+)
+
+copy_trials_csv <- function(src_dir, dest_dir, new_filename = "trials.csv") {
+  src_trials <- file.path(src_dir, "trials.csv")
+  if (file.exists(src_trials)) {
+    file.copy(src_trials, file.path(dest_dir, new_filename), overwrite = TRUE)
+  }
+}
+```
+
+# 5. ERP Component Extraction (Face Phase)
+
+```{r face-phase}
+if (run_face_phase) {
+
+  out_face <- path_dest_face
+  if (!dir.exists(out_face)) dir.create(out_face, recursive = TRUE)
+
+  face_raw_files <- list.files(path_raw_eeg, pattern = "\\.(set|vhdr)$",
+                               full.names = TRUE, ignore.case = TRUE)
+  if (length(face_raw_files) == 0) stop("CRITICAL: No EEG files found.")
+
+  cat("\n=== Running Face-Locked Extraction (E1) ===\n")
+  cat(sprintf("Method: %s\n", path_suffix))
+
+  # --------------------------------------------------------------------------
+  # Component definitions read from the FACE-PHASE config (separate from the
+  # offer-phase config/erp_components.csv to keep the offer pipeline untouched).
+  # Currently classic literature windows for P1/N170/EPN/LPP_face. To change a
+  # window/ROI or add/remove a component, edit ONLY config/erp_components_face_E1.csv.
+  # --------------------------------------------------------------------------
+  comp_csv <- here("config", "erp_components_face_E1.csv")
+  if (!file.exists(comp_csv)) stop(sprintf("Component config not found: %s", comp_csv))
+
+  comp_def <- readr::read_csv(comp_csv, show_col_types = FALSE)
+  required_cols <- c("experiment", "comp_name", "t_min", "t_max", "roi")
+  if (!all(required_cols %in% names(comp_def))) {
+    stop(sprintf("config/erp_components_face_E1.csv must contain columns: %s",
+                 paste(required_cols, collapse = ", ")))
+  }
+  comp_def <- comp_def[comp_def$experiment == experiment_version, ]
+  if (nrow(comp_def) == 0) stop("No component rows for E1 in config/erp_components_face_E1.csv")
+
+  erp_config <- tibble::tibble(
+    comp_name    = comp_def$comp_name,
+    t_min        = comp_def$t_min,
+    t_max        = comp_def$t_max,
+    roi_channels = strsplit(comp_def$roi, "|", fixed = TRUE)
+  )
+
+  # Regression/Alday method: additionally extract an ROI-specific pre-stimulus
+  # baseline (-200..0 ms) per component, named Baseline_<comp>, to enter the
+  # downstream LMM as a covariate.
+  if (!use_baseline_correction) {
+    baseline_config <- erp_config %>%
+      mutate(comp_name = paste0("Baseline_", comp_name), t_min = -0.200, t_max = 0.000)
+    final_config <- bind_rows(erp_config, baseline_config)
+  } else {
+    final_config <- erp_config
+  }
+
+  components_arg <- list(
+    name = as.list(final_config$comp_name),
+    tmin = as.list(final_config$t_min),
+    tmax = as.list(final_config$t_max),
+    roi  = final_config$roi_channels
+  )
+
+  # --------------------------------------------------------------------------
+  # Cluster-permutation localizers (optional, supplementary). Emotion is the
+  # only face-phase factor, so the primary localizer is a negative-valence
+  # contrast (Disgust vs Neutral); a pooled-smile vs Neutral contrast captures
+  # positive valence. These generate clusters.csv/perm.csv for optional later
+  # use; they do not define the measurement windows (those are classic, fixed
+  # in the config above).
+  # --------------------------------------------------------------------------
+  perm_contrasts_list <- list(
+    c("Face_dis",   "Face_neu"),
+    c("Face_smile", "Face_neu")
+  )
+
+  res_face <- pipeline_mod$group_pipeline(
+    raw_files        = face_raw_files,
+    log_files        = path_csv_filtered,
+    output_dir       = out_face,
+    epochs_dir       = file.path(out_face, "epochs"),
+
+    ica_method       = "fastica",
+    ica_n_components = 0.99,
+    triggers         = c(101:115, 201:215),   # E1 face-onset codes (log stim_trigger)
+    bad_channels     = "auto",
+    highpass_freq    = 0.05,
+    lowpass_freq     = 30.0,
+    reject_peak_to_peak = 200.0,
+    baseline         = baseline_arg,
+
+    components       = components_arg,
+    average_by       = face_average_by,
+
+    perm_contrasts   = perm_contrasts_list,
+    perm_tmin        = 0.050,
+    perm_tmax        = 0.800,
+    perm_channels    = NULL
+  )
+
+  # Archive the per-trial ERP table to the method-specific Face_Locked dir.
+  # (group_pipeline already writes trials.csv into out_face; copy_trials_csv is
+  # a no-op safety net retained for parity with the offer pipeline.)
+  if (!use_baseline_correction) {
+    out_bl_archive <- file.path(path_dest_baseline, "Face_Locked_Values")
+    if (!dir.exists(out_bl_archive)) dir.create(out_bl_archive, recursive = TRUE)
+    copy_trials_csv(out_face, out_bl_archive, "baseline_values.csv")
+  }
+}
+```
+
+# 6. Summary of Generated Files
+
+```{r summary}
+cat("\n========================================\n")
+cat("       FACE-PHASE PREPROCESSING DONE       \n")
+cat("========================================\n")
+cat("Experiment:      ", experiment_version, "(face-locked)\n")
+cat("Method Strategy: ", path_suffix, "\n")
+cat("Output Root:     ", path_output_root, "\n\n")
+
+if (run_face_phase) {
+  cat("Face-Locked single-trial table:\n   ",
+      file.path(path_dest_face, "trials.csv"), "\n")
+  if (!use_baseline_correction) {
+    cat("Baseline columns (Baseline_<comp>) are included in the same trials.csv.\n")
+  }
+}
+cat("\nNOTE: E1 timing = face 1500 ms -> fixation 500 ms -> offer (>=2000 ms post\n")
+cat("face onset). The LPP_face window (500-800 ms) is therefore well clear of the\n")
+cat("offer onset; no offer-evoked contamination of the face-locked components.\n")
+cat("========================================\n")
+```

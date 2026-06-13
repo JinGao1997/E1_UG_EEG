@@ -1,19 +1,16 @@
-Table: Stage 2 Confirmatory single-stage moderation: Rating_2. Within-trait BH-FDR across n_tests = 15 (components x 3 interaction terms).
+Table: Stage 2 Confirmatory single-stage moderation: Rating_2. Within-trait BH-FDR across n_tests = 12 (components x 3 interaction terms).
 
-|   |component |term                       |F_or_Chisq | df_num|    df_den|p_raw    |ddf_used      |p_fdr    |Sig_fdr |trait    |
-|:--|:---------|:--------------------------|:----------|------:|---------:|:--------|:-------------|:--------|:-------|:--------|
-|15 |EPN       |emotion:offer_type:trait_z |14.046     |      4| 106663.18|< 0.0001 |Satterthwaite |< 0.0001 |***     |Rating_2 |
-|6  |N400      |emotion:offer_type:trait_z |11.058     |      4| 106691.06|< 0.0001 |Satterthwaite |< 0.0001 |***     |Rating_2 |
-|9  |LPP_offer |emotion:offer_type:trait_z |10.682     |      4| 106663.19|< 0.0001 |Satterthwaite |< 0.0001 |***     |Rating_2 |
-|3  |FRN       |emotion:offer_type:trait_z |8.317      |      4| 106691.04|< 0.0001 |Satterthwaite |< 0.0001 |***     |Rating_2 |
-|12 |N170      |emotion:offer_type:trait_z |7.983      |      4| 106691.01|< 0.0001 |Satterthwaite |< 0.0001 |***     |Rating_2 |
-|2  |FRN       |offer_type:trait_z         |14.140     |      1| 106691.02|0.00017  |Satterthwaite |0.000424 |***     |Rating_2 |
-|1  |FRN       |emotion:trait_z            |4.477      |      4| 106691.01|0.00129  |Satterthwaite |0.002756 |**      |Rating_2 |
-|4  |N400      |emotion:trait_z            |3.882      |      4| 106691.01|0.00372  |Satterthwaite |0.006978 |**      |Rating_2 |
-|10 |N170      |emotion:trait_z            |3.437      |      4| 106691.00|0.00814  |Satterthwaite |0.013573 |*       |Rating_2 |
-|13 |EPN       |emotion:trait_z            |3.260      |      4| 106663.76|0.01109  |Satterthwaite |0.016636 |*       |Rating_2 |
-|11 |N170      |offer_type:trait_z         |6.233      |      1| 106691.01|0.01254  |Satterthwaite |0.017097 |*       |Rating_2 |
-|7  |LPP_offer |emotion:trait_z            |1.836      |      4| 106663.61|0.11888  |Satterthwaite |0.148600 |ns      |Rating_2 |
-|14 |EPN       |offer_type:trait_z         |0.137      |      1|     27.99|0.71385  |Satterthwaite |0.823676 |ns      |Rating_2 |
-|5  |N400      |offer_type:trait_z         |0.082      |      1| 106691.02|0.77527  |Satterthwaite |0.830642 |ns      |Rating_2 |
-|8  |LPP_offer |offer_type:trait_z         |0.038      |      1|     28.00|0.84751  |Satterthwaite |0.847512 |ns      |Rating_2 |
+|   |component  |term                       |F_or_Chisq | df_num|   df_den|p_raw    |ddf_used      |p_fdr    |Sig_fdr |trait    |
+|:--|:----------|:--------------------------|:----------|------:|--------:|:--------|:-------------|:--------|:-------|:--------|
+|9  |FRN_explor |emotion:offer_type:trait_z |6.310      |      4| 85343.04|< 0.0001 |Satterthwaite |0.000542 |***     |Rating_2 |
+|7  |FRN_explor |emotion:trait_z            |5.879      |      4| 85343.01|< 0.0001 |Satterthwaite |0.000600 |***     |Rating_2 |
+|6  |LPP_pre    |emotion:offer_type:trait_z |5.225      |      4| 85315.10|0.000332 |Satterthwaite |0.001328 |**      |Rating_2 |
+|4  |LPP_pre    |emotion:trait_z            |4.410      |      4| 85315.38|0.001451 |Satterthwaite |0.004353 |**      |Rating_2 |
+|2  |FRN_pre    |offer_type:trait_z         |8.592      |      1| 85343.01|0.003377 |Satterthwaite |0.008105 |**      |Rating_2 |
+|3  |FRN_pre    |emotion:offer_type:trait_z |3.659      |      4| 85343.02|0.005518 |Satterthwaite |0.009459 |**      |Rating_2 |
+|12 |P3_explor  |emotion:offer_type:trait_z |3.728      |      4| 85315.10|0.004892 |Satterthwaite |0.009459 |**      |Rating_2 |
+|1  |FRN_pre    |emotion:trait_z            |2.005      |      4| 85343.01|0.090823 |Satterthwaite |0.126859 |ns      |Rating_2 |
+|10 |P3_explor  |emotion:trait_z            |1.976      |      4| 85315.34|0.095144 |Satterthwaite |0.126859 |ns      |Rating_2 |
+|11 |P3_explor  |offer_type:trait_z         |0.586      |      1|    27.98|0.450230 |Satterthwaite |0.540276 |ns      |Rating_2 |
+|8  |FRN_explor |offer_type:trait_z         |0.245      |      1| 85343.02|0.620562 |Satterthwaite |0.636986 |ns      |Rating_2 |
+|5  |LPP_pre    |offer_type:trait_z         |0.228      |      1|    27.98|0.636986 |Satterthwaite |0.636986 |ns      |Rating_2 |

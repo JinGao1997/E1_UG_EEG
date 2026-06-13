@@ -1,0 +1,3239 @@
+---
+title: "E1 Face-Phase ERP Statistical Analysis: Two-Stage Pipeline (FacePhase v1.0)"
+subtitle: "E1 face-locked (sequential design) single-factor emotion LMM. Single merged script: use_baseline_correction = FALSE -> Alday baseline-as-covariate (PRIMARY); TRUE -> traditional baseline subtraction (SENSITIVITY). Stage 1: single-trial LMM with Bates random-structure selection. Stage 2 (Alday only): single-stage LMM two-way emotion-by-trait moderation for five confirmatory traits (Rating_1/2/3, SVO_angle, Negative_Affectivity); BLUP-based exploratory screen for the five PID-5-BF dimensions. Trial inclusion (reaction != 0; RT in [300, 3000] ms) aligned with the offer-phase and behavioral analyses. Adapted from Sta_EEG_OfferPhase_RefAlday.Rmd: the offer phase's emotion*offer_type design is reduced to emotion-only here because at face onset (E1) the offer is not yet shown."
+author: "Project Research Team"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+    theme: flatly
+    fig_width: 10
+    fig_height: 6
+---
+
+``` {r setup, include=FALSE}
+# ==============================================================================
+# 1. Global Configuration & Environment
+# ==============================================================================
+# Note: knitr defaults buffer chunk output until completion. For long-running
+# chunks (large LMM fits), we set R.options(progress = TRUE) and use
+# flush.console() inside helpers (see flush_progress() below). When running
+# interactively in RStudio (not via Knit), output is unbuffered automatically.
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  results = "markup"   # default; ensures plain text streams correctly
+)
+options(scipen = 999, digits = 4)
+set.seed(2024)
+
+# Sum-to-zero contrasts: required for valid Type III ANOVA in the presence of
+# interactions, and for interpretable zero-correlation random-effect parameterizations.
+# Reference: Schad, Vasishth, Hohenstein, & Kliegl (2020) on contrast coding.
+options(contrasts = c("contr.sum", "contr.poly"))
+
+# ------------------------------------------------------------------------------
+# Global Settings & Analysis Targets (SINGLE SOURCE OF TRUTH)
+# ------------------------------------------------------------------------------
+# Face phase exists only for E1 (sequential design); E2 has no separable face
+# phase. experiment_version is fixed to "E1" and kept only for the versioned
+# path scheme shared with the offer pipeline.
+experiment_version <- "E1"
+if (experiment_version != "E1") {
+  stop("Face phase is defined only for E1 (sequential design).")
+}
+
+# ------------------------------------------------------------------------------
+# Method toggle (mirrors Pipline_UG_FacePhase_E1.Rmd). A SINGLE merged script:
+#   FALSE = Alday baseline-as-covariate, reads Method_Regression  (PRIMARY)
+#   TRUE  = traditional baseline subtraction, reads Method_Standard (SENSITIVITY)
+# Drives: input dir, fixed-effect formula (Baseline_c presence), baseline-balance
+# pre-check, emmeans 'at', output dir suffix, and whether Stage 2 runs.
+# ------------------------------------------------------------------------------
+use_baseline_correction <- FALSE
+if (use_baseline_correction) {
+  method_dir     <- "Method_Standard"
+  output_suffix  <- "Traditional"
+  use_baseline_covariate <- FALSE   # amplitude already baseline-corrected upstream
+  run_stage2     <- FALSE           # disabled in sensitivity analysis (see README)
+} else {
+  method_dir     <- "Method_Regression"
+  output_suffix  <- "Alday"
+  use_baseline_covariate <- TRUE    # Baseline_<comp> enters the LMM as a covariate
+  run_stage2     <- TRUE
+}
+
+# ------------------------------------------------------------------------------
+# Stage 2 trait architecture (v2.2: dual-track confirmatory/exploratory design).
+#
+# RATIONALE FOR THE SPLIT
+# Trait variables are partitioned by their THEORETICAL ROLE (not lumped as one
+# covariate set), addressing the over-fitting/multicollinearity risk of dumping
+# many correlated questionnaires into one model:
+#
+# (A) CONFIRMATORY MODERATORS (single-stage LMM moderation, n = 2)
+#   SVO_angle            : social value orientation; established UG-ERP moderator
+#                          (e.g., Wu et al., 2021, SCAN, on prosocial vs proself
+#                          differences in MFN/P3).
+#   Negative_Affectivity : trait anxiety / Neuroticism analogue; established FRN
+#                          moderator across feedback paradigms (Gu et al., 2010;
+#                          Gu et al., 2014; Banica et al., 2021).
+#   Tested as confirmatory hypotheses via single-stage LMM with the two-way
+#   emotion-by-trait interaction (face phase: emotion is the sole design factor;
+#   the statistically valid implementation of cross-level moderation; Snijders &
+#   Bosker, 2012, ch. 5-6).
+#
+# (B) NUISANCE COVARIATES (separate main-effect control model, n = 3)
+#   Rating_1, Rating_2, Rating_3 : cover-story belief checks (manipulation
+#                          checks), NOT theoretical moderators. They enter a
+#                          SEPARATE control model as grand-mean-centered MAIN-
+#                          EFFECT covariates (no interaction) to verify the
+#                          design effects are robust to belief strength. The
+#                          primary Stage 1 inference is left untouched. See
+#                          run_covariate_control_check().
+#
+# (C) EXPLORATORY PID-5-BF TRAITS (BLUP-based screen, n = 5)
+#   Detachment, Antagonism, Disinhibition, Anankastia, Psychoticism : five
+#   PID-5-BF dimensions (Krueger et al., 2012) lacking direct UG-ERP literature
+#   support; screened in a secondary BLUP-based exploratory analysis (BLUP-then-
+#   correlate suffers shrinkage/SE bias, Hofmann & Rovine 2007; Rouder & Haaf
+#   2019), reported in Supplementary Materials as hypothesis-generating only.
+# ------------------------------------------------------------------------------
+confirmatory_traits <- c("SVO_angle", "Negative_Affectivity")
+
+# Cover-story belief checks handled as nuisance covariates (main-effect control),
+# NOT as moderators (decision: 2026-06).
+rating_covariates <- c("Rating_1", "Rating_2", "Rating_3")
+
+exploratory_pid_traits <- c("Detachment", "Antagonism", "Disinhibition",
+                            "Anankastia", "Psychoticism")
+
+# Retained for back-compatibility with the BLUP exploratory engine, which uses
+# a named-list structure to drive output directory naming. Only the PID group
+# is populated; Rating and SVO+NegAff are now handled by the single-stage path.
+stage2_trait_groups <- list(
+  Exploratory_PID5BF = exploratory_pid_traits
+)
+
+# Flat union retained for covariate loading (load_covariates filters by this).
+# Includes rating_covariates so the nuisance-covariate control model can use them.
+stage2_traits <- c(confirmatory_traits, rating_covariates, exploratory_pid_traits)
+
+# ------------------------------------------------------------------------------
+# Trial-level inclusion criteria
+# ------------------------------------------------------------------------------
+# These thresholds define which trials enter Stage 1 LMM analysis. They are
+# applied AT THE ANALYSIS LAYER (in load_and_prep below), NOT in the upstream
+# HU pipeline preprocessing. Rationale: the canonical trials.csv produced by
+# HU pipeline reflects only EEG-artifact rejection (peak-to-peak > 200 uV
+# marked as NaN); response-related and RT-range exclusions are analysis-
+# specific decisions and are therefore implemented here for transparency.
+#
+# IMPORTANT: keep these constants synchronized with Sta_Behaviour_RefAlday.Rmd
+# (rt_lower_ms / rt_upper_ms, lines 56-57). Cross-modality sample equivalence
+# requires identical inclusion logic across the behavioral and EEG analyses.
+# These values also match the average_by query in upstream HU pipeline calls
+# (Pipline_UG_OfferPhase.Rmd lines 181-236) and the predeclared analysis plan.
+rt_lower_ms <- 300
+rt_upper_ms <- 3000
+
+# Post-hoc gating thresholds (v2: layered).
+# Effects with omnibus interaction p < confirmatory_alpha enter the main report.
+# Effects with confirmatory_alpha <= p < marginal_threshold are written to
+# Supplementary as "marginal" simple-effect contrasts; they are NEVER reported
+# as confirmatory evidence. p >= marginal_threshold: no simple-effect extraction.
+confirmatory_alpha  <- 0.05
+marginal_threshold  <- 0.10
+
+# Face-phase component definitions. Read from the SEPARATE face config so the
+# offer pipeline's config/erp_components.csv is left untouched. Classic
+# literature windows for P1 / N170 / EPN / LPP_face (E1 only). The
+# confirmatory/exploratory label is a reporting-layer distinction (drives
+# FDR families) set in the CSV `role` column; all components run the same
+# Stage 1 LMM pipeline.
+comp_csv <- here::here("config", "erp_components_face_E1.csv")
+if (!file.exists(comp_csv)) {
+  stop(sprintf("Face component config not found: %s", comp_csv))
+}
+comp_def <- readr::read_csv(comp_csv, show_col_types = FALSE)
+comp_def <- comp_def[comp_def$experiment == experiment_version, ]
+confirmatory_components <- comp_def$comp_name[comp_def$role == "confirmatory"]
+exploratory_components  <- comp_def$comp_name[comp_def$role == "exploratory"]
+analyze_stim_components <- c(confirmatory_components, exploratory_components)
+
+# Helper to return component status for downstream reporting.
+component_status <- function(comp_name) {
+  if (comp_name %in% confirmatory_components) "confirmatory_face_locked"
+  else if (comp_name %in% exploratory_components) "exploratory_face_locked"
+  else NA_character_
+}
+# ------------------------------------------------------------------------------
+
+if(!require("pacman")) install.packages("pacman")
+pacman::p_load(
+  here, readr, readxl, dplyr, tidyr, stringr, tibble, purrr,  # Data wrangling
+  lme4, lmerTest,                                              # Modeling
+  pbkrtest,                                                    # Kenward-Roger backend for lmerTest
+  car, parameters, performance,                                # Diagnostics
+  buildmer,                                                    # LRT-based structure search
+  R.utils,                                                     # withTimeout for buildmer protection
+  emmeans, effectsize,                                         # Marginal means, effect sizes
+  sjPlot, sjmisc,                                              # tab_model, plot_model
+  ggplot2, ggpubr, gridExtra,                                  # Publication visualization
+  knitr, kableExtra,                                           # Markdown table rendering
+  openxlsx                                                     # Legacy Excel export
+)
+
+# Inferential strategy: cascading method preference for LMM
+# (Satterthwaite -> Kenward-Roger -> Wald). EEG analyses are pure LMM
+# (Gaussian on amplitude in microvolts), so there is no GLMM branch.
+# 
+# Cascade rationale:
+# (1) Satterthwaite F (lmerTest::anova): finite-DenDF F-test, preferred for
+#     Type I error control at moderate N_subj (Luke 2017).
+# (2) Kenward-Roger F (pbkrtest backend via lmerTest): conservative second-
+#     order correction. Different numerical implementation than Satterthwaite,
+#     can succeed when Satterthwaite hits Hessian inversion failure modes on
+#     ZCP-form (e.g., (0 + factor | id)) random structures at large N.
+# (3) Wald chi-square (car::Anova): final fallback. Anti-conservative for
+#     finite N (Luke 2017 simulations show Type I error 6-8% at N_subj < 30
+#     for omnibus tests). Logged in REPRODUCIBILITY.txt when invoked.
+# 
+# CRITICAL ENGINEERING DETAIL: lmerTest's Satterthwaite/KR dispatch requires
+# the model object class to include "lmerModLmerTest". When fit via
+# lme4::lmer() (rather than lmerTest::lmer()), the result is bare "lmerMod"
+# and anova() falls through to lme4's base method which silently ignores
+# the ddf argument and returns no Pr column. fit_stage1_bates therefore
+# upgrades the final model class via lmerTest::as_lmerModLmerTest() before
+# returning, and the ANOVA cascade independently re-checks. See bates-engine
+# chunk for details.
+# 
+# Post-hoc contrasts via emmeans use asymptotic (z-test) df for computational
+# stability on large datasets. At present DenDF magnitudes (DenDF >> 30),
+# z-tests differ from Satterthwaite-based t-tests by less than 1% (Luke 2017).
+emmeans::emm_options(lmerTest.limit = 1e7, pbkrtest.limit = 1e7,
+                     lmer.df = "asymptotic")
+options(lmerTest.limit = 1e7)
+options(pbkrtest.limit = 1e7)
+
+# Output directory tree organized by analytic stage and reporting target.
+# v2.2: Stage 2 root directory split into two subtrees to mirror the dual-track
+# methodological design (single-stage confirmatory vs BLUP exploratory).
+# All face-phase results live together under results/EEG/FacePhase_E1/ (the same
+# tree the face visualization writes to), keeping the face module self-contained.
+out_root            <- here("results", "EEG", "FacePhase_E1", paste0("Bates_", output_suffix))
+out_stage1          <- file.path(out_root, "Stage1_TrialLevel")
+out_stage2          <- file.path(out_root, "Stage2_TraitModeration")
+out_stage2_confirm  <- file.path(out_stage2, "Confirmatory_SingleStage")
+out_stage2_explore  <- file.path(out_stage2, "Exploratory_BLUP_PID5BF")
+out_stage2_covctrl  <- file.path(out_stage2, "Covariate_Control_Ratings")
+out_tables          <- file.path(out_root, "Tables_Manuscript")
+out_suppl           <- file.path(out_root, "Supplementary")
+dirs_needed <- c(out_stage1, out_tables, out_suppl)
+if (run_stage2) dirs_needed <- c(dirs_needed, out_stage2, out_stage2_confirm,
+                                 out_stage2_explore, out_stage2_covctrl)
+for (d in dirs_needed) {
+  if (!dir.exists(d)) dir.create(d, recursive = TRUE)
+}
+
+cat(sprintf("Pipeline initialized for Experiment: %s\nRoot: %s\n",
+            experiment_version, out_root))
+cat(sprintf("Stage 2 architecture:\n"))
+cat(sprintf("  Confirmatory moderators (%d): %s\n",
+            length(confirmatory_traits),
+            paste(confirmatory_traits, collapse = ", ")))
+cat(sprintf("  Nuisance covariates / control model (%d): %s\n",
+            length(rating_covariates),
+            paste(rating_covariates, collapse = ", ")))
+cat(sprintf("  Exploratory BLUP screen (%d PID-5-BF traits): %s\n",
+            length(exploratory_pid_traits),
+            paste(exploratory_pid_traits, collapse = ", ")))
+
+# Visual theme.
+theme_set(theme_bw(base_size = 14) +
+          theme(panel.grid.minor = element_blank(), legend.position = "top"))
+
+colors_emo <- c('neu'="#8491B4",'aff'="#91D1C2",'dis'="#E64B35",'dom'="#F39B7F",'enj'="#3C5488")
+labels_emo <- c('neu'='Neutral','aff'='Affiliative','dis'='Disgust','dom'='Dominance','enj'='Reward')
+colors_off <- c('fair'="#2E86AB",'unfair'="#A23B72")
+labels_off <- c('fair'='Fair', 'unfair'='Unfair')
+
+custom_control <- lmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 200000), calc.derivs = FALSE)
+
+# Null-coalescing helper for safe attribute fallback.
+`%||%` <- function(a, b) if (is.null(a)) b else a
+
+# ------------------------------------------------------------------------------
+# Buildmer engineering helpers (defensive against deadlock on large datasets).
+# 
+# When N > 20K trials, lmerTest can cause buildmer's iterative LRT loop to hang
+# (CPU 0%) because every internal anova() call triggers Satterthwaite Hessian
+# inversion. We detach lmerTest before buildmer and reattach after. We also
+# wrap buildmer in withTimeout to prevent unbounded waits.
+# ------------------------------------------------------------------------------
+detach_lmerTest_safely <- function() {
+  if ("package:lmerTest" %in% search()) {
+    detach("package:lmerTest", unload = FALSE, character.only = FALSE)
+    return(TRUE)
+  }
+  FALSE
+}
+
+reattach_lmerTest_safely <- function(was_detached) {
+  if (isTRUE(was_detached)) suppressMessages(library(lmerTest))
+  invisible(NULL)
+}
+
+run_buildmer_protected <- function(buildmer_fn, ..., timeout_sec = 1800) {
+  was_lmerTest <- detach_lmerTest_safely()
+  on.exit(reattach_lmerTest_safely(was_lmerTest), add = TRUE)
+  
+  result <- tryCatch({
+    R.utils::withTimeout({
+      buildmer_fn(...)
+    }, timeout = timeout_sec, onTimeout = "error")
+  }, TimeoutException = function(ex) {
+    progress_log(sprintf("[TIMEOUT] buildmer exceeded %d seconds; aborting.",
+                         timeout_sec), indent = 2)
+    NULL
+  }, error = function(e) {
+    if (grepl("reached.*time.*limit|timeout", conditionMessage(e), ignore.case = TRUE)) {
+      progress_log(sprintf("[TIMEOUT] buildmer exceeded %d seconds; aborting.",
+                           timeout_sec), indent = 2)
+      NULL
+    } else {
+      progress_log(sprintf("[WARN] buildmer error: %s", conditionMessage(e)),
+                   indent = 2)
+      NULL
+    }
+  })
+  
+  result
+}
+
+# ------------------------------------------------------------------------------
+# Progress reporting helpers.
+# ------------------------------------------------------------------------------
+# R Markdown can buffer cat() output until a chunk finishes, hiding progress
+# during long-running operations. flush_progress() forces immediate display.
+# Wall-clock timing is captured per stage to give the user realistic runtime
+# expectations on subsequent components.
+flush_progress <- function() {
+  flush.console()
+  if (interactive()) Sys.sleep(0)  # nominal yield
+}
+
+progress_log <- function(msg, indent = 0) {
+  prefix <- strrep("  ", indent)
+  cat(sprintf("%s%s\n", prefix, msg))
+  flush_progress()
+}
+
+# Format an elapsed-time delta for log lines. Used to report duration of
+# expensive operations (model fits, ANOVA, buildmer search).
+format_elapsed <- function(t_start) {
+  secs <- as.numeric(Sys.time() - t_start, units = "secs")
+  if (secs < 60) sprintf("%.1fs", secs)
+  else if (secs < 3600) sprintf("%dm%02ds", floor(secs / 60), round(secs %% 60))
+  else sprintf("%dh%02dm", floor(secs / 3600), floor((secs %% 3600) / 60))
+}
+
+# Wrap an expression with start/end progress logs and elapsed time.
+with_progress <- function(label, expr, indent = 1) {
+  progress_log(sprintf("[%s] starting...", label), indent = indent)
+  t0 <- Sys.time()
+  result <- force(expr)
+  progress_log(sprintf("[%s] done (%s).", label, format_elapsed(t0)),
+               indent = indent)
+  result
+}
+```
+
+``` {r apa-module}
+# ==============================================================================
+# 2. Helper Functions (preserved from original script).
+# ==============================================================================
+
+# Universal type conversion, missing-value handling, and column purging.
+kill_scipen <- function(df) {
+  df %>%
+    dplyr::mutate(across(where(is.factor), as.character)) %>%
+    dplyr::mutate(across(everything(), function(vec) {
+      if (is.numeric(vec)) {
+        vec <- format(round(vec, 4), scientific = FALSE, trim = TRUE)
+      }
+      vec <- ifelse(is.infinite(suppressWarnings(as.numeric(vec))), "Inf", vec)
+      vec <- ifelse(is.na(vec) | vec == "NA", "-", as.character(vec))
+      vec
+    })) %>%
+    dplyr::select(where(~ !all(. == "-")))
+}
+
+# APA significance star generator.
+add_sig_stars <- function(p) {
+  dplyr::case_when(
+    is.na(p)  ~ "-",
+    p < 0.001 ~ "***",
+    p < 0.01  ~ "**",
+    p < 0.05  ~ "*",
+    p < 0.1   ~ ".",
+    TRUE      ~ "ns"
+  )
+}
+
+# Map sum-coding suffixes back to interpretable factor-level labels.
+beautify_labels <- function(df) {
+  dict <- c(
+    "\\bemotion1\\b"    = "emotion[neu-grand]",
+    "\\bemotion2\\b"    = "emotion[aff-grand]",
+    "\\bemotion3\\b"    = "emotion[dis-grand]",
+    "\\bemotion4\\b"    = "emotion[dom-grand]",
+    "\\boffer_type1\\b" = "offer_type[fair-grand]"
+  )
+  df %>% dplyr::mutate(across(where(is.character),
+                              ~ stringr::str_replace_all(., dict)))
+}
+
+# Format ANOVA table to APA strings.
+# v2: appends partial eta-squared with 95% CI for LMM (Gaussian) models.
+# Effect-size computation uses effectsize::eta_squared() which handles
+# both lme4 and lmerTest model classes. EEG analyses are pure LMM, so
+# eta-squared is always meaningful here (no GLMM branch).
+format_anova_apa <- function(anova_obj, model = NULL) {
+  df_res <- as.data.frame(anova_obj) %>%
+    tibble::rownames_to_column("Effect")
+  
+  get_col <- function(col_name) {
+    if (col_name %in% names(df_res)) df_res[[col_name]] else rep(NA, nrow(df_res))
+  }
+  
+  df_res <- df_res %>%
+    dplyr::mutate(
+      F_val  = get_col("F value"),
+      NumDF  = get_col("NumDF"),
+      DenDF  = get_col("DenDF"),
+      Df_val = get_col("Df"),
+      Chisq  = get_col("Chisq"),
+      p_val  = dplyr::case_when(
+        !is.na(get_col("Pr(>F)"))     ~ get_col("Pr(>F)"),
+        !is.na(get_col("Pr(>Chisq)")) ~ get_col("Pr(>Chisq)"),
+        TRUE ~ NA_real_
+      ),
+      Sig = add_sig_stars(p_val),
+      p_str = dplyr::case_when(
+        is.na(p_val)  ~ "-",
+        p_val < .001  ~ "< .001",
+        TRUE          ~ paste0("= ", format(round(p_val, 3), scientific = FALSE, trim = TRUE))
+      ),
+      APA_Report = dplyr::case_when(
+        !is.na(F_val) & !is.na(NumDF) & !is.na(DenDF) ~
+          sprintf("F(%s, %.2f) = %.2f, p %s", NumDF, DenDF, F_val, p_str),
+        !is.na(F_val) & !is.na(NumDF) ~
+          sprintf("F(%s) = %.2f, p %s", NumDF, F_val, p_str),
+        !is.na(Chisq) & !is.na(Df_val) ~
+          sprintf("\u03C7\u00B2(%s) = %.2f, p %s", Df_val, Chisq, p_str),
+        TRUE ~ "[stat unrecognized]"
+      )
+    )
+  
+  # Partial eta-squared with 95% CI. Only computed for F-statistic rows
+  # (LMM Satterthwaite/KR). Wald chi-square fallback rows show "-".
+  eta_str <- rep("-", nrow(df_res))
+  if (!is.null(model) && inherits(model, "merMod")) {
+    eta_tab <- tryCatch(
+      effectsize::eta_squared(anova_obj, partial = TRUE, ci = 0.95,
+                              alternative = "two.sided"),
+      error = function(e) NULL
+    )
+    if (!is.null(eta_tab) && nrow(eta_tab) > 0) {
+      eta_df <- as.data.frame(eta_tab)
+      param_col <- intersect(c("Parameter", "Effect"), names(eta_df))[1]
+      eta_col   <- intersect(c("Eta2_partial", "Eta2"), names(eta_df))[1]
+      lo_col    <- "CI_low"
+      hi_col    <- "CI_high"
+      if (!is.na(param_col) && !is.na(eta_col) &&
+          all(c(lo_col, hi_col) %in% names(eta_df))) {
+        for (i in seq_len(nrow(df_res))) {
+          eff_name <- df_res$Effect[i]
+          match_idx <- which(eta_df[[param_col]] == eff_name)
+          if (length(match_idx) == 1) {
+            eta_str[i] <- sprintf("%.3f [%.3f, %.3f]",
+                                  eta_df[[eta_col]][match_idx],
+                                  eta_df[[lo_col]][match_idx],
+                                  eta_df[[hi_col]][match_idx])
+          }
+        }
+      }
+    }
+  }
+  df_res$eta2_partial_95CI <- eta_str
+  
+  df_res <- df_res %>%
+    dplyr::select(Effect, APA_Report, eta2_partial_95CI, Sig, p_val)
+  beautify_labels(df_res)
+}
+
+# Format post-hoc emmeans output to APA strings.
+# v2: appends 95% CI columns. EEG analyses operate on raw amplitude scale
+# (microvolts, Gaussian), so no scale transformation (no OR, no percent
+# change) is needed -- contrasts are reported directly in microvolts.
+# Switches to z-statistic notation when df is infinite (asymptotic case).
+format_posthoc_apa <- function(emm_df) {
+  df_clean <- as.data.frame(emm_df)
+  
+  est_col <- intersect(names(df_clean),
+                       c("estimate", "emmean", "response"))
+  if (length(est_col) == 0) {
+    trend_col <- grep("\\.trend$", names(df_clean), value = TRUE)
+    est_col <- if (length(trend_col) > 0) trend_col[1] else names(df_clean)[2]
+  } else {
+    est_col <- est_col[1]
+  }
+  
+  # CI columns. emmeans summary(infer=c(TRUE,TRUE)) emits CL columns, but
+  # column naming varies:
+  #   - "lower.CL" / "upper.CL"      (most cases)
+  #   - "asymp.LCL" / "asymp.UCL"    (when df is Inf, e.g. asymptotic mode)
+  # If neither is present (rare; happens when summary infer didn't fire),
+  # synthesize from estimate +/- 1.96*SE (Wald-based asymptotic CI). This
+  # ensures lower.CL / upper.CL columns ALWAYS exist, which matters because
+  # dplyr::case_when() evaluates ALL RHS expressions regardless of LHS truth
+  # value -- a missing column would error even on rows where the expression
+  # is "not selected".
+  if (all(c("lower.CL", "upper.CL") %in% names(df_clean))) {
+    # already correctly named
+  } else if (all(c("asymp.LCL", "asymp.UCL") %in% names(df_clean))) {
+    df_clean$lower.CL <- df_clean$asymp.LCL
+    df_clean$upper.CL <- df_clean$asymp.UCL
+  } else if ("SE" %in% names(df_clean)) {
+    # Synthesize Wald CI. Mark as fallback in case downstream wants to flag.
+    df_clean$lower.CL <- df_clean[[est_col]] - 1.96 * df_clean$SE
+    df_clean$upper.CL <- df_clean[[est_col]] + 1.96 * df_clean$SE
+  } else {
+    # No SE either: emit NA columns to keep the schema stable.
+    df_clean$lower.CL <- NA_real_
+    df_clean$upper.CL <- NA_real_
+  }
+  has_ci <- all(c("lower.CL", "upper.CL") %in% names(df_clean)) &&
+            !all(is.na(df_clean$lower.CL))
+  
+  df_clean <- df_clean %>%
+    dplyr::mutate(
+      Sig = add_sig_stars(p.value),
+      p_str = dplyr::case_when(
+        p.value < .001 ~ "< .001",
+        TRUE ~ paste0("= ", format(round(p.value, 3), scientific = FALSE, trim = TRUE))
+      )
+    )
+  
+  # Stats_String: with CI when available, fall back to no-CI form otherwise.
+  # Unit hint "muV" because EEG amplitudes are in microvolts.
+  if ("t.ratio" %in% names(df_clean)) {
+    df_clean <- df_clean %>% dplyr::mutate(
+      Stats_String = dplyr::case_when(
+        has_ci & is.infinite(df) ~ sprintf(
+          "b = %.2f muV (SE = %.2f), 95%% CI [%.3f, %.3f], z = %.2f, p %s",
+          .data[[est_col]], SE, lower.CL, upper.CL, t.ratio, p_str),
+        has_ci ~ sprintf(
+          "b = %.2f muV (SE = %.2f), 95%% CI [%.3f, %.3f], t(%.2f) = %.2f, p %s",
+          .data[[est_col]], SE, lower.CL, upper.CL, df, t.ratio, p_str),
+        is.infinite(df) ~ sprintf(
+          "b = %.2f muV (SE = %.2f), z = %.2f, p %s",
+          .data[[est_col]], SE, t.ratio, p_str),
+        TRUE ~ sprintf(
+          "b = %.2f muV (SE = %.2f), t(%.2f) = %.2f, p %s",
+          .data[[est_col]], SE, df, t.ratio, p_str)
+      )
+    )
+  } else if ("z.ratio" %in% names(df_clean)) {
+    df_clean <- df_clean %>% dplyr::mutate(
+      Stats_String = dplyr::case_when(
+        has_ci ~ sprintf(
+          "b = %.2f muV (SE = %.2f), 95%% CI [%.3f, %.3f], z = %.2f, p %s",
+          .data[[est_col]], SE, lower.CL, upper.CL, z.ratio, p_str),
+        TRUE ~ sprintf(
+          "b = %.2f muV (SE = %.2f), z = %.2f, p %s",
+          .data[[est_col]], SE, z.ratio, p_str)
+      )
+    )
+  } else {
+    df_clean <- df_clean %>% dplyr::mutate(
+      Stats_String = dplyr::case_when(
+        has_ci ~ sprintf(
+          "b = %.2f muV (SE = %.2f), 95%% CI [%.3f, %.3f], p %s",
+          .data[[est_col]], SE, lower.CL, upper.CL, p_str),
+        TRUE ~ sprintf(
+          "b = %.2f muV (SE = %.2f), p %s",
+          .data[[est_col]], SE, p_str)
+      )
+    )
+  }
+  
+  if (has_ci) {
+    df_clean <- df_clean %>%
+      dplyr::mutate(CI_str = sprintf("[%.3f, %.3f]", lower.CL, upper.CL))
+  }
+  
+  df_clean <- df_clean %>%
+    dplyr::select(-p_str) %>%
+    dplyr::relocate(Sig, .after = Stats_String)
+  beautify_labels(df_clean)
+}
+
+# Extract fixed-effect coefficients with safe fallback.
+format_coefs <- function(model) {
+  tryCatch({
+    coefs <- as.data.frame(parameters::parameters(model, effects = "fixed"))
+    coefs %>% beautify_labels() %>% kill_scipen()
+  }, error = function(e) {
+    as.data.frame(summary(model)$coefficients) %>%
+      tibble::rownames_to_column("Predictor") %>%
+      beautify_labels() %>% kill_scipen()
+  })
+}
+```
+
+``` {r prep-functions}
+# ==============================================================================
+# 3. Data Loading & Cleaning
+# ==============================================================================
+
+standardize_id <- function(ids) {
+  sprintf("Vp%04d", as.numeric(stringr::str_extract(ids, "\\d+")))
+}
+
+# Covariate loader. Retains raw (un-Z-scored) trait values; Stage 2 standardization
+# happens inside the Stage 2 function where scoping is unambiguous.
+load_covariates <- function(path_cov) {
+  if (is.na(path_cov) || !file.exists(path_cov)) {
+    warning("Covariate file unavailable; Stage 2 will be skipped.")
+    return(NULL)
+  }
+  cat(sprintf("[Covariates] Loading: %s\n", basename(path_cov)))
+  
+  df_cov <- if (grepl("\\.csv$", path_cov)) {
+    readr::read_csv(path_cov, show_col_types = FALSE)
+  } else {
+    readxl::read_excel(path_cov)
+  }
+  
+  names(df_cov)[1] <- "raw_id"
+  df_cov$participant_id <- standardize_id(df_cov$raw_id)
+  
+  df_cov_clean <- df_cov %>%
+    dplyr::select(participant_id, dplyr::any_of(c("SVO_type", stage2_traits)))
+  
+  cat(sprintf("[Covariates] N = %d subjects, %d traits available.\n",
+              nrow(df_cov_clean),
+              sum(stage2_traits %in% names(df_cov_clean))))
+  df_cov_clean
+}
+
+# ERP component loader and cleaner.
+#
+# Baseline preprocessing: mean-centered (NOT z-scored). Per Alday (2019), keeping
+# baseline in microvolt units allows direct comparison with the published
+# coefficient plots (Fig. 10) and preserves interpretation of beta_baseline as
+# 'fraction of pre-stimulus drift propagated forward'.
+#
+# Outlier filter |amplitude| < 200 microvolts: in the Alday baseline-as-covariate
+# framework, extreme target-window values often arise from baseline drift that
+# the model can absorb. This filter is therefore conservative; the number of
+# trimmed trials is logged for the manuscript Methods section.
+load_and_prep <- function(path_erp, df_covariates, erp_name, baseline_col) {
+  if (!file.exists(path_erp)) {
+    stop(sprintf("ERP file missing: %s", path_erp))
+  }
+  
+  df <- readr::read_csv(path_erp, show_col_types = FALSE)
+  
+  # reaction and RT are required for the trial-level inclusion criteria
+  # applied below; participant_id, Offers_Other, emotion, and index are
+  # required for condition coding and downstream key construction.
+  # Face phase: offer is not a factor (offer not yet shown at face onset), so
+  # Offers_Other is not required. emotion is the sole design factor.
+  required_cols <- c("participant_id", "emotion", "index", "reaction", "RT")
+  missing_cols <- setdiff(required_cols, names(df))
+  if (length(missing_cols) > 0) {
+    stop(sprintf("Required columns missing from %s: %s",
+                 basename(path_erp), paste(missing_cols, collapse = ", ")))
+  }
+  
+  if (!(erp_name %in% names(df))) {
+    cat(sprintf("[SKIP] Component '%s' absent from data.\n", erp_name))
+    return(NULL)
+  }
+  
+  df$participant_id <- standardize_id(df$participant_id)
+  
+  # ----------------------------------------------------------------------------
+  # Apply trial inclusion criteria with logging.
+  #
+  # Face phase: the offer is NOT yet shown at face onset, so there is no
+  # fairness/offer filter and NO 7:3 filler exclusion -- every emotion trial is
+  # a valid face trial regardless of the (as-yet-unseen) upcoming offer. Two
+  # sequential filters, aligned with Sta_Behaviour_RefAlday.Rmd and the
+  # offer-phase EEG analysis to keep the same trial set:
+  #   (1) reaction != 0 (excludes timeout / no-response trials);
+  #   (2) RT within [rt_lower_ms, rt_upper_ms].
+  # Applied at the analysis layer (see inclusion-criteria block in setup).
+  # ----------------------------------------------------------------------------
+  # Filter 1: exclude reaction == 0 (timeout / missing response).
+  n_pre <- nrow(df)
+  df <- df %>% dplyr::filter(reaction != 0)
+  cat(sprintf("[Filter] %s | reaction != 0 (timeout): %d -> %d trials (%d removed)\n",
+              erp_name, n_pre, nrow(df), n_pre - nrow(df)))
+
+  # Filter 2: RT range.
+  n_pre <- nrow(df)
+  df <- df %>% dplyr::filter(RT >= rt_lower_ms, RT <= rt_upper_ms)
+  cat(sprintf("[Filter] %s | RT in [%d, %d] ms: %d -> %d trials (%d removed)\n",
+              erp_name, rt_lower_ms, rt_upper_ms,
+              n_pre, nrow(df), n_pre - nrow(df)))
+
+  # emotion is the sole design factor (sum-to-zero contrasts set globally).
+  df <- df %>%
+    dplyr::mutate(
+      emotion = factor(emotion, levels = c("neu", "aff", "dis", "dom", "enj"))
+    )
+  
+  orig_n <- nrow(df)
+  df <- df %>% dplyr::filter(abs(.data[[erp_name]]) < 200)
+  if (orig_n > nrow(df)) {
+    cat(sprintf("[QC] %s: removed %d trials with |amplitude| > 200 \u00B5V (%.1f%%).\n",
+                erp_name, orig_n - nrow(df), 100 * (orig_n - nrow(df)) / orig_n))
+  }
+  
+  if (use_baseline_covariate) {
+    # Alday (PRIMARY): baseline enters the LMM as a mean-centered covariate.
+    if (!is.null(baseline_col) && baseline_col %in% names(df)) {
+      df$Baseline_Raw <- df[[baseline_col]]
+      df$Baseline_c   <- df$Baseline_Raw - mean(df$Baseline_Raw, na.rm = TRUE)
+      df <- df %>% dplyr::filter(!is.na(Baseline_c))
+    } else {
+      # Strict failure on missing baseline column: the Alday framework requires
+      # baseline as a fitted covariate. A missing column means the upstream
+      # extraction (use_baseline_correction = FALSE) was not run; the analysis
+      # must be rerun, not silently degraded to a different model.
+      stop(sprintf(
+        paste("Baseline column '%s' missing from %s.",
+              "Alday baseline-as-covariate framework requires this column.",
+              "Re-run Pipline_UG_FacePhase_E1.Rmd with use_baseline_correction = FALSE.",
+              sep = " "),
+        baseline_col, basename(path_erp)
+      ))
+    }
+  } else {
+    # Traditional (SENSITIVITY): amplitude already baseline-corrected upstream;
+    # no Baseline_c column is created or needed. baseline_col is ignored.
+    if (!is.null(baseline_col)) {
+      cat(sprintf("[Note] %s: ignoring baseline_col '%s'; data is baseline-corrected upstream.\n",
+                  erp_name, baseline_col))
+    }
+  }
+  
+  if (!is.null(df_covariates)) {
+    df <- dplyr::left_join(df, df_covariates, by = "participant_id")
+  }
+  
+  df
+}
+
+check_uniqueness <- function(df, context_name) {
+  if (nrow(df) != dplyr::n_distinct(dplyr::select(df, participant_id, index))) {
+    stop(sprintf("CRITICAL: duplicate (participant_id, index) keys in %s.", context_name))
+  }
+}
+
+# Baseline pre-check: tests whether mean baseline differs across emotion
+# levels. Pure diagnostic. Does NOT gate the main analysis -- the Alday
+# framework explicitly allows baseline-condition coupling and the main
+# pipeline tests it via LRT in fit_stage1_bates. This
+# helper exists to:
+#   (a) flag potential confounds for transparency in the Methods paragraph;
+#   (b) provide a single number (omnibus interaction F) to cite when
+#       reviewers ask "was baseline balanced across conditions?".
+# Output written to Supplementary/baseline_balance/<component>.md.
+# 
+# Implementation note: uses the same LMM machinery as the main analysis
+# (lmer + Type III F via Satterthwaite cascade) for methodological
+# consistency. Each call adds ~10-30 seconds to runtime; total overhead
+# across all components is < 3 minutes, negligible vs the Bates pipeline
+# itself.
+pre_check_baseline_balance <- function(data, comp_name, out_dir) {
+  if (!"Baseline_c" %in% names(data)) {
+    cat(sprintf("[PreCheck] %s: Baseline_c absent; skipping balance check.\n",
+                comp_name))
+    return(invisible(NULL))
+  }
+  
+  if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
+  out_path <- file.path(out_dir, sprintf("%s_baseline_balance.md", comp_name))
+  
+  cat(sprintf("[PreCheck] %s: testing baseline ~ emotion ...\n",
+              comp_name))
+
+  fit <- tryCatch({
+    bf <- lmerTest::lmer(
+      Baseline_c ~ emotion + (1 | participant_id),
+      data = data, REML = TRUE
+    )
+    bf
+  }, error = function(e) {
+    cat(sprintf("[PreCheck] %s: model failed (%s).\n",
+                comp_name, conditionMessage(e)))
+    NULL
+  })
+  if (is.null(fit)) return(invisible(NULL))
+  
+  # Class upgrade defensive (lmerTest::lmer should already produce
+  # lmerModLmerTest, but check for safety).
+  if (!inherits(fit, "lmerModLmerTest")) {
+    fit <- tryCatch(lmerTest::as_lmerModLmerTest(fit), error = function(e) fit)
+  }
+  
+  res <- tryCatch(
+    suppressWarnings(anova(fit, type = 3, ddf = "Satterthwaite")),
+    error = function(e) NULL
+  )
+  if (is.null(res) || !any(grepl("^Pr", colnames(res)))) {
+    res <- tryCatch(
+      suppressWarnings(anova(fit, type = 3, ddf = "Kenward-Roger")),
+      error = function(e) NULL
+    )
+  }
+  if (is.null(res)) {
+    res <- tryCatch(car::Anova(fit, type = 3, test.statistic = "F"),
+                    error = function(e) NULL)
+  }
+  
+  apa_tab <- if (!is.null(res)) format_anova_apa(res, model = fit) else NULL
+  
+  # Extract the omnibus emotion main-effect p-value if present, for a
+  # one-line summary.
+  emotion_p <- if (!is.null(apa_tab)) {
+    em_row <- apa_tab[apa_tab$Effect == "emotion", , drop = FALSE]
+    if (nrow(em_row) == 1) em_row$p_val else NA_real_
+  } else NA_real_
+
+  cell_means <- data %>%
+    dplyr::group_by(emotion) %>%
+    dplyr::summarise(
+      mean_baseline = mean(Baseline_c, na.rm = TRUE),
+      sd_baseline   = sd(Baseline_c, na.rm = TRUE),
+      n_trials      = dplyr::n(),
+      .groups = "drop"
+    )
+
+  writeLines(c(
+    sprintf("# Baseline Balance Pre-Check: %s", comp_name),
+    sprintf("Generated: %s", format(Sys.time(), "%Y-%m-%d %H:%M:%S")),
+    "",
+    "## Purpose",
+    "Diagnostic test of whether mean baseline amplitude differs across",
+    "emotion levels. PURE DIAGNOSTIC: does NOT gate or modify the main",
+    "analysis. The Alday baseline-as-covariate framework allows baseline-",
+    "condition coupling and tests it in the main model.",
+    "",
+    "## Test",
+    "Model: Baseline_c ~ emotion + (1 | participant_id)",
+    "",
+    if (!is.na(emotion_p)) {
+      sprintf("Omnibus emotion main effect on baseline: p = %s",
+              if (emotion_p < .001) "< .001"
+              else sprintf("%.3f", emotion_p))
+    } else "Omnibus emotion effect: not extractable",
+    "",
+    "## Type III ANOVA",
+    if (!is.null(apa_tab)) {
+      knitr::kable(apa_tab, format = "markdown", row.names = FALSE)
+    } else "Test failed.",
+    "",
+    "## Cell means (microvolts)",
+    knitr::kable(cell_means, format = "markdown", digits = 3, row.names = FALSE),
+    "",
+    "## Interpretation",
+    "If emotion p > 0.05: baseline is balanced across emotion levels; no",
+    "concern. If p < 0.05: emotion-dependent baseline detected. The main",
+    "analysis tests the Baseline_c:emotion interaction in fit_stage1_bates",
+    "Step 3 (LRT-based inclusion); a significant baseline-emotion coupling",
+    "will be retained automatically and reported in REPRODUCIBILITY.txt."
+  ), out_path)
+  
+  invisible(out_path)
+}
+```
+
+``` {r bates-engine}
+# ==============================================================================
+# 4. Stage 1 Engine: Bates (2015) Five-Step Random-Structure Selection
+#    Combined with Alday (2019) baseline-as-covariate fixed-effect specification.
+# ==============================================================================
+#
+# FIXED-EFFECT SPECIFICATION (face phase, single-factor emotion)
+# Under Alday: the pairwise model (emotion + Baseline_c)^2 serves as the search
+# space; the buildmer 'include' argument forces retention of emotion and
+# Baseline_c, while the emotion:Baseline_c interaction is subjected to LRT-based
+# inclusion testing (data-driven Alday). Under traditional baseline subtraction:
+# the fixed model is simply emotion (no baseline covariate).
+#
+# RANDOM-EFFECT STRUCTURE (Bates 2015 / Matuschek 2017 five-step pipeline)
+#   Step 1: Design-justified maximal model with the by-subject emotion random
+#           slope and its correlation with the intercept: (1 + emotion | id).
+#           (Face phase has one within-subject factor, emotion.)
+#   Step 2: Zero-correlation-parameter (ZCP) model as fallback starting point
+#           for variance-component selection.
+#   Step 3: LRT-based backward elimination via buildmer (alpha = 0.20 per
+#           Matuschek et al. 2017, equivalent to AIC for nested two-model
+#           comparisons; avoids the over-conservative model selection that
+#           strict alpha = 0.05 would impose at this stage).
+#   Step 4: Test whether adding correlation parameters improves fit, by
+#           enumerating candidate correlated structures over the surviving
+#           variance components and selecting via LRT/AIC.
+#   Step 5: rePCA diagnostic on the final model documents the dimensionality
+#           supported by the data, written to the reproducibility log.
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# Helper: parse a fitted model's formula to identify which random slopes
+# survived Step 3. Returns a character vector of slope variable names.
+# ------------------------------------------------------------------------------
+extract_surviving_slopes <- function(model) {
+  re_terms <- lme4::findbars(formula(model))
+  surviving <- character(0)
+  for (term in re_terms) {
+    rhs <- deparse(term[[2]])
+    rhs <- gsub("^\\s*0\\s*\\+\\s*", "", rhs)
+    rhs <- gsub("^\\s*1\\s*\\+\\s*", "", rhs)
+    rhs <- gsub("^\\s*1\\s*$",       "", rhs)
+    rhs <- trimws(rhs)
+    if (rhs == "" || rhs == "1") next
+    parts <- trimws(strsplit(rhs, "\\+")[[1]])
+    surviving <- c(surviving, parts)
+  }
+  unique(surviving)
+}
+
+# ------------------------------------------------------------------------------
+# Helper: rePCA dimensionality summary as a tidy data frame, one row per
+# principal component with cumulative variance explained.
+# ------------------------------------------------------------------------------
+extract_repca_summary <- function(model, group_name = "participant_id") {
+  # Defensive: rePCA() requires a merMod object; lm or lmerTest objects without
+  # the underlying lme4 slot will trigger getME() failures. Return an NA frame
+  # so downstream count_effective_dims() returns NA cleanly.
+  if (!inherits(model, "merMod")) {
+    return(data.frame(component = NA_integer_, sd = NA_real_,
+                      proportion_variance = NA_real_,
+                      cumulative_variance = NA_real_))
+  }
+  pca_obj <- tryCatch(lme4::rePCA(model), error = function(e) NULL)
+  if (is.null(pca_obj) || !group_name %in% names(pca_obj)) {
+    return(data.frame(component = NA_integer_, sd = NA_real_,
+                      proportion_variance = NA_real_,
+                      cumulative_variance = NA_real_))
+  }
+  imp <- summary(pca_obj[[group_name]])$importance
+  data.frame(
+    component = seq_len(ncol(imp)),
+    sd = imp["Standard deviation", ],
+    proportion_variance = imp["Proportion of Variance", ],
+    cumulative_variance = imp["Cumulative Proportion", ]
+  )
+}
+
+# ------------------------------------------------------------------------------
+# Helper: count effective dimensions (those reaching >= threshold cumulative
+# variance). Indicates whether the random structure is overparameterized.
+# ------------------------------------------------------------------------------
+count_effective_dims <- function(repca_df, threshold = 0.999) {
+  if (all(is.na(repca_df$cumulative_variance))) return(NA_integer_)
+  hit <- which(repca_df$cumulative_variance >= threshold)
+  if (length(hit) == 0) nrow(repca_df) else hit[1]
+}
+
+# ------------------------------------------------------------------------------
+# Step 4 helper: enumerate candidate correlated structures over surviving
+# variance components, fit each, and select via LRT vs. ZCP (alpha = 0.20 per
+# Matuschek et al. 2017). Returns the best-fitting model with REML refitted
+# for inference.
+# ------------------------------------------------------------------------------
+add_correlations_step4 <- function(model_zcp_reduced, fixed_str, data, alpha_lrt = 0.20) {
+  # Defensive: if the reduced model is not an lme4 mixed model (e.g. degraded
+  # to plain lm during Step 3), there are no random slopes to add correlations
+  # to. Return as-is.
+  if (!inherits(model_zcp_reduced, "merMod")) {
+    progress_log("[Step 4] Reduced model is not a mixed model; skipping correlation tests.",
+                 indent = 1)
+    return(model_zcp_reduced)
+  }
+  
+  surviving <- extract_surviving_slopes(model_zcp_reduced)
+  
+  if (length(surviving) == 0) {
+    progress_log("[Step 4] Reduced model has only random intercept; no correlations to test.",
+                 indent = 1)
+    # SAFETY: do NOT use update(model_zcp_reduced, REML = TRUE). When
+    # model_zcp_reduced was extracted from buildmer (bm_res@model), its
+    # @call slot stores buildmer's internal data placeholder ('..2'),
+    # not the actual data argument. update.merMod tries to re-evaluate
+    # the call in the current environment, where '..2' does not exist,
+    # producing "bad 'data': ..2 used in an incorrect context".
+    # Explicit refit using formula(model) and the function's `data`
+    # argument bypasses this issue.
+    f_zcp_only <- formula(model_zcp_reduced)
+    return(lme4::lmer(f_zcp_only, data = data, REML = TRUE,
+                      control = custom_control))
+  }
+  
+  # Build candidate set. ZCP-baseline always included for LRT baseline.
+  candidates <- list()
+  candidates[["ZCP_baseline"]] <- formula(model_zcp_reduced)
+  
+  # All-correlated candidate: (1 + s1 + s2 + ... | id)
+  all_str <- paste(surviving, collapse = " + ")
+  candidates[["All_correlated"]] <- as.formula(
+    paste(fixed_str, "+ (1 +", all_str, "| participant_id)")
+  )
+  
+  # Pairwise candidates: intercept correlated with one slope at a time.
+  if (length(surviving) > 1) {
+    for (i in seq_along(surviving)) {
+      others <- setdiff(surviving, surviving[i])
+      if (length(others) > 0) {
+        others_terms <- paste(
+          sprintf("(0 + %s | participant_id)", others),
+          collapse = " + "
+        )
+        cand_str <- paste(fixed_str,
+                          sprintf("+ (1 + %s | participant_id)", surviving[i]),
+                          "+", others_terms)
+      } else {
+        cand_str <- paste(fixed_str,
+                          sprintf("+ (1 + %s | participant_id)", surviving[i]))
+      }
+      candidates[[paste0("Int_with_", surviving[i])]] <- as.formula(cand_str)
+    }
+  }
+  
+  # Fit each candidate under ML for valid LRT comparison.
+  total_cands <- length(candidates)
+  progress_log(sprintf("[Step 4] Fitting %d candidate correlated structures...",
+                       total_cands), indent = 1)
+  fits <- list()
+  cand_idx <- 0
+  for (nm in names(candidates)) {
+    cand_idx <- cand_idx + 1
+    progress_log(sprintf("[Step 4 %d/%d] Trying '%s'...",
+                         cand_idx, total_cands, nm), indent = 2)
+    t_cand <- Sys.time()
+    fit <- tryCatch(
+      lme4::lmer(candidates[[nm]], data = data, REML = FALSE, control = custom_control),
+      error = function(e) NULL
+    )
+    if (!is.null(fit) && !lme4::isSingular(fit, tol = 1e-4)) {
+      fits[[nm]] <- fit
+      progress_log(sprintf("[Step 4 %d/%d] '%s' converged (%s).",
+                           cand_idx, total_cands, nm, format_elapsed(t_cand)),
+                   indent = 3)
+    } else if (!is.null(fit)) {
+      progress_log(sprintf("[Step 4 %d/%d] '%s' singular; excluded (%s).",
+                           cand_idx, total_cands, nm, format_elapsed(t_cand)),
+                   indent = 3)
+    } else {
+      progress_log(sprintf("[Step 4 %d/%d] '%s' failed to converge (%s).",
+                           cand_idx, total_cands, nm, format_elapsed(t_cand)),
+                   indent = 3)
+    }
+  }
+  
+  if (length(fits) == 0) {
+    # All candidates were singular or failed. Per Bates (2015), this means the
+    # data does not support any random-slope variance components beyond the
+    # intercept. Refit with random-intercept-only structure.
+    progress_log("[Step 4] All candidates singular; data does not support random slopes.",
+                 indent = 1)
+    progress_log("[Step 4] Refitting with random-intercept-only structure.", indent = 2)
+    
+    fixed_only_part <- nobars(formula(model_zcp_reduced))
+    f_min <- as.formula(paste(deparse(fixed_only_part), "+ (1 | participant_id)"))
+    m_min <- lme4::lmer(f_min, data = data, REML = TRUE, control = custom_control)
+    attr(m_min, "step4_selected") <- "RandomIntercept_only"
+    return(m_min)
+  }
+  
+  if (length(fits) == 1) {
+    # Only ZCP_baseline survived (others singular). Keep it.
+    progress_log("[Step 4] Only ZCP candidate viable; correlations not added.", indent = 1)
+    # See safety note above re: update() and buildmer-derived models.
+    f_zcp_only <- formula(model_zcp_reduced)
+    return(lme4::lmer(f_zcp_only, data = data, REML = TRUE,
+                      control = custom_control))
+  }
+  
+  # Establish a working reference for LRT comparisons. ZCP_baseline (the simplest
+  # candidate, no correlations) is the preferred reference because all richer
+  # candidates are nested within it. If it failed to converge but other candidates
+  # succeeded, fall back to selecting by AIC alone.
+  # NOTE: "baseline" here refers to the Step 4 reference model, NOT to the
+  # pre-stimulus EEG baseline (Baseline_c). The two are unrelated.
+  baseline_fit <- fits[["ZCP_baseline"]]
+  lrt_table <- data.frame(model = character(), df_diff = integer(),
+                          chisq = numeric(), p_value = numeric(),
+                          AIC = numeric(), stringsAsFactors = FALSE)
+  
+  if (is.null(baseline_fit)) {
+    # ZCP_baseline was singular but at least one alternative converged.
+    # Select the candidate with lowest AIC.
+    progress_log("[Step 4] ZCP_baseline singular; selecting best converged candidate by AIC.",
+                 indent = 1)
+    aics <- sapply(fits, AIC)
+    best_name <- names(fits)[which.min(aics)]
+    best_fit  <- fits[[best_name]]
+    
+    for (nm in names(fits)) {
+      lrt_table <- rbind(lrt_table, data.frame(
+        model = nm,
+        df_diff = NA_integer_,
+        chisq = NA_real_,
+        p_value = NA_real_,
+        AIC = aics[nm],
+        stringsAsFactors = FALSE
+      ))
+    }
+  } else {
+    # Standard path: ZCP_baseline available, perform nested LRTs against it.
+    best_name <- "ZCP_baseline"
+    best_fit  <- baseline_fit
+    
+    for (nm in setdiff(names(fits), "ZCP_baseline")) {
+      cand <- fits[[nm]]
+      lrt <- tryCatch(anova(baseline_fit, cand), error = function(e) NULL)
+      if (is.null(lrt) || nrow(lrt) < 2) next
+      
+      p_val <- lrt$"Pr(>Chisq)"[2]
+      if (is.na(p_val)) next
+      
+      lrt_table <- rbind(lrt_table, data.frame(
+        model = nm,
+        df_diff = lrt$Df[2],
+        chisq = lrt$Chisq[2],
+        p_value = p_val,
+        AIC = AIC(cand),
+        stringsAsFactors = FALSE
+      ))
+      
+      # Select candidate with lowest AIC among those passing alpha_lrt.
+      if (p_val < alpha_lrt && AIC(cand) < AIC(best_fit)) {
+        best_name <- nm
+        best_fit  <- cand
+      }
+    }
+  }
+  
+  attr(best_fit, "step4_lrt_table") <- lrt_table
+  attr(best_fit, "step4_selected") <- best_name
+  
+  progress_log(sprintf("[Step 4] Selected: %s (alpha_LRT = %.2f).",
+                       best_name, alpha_lrt), indent = 1)
+  
+  update(best_fit, REML = TRUE)
+}
+
+# ==============================================================================
+# Main Stage 1 engine: full Bates 5-step pipeline + Alday 2.5 fixed structure.
+# Returns the fitted model with diagnostic attributes attached.
+# ==============================================================================
+fit_stage1_bates <- function(data, erp_name) {
+  
+  # Face phase: emotion is the sole design factor. Fixed-effect specification
+  # branches on the method toggle:
+  #   Alday (use_baseline_covariate = TRUE): (emotion + Baseline_c)^2, i.e.
+  #     emotion + Baseline_c + emotion:Baseline_c. The emotion:Baseline_c
+  #     interaction is LRT-tested (not forced) per data-driven Alday.
+  #   Traditional (FALSE): emotion only (amplitude already baseline-corrected).
+  if (use_baseline_covariate) {
+    fixed_str <- sprintf("%s ~ (emotion + Baseline_c)^2", erp_name)
+    fixed_include <- as.formula("~ emotion + Baseline_c + (1 | participant_id)")
+  } else {
+    fixed_str <- sprintf("%s ~ emotion", erp_name)
+    fixed_include <- as.formula("~ emotion + (1 | participant_id)")
+  }
+  # Forced-include set for buildmer Step 3: the core emotion term (and, under
+  # Alday, Baseline_c) must remain regardless of LRT outcome. The by-subject
+  # random intercept is also forced because it reflects the nested data
+  # structure (trials within subjects); without it, single-trial EEG data are
+  # pseudo-replicated and inference is invalid.
+  
+  diag_log <- list(
+    component = erp_name,
+    n_obs = nrow(data),
+    n_subjects = dplyr::n_distinct(data$participant_id),
+    step1_status = NA_character_,
+    step1_pca = NULL,
+    step2_status = NA_character_,
+    step3_final_formula = NA_character_,
+    step4_status = NA_character_,
+    step5_pca = NULL
+  )
+  
+  # ---- STEP 1: Barr-style maximal model (main-effects random slopes only). ----
+  progress_log(sprintf("[%s] Stage 1: Bates 5-step random-structure selection",
+                       erp_name))
+  progress_log(sprintf("Data: N = %d trials, %d subjects.",
+                       nrow(data), dplyr::n_distinct(data$participant_id)),
+               indent = 1)
+  
+  random_max <- "(1 + emotion | participant_id)"
+  f_max <- as.formula(paste(fixed_str, "+", random_max))
+  
+  progress_log("[Step 1] Fitting design-justified maximal model with correlations...",
+               indent = 1)
+  t_step1 <- Sys.time()
+  m_max <- tryCatch(
+    lme4::lmer(f_max, data = data, REML = FALSE, control = custom_control),
+    error = function(e) {
+      progress_log(sprintf("[ERROR] Maximal fit failed: %s", conditionMessage(e)),
+                   indent = 2)
+      NULL
+    }
+  )
+  progress_log(sprintf("[Step 1] elapsed: %s", format_elapsed(t_step1)),
+               indent = 2)
+  
+  if (!is.null(m_max)) {
+    is_sing <- lme4::isSingular(m_max, tol = 1e-4)
+    diag_log$step1_status <- if (is_sing) "converged_singular" else "converged_clean"
+    diag_log$step1_pca <- extract_repca_summary(m_max)
+    progress_log(sprintf("[Step 1] Status: %s. Effective dims = %d / %d.",
+                         diag_log$step1_status,
+                         count_effective_dims(diag_log$step1_pca),
+                         nrow(diag_log$step1_pca)),
+                 indent = 2)
+  } else {
+    diag_log$step1_status <- "failed_to_converge"
+  }
+  
+  # ---- STEP 2: Zero-correlation-parameter (ZCP) model. ----
+  progress_log("[Step 2] Fitting zero-correlation-parameter model...", indent = 1)
+  t_step2 <- Sys.time()
+  
+  random_zcp <- paste("(1 | participant_id)",
+                      "(0 + emotion | participant_id)",
+                      sep = " + ")
+  f_zcp <- as.formula(paste(fixed_str, "+", random_zcp))
+  
+  m_zcp <- tryCatch(
+    lme4::lmer(f_zcp, data = data, REML = FALSE, control = custom_control),
+    error = function(e) NULL
+  )
+  progress_log(sprintf("[Step 2] elapsed: %s", format_elapsed(t_step2)), indent = 2)
+  
+  if (is.null(m_zcp)) {
+    progress_log("[Step 2] [ERROR] ZCP fit failed; falling back to random-intercept-only.",
+                 indent = 2)
+    diag_log$step2_status <- "failed"
+    f_minimal <- as.formula(paste(fixed_str, "+ (1 | participant_id)"))
+    m_zcp <- lme4::lmer(f_minimal, data = data, REML = FALSE, control = custom_control)
+  } else {
+    is_sing_zcp <- lme4::isSingular(m_zcp, tol = 1e-4)
+    diag_log$step2_status <- if (is_sing_zcp) "converged_singular" else "converged_clean"
+    progress_log(sprintf("[Step 2] Status: %s.", diag_log$step2_status), indent = 2)
+  }
+  
+  # ---- STEP 3: LRT-based backward elimination via buildmer. ----
+  # buildmer drops both fixed-effect baseline interactions and random-effect
+  # variance components if not supported by data. Theoretical core terms are
+  # protected by the 'include' argument.
+  #
+  # Elimination criterion uses alpha = 0.20 per Matuschek, Kliegl, Vasishth,
+  # Baayen, & Bates (2017, Journal of Memory and Language). Their simulations
+  # showed that alpha = 0.05 over-penalizes model complexity at the elimination
+  # stage, sacrificing power to detect true fixed effects. Alpha = 0.20 is
+  # approximately equivalent to AIC-based selection for nested two-model
+  # comparisons and provides the optimal Type I error / power tradeoff for
+  # typical psychological / psycholinguistic datasets.
+  #
+  # Note on buildmer API: 'crit' governs term ordering (default LRT), while
+  # 'elim' governs elimination decisions. LRTalpha() generates an elimination
+  # function and must be passed to 'elim', not 'crit'.
+  progress_log("[Step 3] LRT-based backward elimination (buildmer, alpha = 0.20)...",
+               indent = 1)
+  progress_log(paste("This step iteratively tests model terms via LRT and may fit",
+                     "many candidate models. With large N (>20,000 trials) and",
+                     "complex random structures, expect several minutes per",
+                     "component. buildmer's internal progress is shown below."),
+               indent = 2)
+  progress_log("[Step 3] Engineering protections active: lmerTest detached during",
+               indent = 2)
+  progress_log("buildmer call; withTimeout=1800s; ZCP fallback on failure.",
+               indent = 2)
+  t_step3 <- Sys.time()
+  
+  bm_ctrl <- buildmer::buildmerControl(
+    include = fixed_include,
+    direction = c("order", "backward"),
+    crit = "LRT",
+    elim = buildmer::LRTalpha(0.20),
+    quiet = FALSE,
+    args = list(control = custom_control)
+    # Note: REML is managed by buildmer internally based on whether the
+    # comparison is between fixed-effect or random-effect changes. Passing
+    # REML here causes a duplicate-argument error.
+  )
+  
+  bm_res <- run_buildmer_protected(
+    buildmer::buildmer,
+    formula = f_zcp, data = data,
+    buildmerControl = bm_ctrl,
+    timeout_sec = 1800
+  )
+  
+  if (is.null(bm_res)) {
+    progress_log("[Step 3] buildmer failed or timed out; retaining ZCP model.",
+                 indent = 2)
+    m_reduced <- m_zcp
+  } else {
+    m_reduced <- tryCatch({
+      bm_res@model
+    }, error = function(e) {
+      progress_log(sprintf("[WARN] Could not extract @model: %s; retaining ZCP.",
+                           conditionMessage(e)), indent = 2)
+      m_zcp
+    })
+  }
+  
+  progress_log(sprintf("[Step 3] elapsed: %s", format_elapsed(t_step3)), indent = 2)
+  
+  # Sanity check: buildmer can occasionally eliminate ALL random-effect terms,
+  # returning a plain `lm` object. Single-trial EEG analysis without random
+  # intercepts is invalid (pseudo-replication of trials within subjects), so we
+  # rebuild the minimum viable LMM with a random intercept. This branch should
+  # be rare given that (1 | participant_id) is in the include set above.
+  if (!inherits(m_reduced, "merMod")) {
+    progress_log("[WARN] Reduced model lost all random effects; refitting with (1 | participant_id).",
+                 indent = 2)
+    reduced_fixed_str_recovered <- paste(deparse(formula(m_reduced)), collapse = " ")
+    f_recover <- as.formula(paste(reduced_fixed_str_recovered, "+ (1 | participant_id)"))
+    m_reduced <- lme4::lmer(f_recover, data = data, REML = FALSE,
+                            control = custom_control)
+  }
+  
+  diag_log$step3_final_formula <- paste(deparse(formula(m_reduced)), collapse = " ")
+  progress_log(sprintf("[Step 3] Reduced formula: %s",
+                       stringr::str_squish(diag_log$step3_final_formula)),
+               indent = 2)
+  
+  # ---- STEP 4: Test correlation parameters on surviving slopes. ----
+  progress_log("[Step 4] Testing correlation parameters on surviving slopes...",
+               indent = 1)
+  t_step4 <- Sys.time()
+  
+  # Reconstruct fixed-only formula from the reduced model for Step 4 candidates.
+  reduced_fixed <- nobars(formula(m_reduced))
+  reduced_fixed_str <- paste(deparse(reduced_fixed), collapse = " ")
+  
+  m_final <- add_correlations_step4(m_reduced, reduced_fixed_str, data, alpha_lrt = 0.20)
+  diag_log$step4_status <- attr(m_final, "step4_selected") %||% "ZCP_kept"
+  progress_log(sprintf("[Step 4] elapsed: %s. Selected: %s.",
+                       format_elapsed(t_step4), diag_log$step4_status),
+               indent = 2)
+  
+  # ---- STEP 5: rePCA diagnostic on final model. ----
+  diag_log$step5_pca <- extract_repca_summary(m_final)
+  step5_eff <- count_effective_dims(diag_log$step5_pca)
+  step5_nom <- nrow(diag_log$step5_pca)
+  progress_log(sprintf("[Step 5] Final model dimensionality: %s effective / %s nominal.",
+                       if (is.na(step5_eff)) "NA" else as.character(step5_eff),
+                       if (is.na(step5_nom)) "NA" else as.character(step5_nom)),
+               indent = 1)
+  
+  # ---- Defensive REML guard. ----
+  # 
+  # Several paths through add_correlations_step4 and fit_stage1_bates can
+  # return an LMM in ML state (REML=FALSE). lmerTest::anova(ddf="Satterthwaite")
+  # expects REML by default. Refit REML here unconditionally so the downstream
+  # ANOVA cascade has a clean input.
+  # 
+  # SAFETY: do NOT use update() because m_final may be a buildmer @model
+  # object whose @call references buildmer's internal '..2' placeholder,
+  # which fails outside buildmer's scope. Refit explicitly from formula
+  # and the local `data` argument.
+  if (inherits(m_final, "merMod")) {
+    is_reml <- tryCatch(lme4::isREML(m_final), error = function(e) FALSE)
+    if (!isTRUE(is_reml)) {
+      progress_log("[Final] Refitting LMM with REML=TRUE for Satterthwaite compatibility.",
+                   indent = 1)
+      f_final <- formula(m_final)
+      m_final_reml <- tryCatch(
+        lme4::lmer(f_final, data = data, REML = TRUE, control = custom_control),
+        error = function(e) {
+          progress_log(sprintf("[Final] REML refit failed: %s; retaining ML fit.",
+                               conditionMessage(e)), indent = 2)
+          NULL
+        }
+      )
+      if (!is.null(m_final_reml)) {
+        existing_attrs <- attributes(m_final)[c("step4_selected",
+                                                "step4_lrt_table")]
+        for (an in names(existing_attrs)) {
+          if (!is.null(existing_attrs[[an]])) {
+            attr(m_final_reml, an) <- existing_attrs[[an]]
+          }
+        }
+        m_final <- m_final_reml
+      }
+    }
+  }
+  
+  # ---- Defensive lmerTest class upgrade. ----
+  # 
+  # CRITICAL for Satterthwaite/KR p-values. When fit via lme4::lmer() (rather
+  # than lmerTest::lmer()), the resulting object has class "lmerMod" only.
+  # Calling anova(model, ddf="Satterthwaite") on a bare lmerMod does NOT
+  # dispatch to lmerTest's S4 method; lme4's base anova() handles it,
+  # silently ignoring the ddf argument and returning a table with F values
+  # but NO Pr(>F) and NO NumDF/DenDF columns. The downstream cascade then
+  # detects "no Pr column" and falls through to Wald.
+  # 
+  # The fix is to upgrade the class via lmerTest::as_lmerModLmerTest() (a
+  # free no-refit operation that registers the model with lmerTest's
+  # df-computation machinery). buildmer internally fits via lmerTest::lmer()
+  # so its @model output may already be lmerModLmerTest; but our 
+  # add_correlations_step4 refits via lme4::lmer() in many paths, losing the
+  # lmerTest class. This guard ensures the final returned model is dispatch-
+  # ready regardless of which fallback path was taken.
+  if (inherits(m_final, "merMod") && !inherits(m_final, "lmerModLmerTest")) {
+    m_final_lt <- tryCatch(
+      lmerTest::as_lmerModLmerTest(m_final),
+      error = function(e) {
+        progress_log(sprintf("[Final] lmerTest class upgrade failed: %s",
+                             conditionMessage(e)), indent = 2)
+        NULL
+      }
+    )
+    if (!is.null(m_final_lt)) {
+      existing_attrs <- attributes(m_final)[c("step4_selected",
+                                              "step4_lrt_table")]
+      for (an in names(existing_attrs)) {
+        if (!is.null(existing_attrs[[an]])) {
+          attr(m_final_lt, an) <- existing_attrs[[an]]
+        }
+      }
+      m_final <- m_final_lt
+      progress_log("[Final] LMM upgraded to lmerModLmerTest for Satt/KR dispatch.",
+                   indent = 1)
+    }
+  }
+  
+  attr(m_final, "bates_diag") <- diag_log
+  m_final
+}
+```
+
+
+``` {r stage1-runner}
+# ==============================================================================
+# 5. Stage 1 Runner: fit, decompose, and report for one ERP component.
+#    Replaces the original run_regression_analysis function.
+# ==============================================================================
+run_stage1_component <- function(data, erp_name, out_dir, exp_version) {
+  
+  comp_dir <- file.path(out_dir, erp_name)
+  if (!dir.exists(comp_dir)) dir.create(comp_dir, recursive = TRUE)
+  
+  progress_log(sprintf(">>> Component: %s [%s] (N_subj = %d, N_trial = %d)",
+                       erp_name, exp_version,
+                       dplyr::n_distinct(data$participant_id), nrow(data)))
+  
+  # ---- Fit Stage 1 model via Bates 5-step pipeline. ----
+  FINAL_MODEL <- fit_stage1_bates(data, erp_name)
+  diag_log <- attr(FINAL_MODEL, "bates_diag")
+  
+  formula_str <- paste(deparse(formula(FINAL_MODEL)), collapse = " ")
+  progress_log(sprintf("[Final model] %s", stringr::str_squish(formula_str)), indent = 1)
+  
+  # ---- Type III ANOVA: cascade Satterthwaite -> Kenward-Roger -> Wald. ----
+  # 
+  # CASCADE: lmerTest cascade for LMM.
+  #   (1) Satterthwaite F  - lmerTest::anova; preferred (Luke 2017).
+  #   (2) Kenward-Roger F  - pbkrtest backend; conservative fallback,
+  #       different numerical implementation than Satterthwaite.
+  #   (3) Wald chi-square  - car::Anova; last resort, asymptotic.
+  # 
+  # The cascade is necessary because lmerTest's Satt/KR dispatch requires
+  # the model to have class "lmerModLmerTest" (not bare "lmerMod"). The
+  # fit_stage1_bates engine upgrades the class before returning, but a
+  # second defensive upgrade here protects against models loaded from
+  # disk via readRDS or any other path bypassing the engine guard.
+  progress_log("[ANOVA] Computing Type III tests...", indent = 1)
+  t_anova <- Sys.time()
+  
+  # Defensive class upgrade. See fit_stage1_bates for full rationale.
+  if (inherits(FINAL_MODEL, "merMod") &&
+      !inherits(FINAL_MODEL, "lmerModLmerTest")) {
+    FINAL_MODEL_lt <- tryCatch(
+      lmerTest::as_lmerModLmerTest(FINAL_MODEL),
+      error = function(e) NULL
+    )
+    if (!is.null(FINAL_MODEL_lt)) FINAL_MODEL <- FINAL_MODEL_lt
+  }
+  
+  anova_res <- NULL
+  method_used <- NA_character_
+  
+  # Attempt 1: Satterthwaite.
+  anova_res <- tryCatch({
+    res <- suppressWarnings(anova(FINAL_MODEL, type = 3, ddf = "Satterthwaite"))
+    if (any(grepl("^Pr", colnames(res)))) {
+      method_used <- "Satterthwaite_F"
+      res
+    } else {
+      progress_log("[ANOVA] Satterthwaite returned no p-value column; trying Kenward-Roger.",
+                   indent = 2)
+      NULL
+    }
+  }, error = function(e) {
+    progress_log(sprintf("[ANOVA] Satterthwaite errored (%s); trying Kenward-Roger.",
+                         conditionMessage(e)), indent = 2)
+    NULL
+  })
+  
+  # Attempt 2: Kenward-Roger.
+  if (is.null(anova_res)) {
+    anova_res <- tryCatch({
+      res <- suppressWarnings(anova(FINAL_MODEL, type = 3, ddf = "Kenward-Roger"))
+      if (any(grepl("^Pr", colnames(res)))) {
+        method_used <- "Kenward_Roger_F"
+        res
+      } else {
+        progress_log("[ANOVA] Kenward-Roger returned no p-value column; falling back to Wald.",
+                     indent = 2)
+        NULL
+      }
+    }, error = function(e) {
+      progress_log(sprintf("[ANOVA] Kenward-Roger errored (%s); falling back to Wald.",
+                           conditionMessage(e)), indent = 2)
+      NULL
+    })
+  }
+  
+  # Attempt 3: Wald.
+  if (is.null(anova_res)) {
+    anova_res <- car::Anova(FINAL_MODEL, type = 3, test.statistic = "Chisq")
+    method_used <- "Wald_chi_square"
+  }
+  
+  diag_log$anova_method <- method_used
+  progress_log(sprintf("[ANOVA] Method: %s. Elapsed: %s.",
+                       method_used, format_elapsed(t_anova)),
+               indent = 2)
+  
+  anova_apa <- format_anova_apa(anova_res, FINAL_MODEL)
+  # Include partial eta-squared with 95% CI in console print so users see
+  # effect sizes during long pipeline runs. The full table (with p_val
+  # column) is written to anova_apa.md; controlling print width avoids
+  # console wrapping.
+  print(anova_apa %>% dplyr::select(Effect, APA_Report, eta2_partial_95CI, Sig))
+  
+  # ---- Post-hoc decomposition (single-factor emotion). ----
+  #
+  # Face phase has ONE design factor (emotion), so there is no interaction to
+  # decompose. The post-hoc of interest is the pairwise comparison among the
+  # five emotion levels (FDR-corrected). We tag the table by the omnibus
+  # emotion effect: Confirmatory (p < confirmatory_alpha),
+  # Exploratory_Marginal (confirmatory_alpha <= p < marginal_threshold), or NS,
+  # for transparency. Pairwise comparisons are computed in all cases.
+  cat("   [Post-hoc] FDR-corrected emotion pairwise...\n")
+
+  # Extract omnibus emotion p-value defensively (column name varies:
+  # 'Pr(>F)' lmerTest, 'Pr(>Chisq)' car::Anova).
+  p_emotion <- NA_real_
+  if ("emotion" %in% rownames(anova_res)) {
+    for (pcol in c("Pr(>F)", "Pr(>Chisq)")) {
+      if (pcol %in% colnames(anova_res)) {
+        val <- suppressWarnings(as.numeric(anova_res["emotion", pcol]))
+        if (length(val) == 1 && !is.na(val)) { p_emotion <- val; break }
+      }
+    }
+  }
+  if (is.na(p_emotion)) p_emotion <- 1.0
+  status_tag <- if (p_emotion < confirmatory_alpha) "Confirmatory"
+                else if (p_emotion < marginal_threshold) "Exploratory_Marginal"
+                else "NS"
+
+  # emmeans 'at': hold Baseline_c at its mean (0 after centering) under Alday;
+  # nothing to hold under Traditional.
+  at_list <- if (use_baseline_covariate) list(Baseline_c = 0) else list()
+
+  # Helper: emmeans pairs with explicit infer=c(TRUE,TRUE) so summary() returns
+  # BOTH CI columns AND p.value (format_posthoc_apa requires both).
+  pairs_with_ci <- function(emm, ...) {
+    summary(pairs(emm, ...), infer = c(TRUE, TRUE))
+  }
+
+  list_of_tables <- list(
+    "ANOVA_Main" = anova_apa,
+    "Model_Formula" = data.frame(Formula = formula_str),
+    "Model_Coefficients" = format_coefs(FINAL_MODEL)
+  )
+  list_of_supp_tables <- list()
+
+  progress_log(sprintf("[Post-hoc] emotion omnibus p = %.4f -> %s; pairwise (FDR)...",
+                       p_emotion, status_tag), indent = 1)
+  t_me <- Sys.time()
+  emo_pairs <- format_posthoc_apa(
+    pairs_with_ci(emmeans::emmeans(FINAL_MODEL, ~ emotion, at = at_list), adjust = "fdr")
+  )
+  emo_pairs$Status <- status_tag
+  list_of_tables[["Main_Effect_Emotion"]] <- emo_pairs
+  progress_log(sprintf("[Post-hoc emotion] done (%s).", format_elapsed(t_me)), indent = 3)
+
+  progress_log("[Descriptive] estimated marginal means...", indent = 2)
+  t_me <- Sys.time()
+  list_of_tables[["Descriptive_Means"]] <- beautify_labels(kill_scipen(
+    as.data.frame(emmeans::emmeans(FINAL_MODEL, ~ emotion, at = at_list))
+  ))
+  progress_log(sprintf("[Descriptive] done (%s).", format_elapsed(t_me)), indent = 3)
+  
+  # ---- Reporting Layer (replaces multi-sheet Excel as primary output). ----
+  
+  # Component status (confirmatory vs exploratory) for downstream filtering.
+  comp_status <- component_status(erp_name)
+  
+  # 1. REPRODUCIBILITY metadata.
+  sink(file.path(comp_dir, "REPRODUCIBILITY.txt"))
+  cat("# Reproducibility log for ERP component:", erp_name, "\n")
+  cat("# Generated:", format(Sys.time(), "%Y-%m-%d %H:%M:%S"), "\n\n")
+  cat("## Status: ", comp_status, "\n\n")
+  cat("## Final formula:\n")
+  cat(formula_str, "\n\n")
+  cat("## Software versions:\n")
+  cat("R:        ", R.version.string, "\n")
+  cat("lme4:     ", as.character(packageVersion("lme4")), "\n")
+  cat("lmerTest: ", as.character(packageVersion("lmerTest")), "\n")
+  cat("pbkrtest: ", as.character(packageVersion("pbkrtest")), "\n")
+  cat("buildmer: ", as.character(packageVersion("buildmer")), "\n")
+  cat("emmeans:  ", as.character(packageVersion("emmeans")), "\n\n")
+  cat("## Convergence diagnostics:\n")
+  cat("Optimizer:    bobyqa\n")
+  cat("Singular fit:", lme4::isSingular(FINAL_MODEL, tol = 1e-4), "\n")
+  cat("REML:         TRUE\n")
+  cat("Observations:", nobs(FINAL_MODEL), "\n")
+  cat("Subjects:    ", lme4::ngrps(FINAL_MODEL)["participant_id"], "\n\n")
+  cat("## Bates 5-step diagnostic log:\n")
+  cat("Term ordering criterion:     LRT (default)\n")
+  cat("Term elimination criterion:  LRTalpha(0.20) (Matuschek et al., 2017)\n")
+  cat("Step 1 (Maximal):           ", diag_log$step1_status, "\n")
+  if (!is.null(diag_log$step1_pca)) {
+    cat("  Step 1 effective/nominal: ",
+        count_effective_dims(diag_log$step1_pca), "/",
+        nrow(diag_log$step1_pca), "\n")
+  }
+  cat("Step 2 (ZCP):               ", diag_log$step2_status, "\n")
+  cat("Step 3 (LRT reduction):     ", diag_log$step3_final_formula, "\n")
+  cat("Step 4 (correlations):      ", diag_log$step4_status, "\n")
+  cat("Step 5 (final dims):        ",
+      count_effective_dims(diag_log$step5_pca), "/",
+      nrow(diag_log$step5_pca), "\n")
+  cat("\n## Inferential method:\n")
+  cat("ANOVA test:                 ", diag_log$anova_method %||% "Wald_chi_square",
+      "\n")
+  if (identical(diag_log$anova_method, "Kenward_Roger_F")) {
+    cat("Note: Satterthwaite returned no p-value column; Kenward-Roger\n")
+    cat("(pbkrtest backend) used as second-tier method. Both Satt and KR\n")
+    cat("are finite-DenDF F approximations; KR is more conservative.\n")
+  }
+  if (identical(diag_log$anova_method, "Wald_chi_square")) {
+    cat("Note: Both Satterthwaite and Kenward-Roger failed (no p-value\n")
+    cat("column or error). Wald chi-square (car::Anova) used as final\n")
+    cat("fallback. Wald is anti-conservative for finite N (Luke 2017),\n")
+    cat("interpret reported p-values with caution.\n")
+  }
+  sink()
+  
+  # 2. saveRDS for offline re-analysis (Methods replication, sensitivity).
+  saveRDS(FINAL_MODEL,
+          file.path(comp_dir, sprintf("final_model_%s.rds", erp_name)))
+  
+  # 3. Full model summary (Alday-style transparency).
+  sink(file.path(comp_dir, "summary_text.txt"))
+  print(summary(FINAL_MODEL))
+  sink()
+  
+  # 4. ANOVA table in markdown (manuscript-ready).
+  writeLines(
+    knitr::kable(anova_apa, format = "markdown",
+                 caption = sprintf("Type III ANOVA (%s), %s.",
+                                   diag_log$anova_method %||% "Wald", erp_name)),
+    con = file.path(comp_dir, "anova_apa.md")
+  )
+  
+  # 5. R-squared (Nakagawa & Schielzeth, 2013).
+  r2_obj <- tryCatch(performance::r2(FINAL_MODEL), error = function(e) NULL)
+  if (!is.null(r2_obj)) {
+    r2_df <- data.frame(
+      R2_marginal    = r2_obj$R2_marginal,
+      R2_conditional = r2_obj$R2_conditional
+    )
+    writeLines(
+      knitr::kable(kill_scipen(r2_df), format = "markdown",
+                   caption = sprintf("Nakagawa & Schielzeth R\u00B2, %s.", erp_name)),
+      con = file.path(comp_dir, "r2.md")
+    )
+  }
+  
+  # 6. Post-hoc tables in markdown (one file per contrast type).
+  # Confirmatory tables go to comp_dir; marginal tables go to Supplementary.
+  for (nm in names(list_of_tables)) {
+    safe_nm <- gsub("[^A-Za-z0-9_]", "_", nm)
+    writeLines(
+      knitr::kable(list_of_tables[[nm]], format = "markdown",
+                   caption = sprintf("%s -- %s", erp_name, nm)),
+      con = file.path(comp_dir, sprintf("posthoc_%s.md", safe_nm))
+    )
+  }
+  
+  if (length(list_of_supp_tables) > 0) {
+    supp_comp_dir <- file.path(out_suppl,
+                               sprintf("%s_marginal_contrasts", erp_name))
+    if (!dir.exists(supp_comp_dir)) dir.create(supp_comp_dir, recursive = TRUE)
+    for (nm in names(list_of_supp_tables)) {
+      safe_nm <- gsub("[^A-Za-z0-9_]", "_", nm)
+      writeLines(
+        knitr::kable(list_of_supp_tables[[nm]], format = "markdown",
+                     caption = sprintf("%s -- %s [MARGINAL: 0.05<=p<0.10]",
+                                       erp_name, nm)),
+        con = file.path(supp_comp_dir, sprintf("posthoc_%s.md", safe_nm))
+      )
+    }
+  }
+  
+  # 7. Step 4 LRT comparison table (when applicable).
+  step4_lrt <- attr(FINAL_MODEL, "step4_lrt_table")
+  if (!is.null(step4_lrt) && nrow(step4_lrt) > 0) {
+    writeLines(
+      knitr::kable(kill_scipen(step4_lrt), format = "markdown",
+                   caption = sprintf("Step 4 candidate-correlation LRT, %s.", erp_name)),
+      con = file.path(comp_dir, "step4_correlation_lrt.md")
+    )
+  }
+  
+  # 8. Bates rePCA summary in markdown (Step 5 documentation).
+  if (!is.null(diag_log$step5_pca) && !all(is.na(diag_log$step5_pca$component))) {
+    writeLines(
+      knitr::kable(kill_scipen(diag_log$step5_pca), format = "markdown",
+                   caption = sprintf("Final-model rePCA dimensionality, %s.", erp_name)),
+      con = file.path(comp_dir, "step5_rePCA.md")
+    )
+  }
+  
+  # 9. Excel export (legacy compatibility for non-markdown workflows).
+  wb <- openxlsx::createWorkbook()
+  for (sheet_name in names(list_of_tables)) {
+    safe_sheet <- substr(gsub("[^A-Za-z0-9_]", "_", sheet_name), 1, 31)
+    openxlsx::addWorksheet(wb, safe_sheet)
+    openxlsx::writeData(wb, safe_sheet, list_of_tables[[sheet_name]])
+    openxlsx::addStyle(wb, safe_sheet,
+      openxlsx::createStyle(textDecoration = "bold", border = "Bottom"),
+      rows = 1, cols = 1:ncol(list_of_tables[[sheet_name]]))
+  }
+  openxlsx::saveWorkbook(wb,
+    file.path(comp_dir, sprintf("STATS_%s_%s.xlsx", exp_version, erp_name)),
+    overwrite = TRUE)
+  
+  # ---- Visualization Layer. ----
+  cat("   [Visualization]\n")
+  try({
+    p_forest <- sjPlot::plot_model(FINAL_MODEL, type = "est",
+                                   show.values = TRUE, show.p = TRUE,
+                                   title = sprintf("%s [%s] coefficients",
+                                                   erp_name, exp_version)) + theme_bw()
+    ggsave(file.path(comp_dir, sprintf("Forest_%s_%s.pdf", exp_version, erp_name)),
+           p_forest, width = 7, height = 8, device = cairo_pdf)
+  })
+  
+  try({
+    pd <- as.data.frame(emmeans::emmeans(FINAL_MODEL, ~ emotion, at = at_list))
+    p_emm <- ggplot(pd, aes(x = emotion, y = emmean, fill = emotion)) +
+      geom_col(width = 0.7, color = "black", linewidth = 0.3) +
+      geom_errorbar(aes(ymin = emmean - SE, ymax = emmean + SE), width = 0.2) +
+      scale_fill_manual(values = colors_emo, labels = labels_emo, guide = "none") +
+      scale_x_discrete(labels = labels_emo) +
+      labs(title = sprintf("%s %s: emotion main effect", exp_version, erp_name),
+           y = "Amplitude (\u00B5V)", x = "Facial expression")
+    ggsave(file.path(comp_dir, sprintf("Plot_%s_%s.pdf", exp_version, erp_name)),
+           p_emm, width = 7, height = 5, device = cairo_pdf)
+  })
+  
+  cat("   >>> Component complete.\n")
+  invisible(FINAL_MODEL)
+}
+
+# ==============================================================================
+# Multi-component side-by-side table for manuscript supplementary.
+# Mirrors the convention of presenting all ERP components in a single tab_model
+# HTML which can be opened in Word for final formatting.
+# ==============================================================================
+report_stage1_multi <- function(model_list, exp_version, out_dir) {
+  if (length(model_list) == 0) return(invisible(NULL))
+  
+  out_html <- file.path(out_dir, sprintf("Stage1_AllComponents_%s.html", exp_version))
+  out_md   <- file.path(out_dir, sprintf("Stage1_AllComponents_%s.md", exp_version))
+  
+  # ---- HTML output via sjPlot::tab_model (preferred for manuscript supplementary) ----
+  tab_model_succeeded <- FALSE
+  tryCatch({
+    sjPlot::tab_model(
+      model_list,
+      show.se = TRUE, show.stat = TRUE, show.ci = FALSE,
+      string.se = "SE", string.stat = "t-value", string.p = "p-value",
+      show.re.var = TRUE, show.obs = TRUE, show.icc = FALSE,
+      show.r2 = TRUE, show.loglik = TRUE, show.dev = TRUE,
+      emph.p = TRUE, p.style = "numeric_stars",
+      file = out_html,
+      dv.labels = names(model_list)
+    )
+    # Verify file actually exists. tab_model can silently fail on some sjPlot
+    # versions or with mixed-class model lists, returning NULL without writing.
+    if (file.exists(out_html) && file.size(out_html) > 0) {
+      cat(sprintf("[Multi-component HTML] %s\n", basename(out_html)))
+      tab_model_succeeded <- TRUE
+    } else {
+      cat(sprintf("[WARN] tab_model returned without error but no file written: %s\n",
+                  out_html))
+    }
+  }, error = function(e) {
+    cat(sprintf("[WARN] tab_model failed: %s\n", conditionMessage(e)))
+  })
+  
+  # ---- Markdown fallback: assemble a side-by-side ANOVA table ----
+  # Always produced, regardless of tab_model success. Provides a
+  # version-independent manuscript-ready table that can be pasted into Word.
+  tryCatch({
+    rows <- list()
+    methods_log <- character(0)
+    for (comp_name in names(model_list)) {
+      mdl <- model_list[[comp_name]]
+      
+      # Defensive class upgrade. Mirrors the upgrade in fit_stage1_bates;
+      # protects against models loaded directly from RDS without going
+      # through the engine.
+      if (inherits(mdl, "merMod") && !inherits(mdl, "lmerModLmerTest")) {
+        mdl_upgraded <- tryCatch(
+          lmerTest::as_lmerModLmerTest(mdl),
+          error = function(e) NULL
+        )
+        if (!is.null(mdl_upgraded)) mdl <- mdl_upgraded
+      }
+      
+      # Per-component cascade: Satt -> KR -> Wald.
+      anova_obj <- NULL
+      method_used <- NA_character_
+      
+      # Attempt 1: Satterthwaite.
+      anova_obj <- tryCatch({
+        res <- suppressWarnings(anova(mdl, type = 3, ddf = "Satterthwaite"))
+        if (any(grepl("^Pr", colnames(res)))) {
+          method_used <- "Satterthwaite F"
+          res
+        } else {
+          NULL
+        }
+      }, error = function(e) NULL)
+      
+      # Attempt 2: Kenward-Roger.
+      if (is.null(anova_obj)) {
+        anova_obj <- tryCatch({
+          res <- suppressWarnings(anova(mdl, type = 3, ddf = "Kenward-Roger"))
+          if (any(grepl("^Pr", colnames(res)))) {
+            method_used <- "Kenward-Roger F"
+            res
+          } else {
+            NULL
+          }
+        }, error = function(e) NULL)
+      }
+      
+      # Attempt 3: Wald.
+      if (is.null(anova_obj)) {
+        anova_obj <- tryCatch(
+          car::Anova(mdl, type = 3, test.statistic = "Chisq"),
+          error = function(e) NULL
+        )
+        if (!is.null(anova_obj)) method_used <- "Wald chi-square (LMM fallback)"
+      }
+      
+      if (is.null(anova_obj)) next
+      
+      methods_log <- c(methods_log, sprintf("%s: %s", comp_name, method_used))
+      
+      apa <- format_anova_apa(anova_obj, mdl)
+      apa$Component <- comp_name
+      apa$Status    <- component_status(comp_name)
+      apa$Method    <- method_used
+      rows[[comp_name]] <- apa[, c("Component", "Status", "Effect",
+                                   "APA_Report", "eta2_partial_95CI",
+                                   "Sig", "Method")]
+    }
+    
+    if (length(rows) > 0) {
+      combined <- do.call(rbind, rows)
+      writeLines(
+        c(sprintf("# Stage 1 ANOVA Summary, %s", exp_version),
+          sprintf("Generated: %s", format(Sys.time(), "%Y-%m-%d %H:%M:%S")),
+          "",
+          "Type III ANOVA tests. LMM analyses use a Satterthwaite -> ",
+          "Kenward-Roger -> Wald cascade (lmerTest, pbkrtest, car). All EEG",
+          "analyses are LMM (Gaussian on amplitude); GLMM is not used.",
+          "Component Status indicates confirmatory vs exploratory face-locked",
+          "components (a reporting-layer label set in the face component config).",
+          "",
+          "## Methods used per component:",
+          paste0("- ", methods_log),
+          "",
+          knitr::kable(combined, format = "markdown",
+                       caption = sprintf("Stage 1 fixed-effect tests across %d ERP components.",
+                                         length(rows)))),
+        con = out_md
+      )
+      cat(sprintf("[Multi-component Markdown] %s\n", basename(out_md)))
+    }
+  }, error = function(e) {
+    cat(sprintf("[WARN] Markdown multi-component summary failed: %s\n",
+                conditionMessage(e)))
+  })
+  
+  invisible(list(html_ok = tab_model_succeeded, html_path = out_html, md_path = out_md))
+}
+```
+
+``` {r stage2-blup}
+# ==============================================================================
+# 6. Stage 2: Trait Moderation Analysis (v2.2 dual-track design)
+# ==============================================================================
+#
+# v2.2 ARCHITECTURE
+# -----------------
+# Stage 2 implements two methodologically distinct tracks:
+#
+#   (A) CONFIRMATORY SINGLE-STAGE MODERATION (run_stage2_singlestage_moderation)
+#       For each of the five traits with established UG-ERP literature support
+#       (Rating_1, Rating_2, Rating_3, SVO_angle, Negative_Affectivity), refit a
+#       single-stage LMM containing the two-way emotion-by-trait_z interaction
+#       (face phase), plus the Alday baseline covariate. The same random-effects
+#       structure as the corresponding Stage 1 fit is reused.
+#       Type III F-tests with cascading Satterthwaite -> Kenward-Roger -> Wald
+#       inference, identical to Stage 1. FDR correction is applied within each
+#       trait family (across components, one emotion:trait_z term each). This is
+#       the statistically valid implementation of
+#       cross-level moderation and is appropriate for confirmatory inference.
+#
+#   (B) EXPLORATORY BLUP SCREEN (extract_blups + compute_blup_trait_table +
+#       run_stage2_blup_correlation, retained from v2.1)
+#       For the five PID-5-BF maladaptive personality dimensions lacking
+#       direct UG-ERP literature support, retain the BLUP-based correlational
+#       screen. BLUPs from each Stage 1 model are regressed weighted (1/SE^2)
+#       against each trait, with Spearman as a distribution-robust check.
+#       Within-group BH-FDR. These tests are explicitly hypothesis-generating
+#       and reported only in Supplementary Materials.
+#
+# RATIONALE FOR THE SPLIT
+# -----------------------
+# BLUP-then-correlate suffers two known methodological limitations: (a) BLUP
+# shrinkage attenuates trait associations heterogeneously (Hofmann & Rovine,
+# 2007); (b) condVar-based weights do not equal the variance of the BLUP-truth
+# discrepancy and so 1/SE^2 weighting is only approximate (Rouder & Haaf,
+# 2019). Single-stage LMM avoids both issues by propagating measurement
+# uncertainty within the model. We therefore reserve BLUP for traits where
+# the analysis is genuinely exploratory and no confirmatory inference is
+# claimed, while upgrading the literature-supported subset to the single-
+# stage path.
+# ==============================================================================
+
+extract_blups <- function(model, erp_name) {
+  ranef_obj <- lme4::ranef(model, condVar = TRUE)
+  
+  if (!"participant_id" %in% names(ranef_obj)) {
+    cat(sprintf("[Stage 2] No participant-level random effects in %s; skipping.\n",
+                erp_name))
+    return(NULL)
+  }
+  
+  re_pid <- ranef_obj$participant_id
+  if (ncol(re_pid) == 0) return(NULL)
+  
+  # Conditional variance structure depends on the random-effects specification:
+  #   * Single (... | id) term  -> postVar is a 3-d array [n_terms, n_terms, n_subj]
+  #   * Multiple separate terms -> postVar is a list of such arrays, one per term,
+  #                                 with column-grouping recoverable from the term
+  #                                 indexing in the 'nms' attribute.
+  # We handle both cases below. In all cases we extract the per-subject standard
+  # deviation (sqrt of diagonal) for each BLUP column, used as weights in Stage 2.
+  pv <- attr(re_pid, "postVar")
+  n_terms <- ncol(re_pid)
+  n_subj  <- nrow(re_pid)
+  cond_sd_mat <- matrix(NA_real_, nrow = n_subj, ncol = n_terms)
+  
+  if (is.null(pv)) {
+    # No condVar attribute available; leave SDs as NA (Stage 2 falls back to
+    # unweighted regression).
+  } else if (is.list(pv)) {
+    # Multi-term ZCP-style structure: pv is list of arrays, one per random term.
+    # Column ordering in re_pid matches: term1's columns, then term2's, etc.
+    col_offset <- 0
+    for (term_idx in seq_along(pv)) {
+      arr <- pv[[term_idx]]
+      term_dim <- dim(arr)[1]  # number of columns from this term
+      for (i in seq_len(n_subj)) {
+        block <- as.matrix(arr[, , i])
+        diag_vals <- if (length(block) == 1) as.numeric(block) else diag(block)
+        cond_sd_mat[i, (col_offset + 1):(col_offset + term_dim)] <- sqrt(diag_vals)
+      }
+      col_offset <- col_offset + term_dim
+    }
+  } else {
+    # Single-term structure: pv is a 3-d array.
+    for (i in seq_len(n_subj)) {
+      block <- as.matrix(pv[, , i])
+      diag_vals <- if (length(block) == 1) as.numeric(block) else diag(block)
+      cond_sd_mat[i, ] <- sqrt(diag_vals)
+    }
+  }
+  
+  colnames(cond_sd_mat) <- colnames(re_pid)
+  
+  blup_long <- re_pid %>%
+    tibble::rownames_to_column("participant_id") %>%
+    tidyr::pivot_longer(cols = -participant_id,
+                        names_to = "term", values_to = "blup_value")
+  
+  sd_long <- as.data.frame(cond_sd_mat) %>%
+    dplyr::mutate(participant_id = rownames(re_pid)) %>%
+    tidyr::pivot_longer(cols = -participant_id,
+                        names_to = "term", values_to = "blup_se")
+  
+  dplyr::left_join(blup_long, sd_long,
+                   by = c("participant_id", "term")) %>%
+    dplyr::mutate(component = erp_name)
+}
+
+# ==============================================================================
+# Stage 2 between-subject correlation engine.
+#
+# Implements grouped FDR correction: traits are partitioned into theoretically
+# meaningful groups (configured at top of script via stage2_trait_groups), and
+# Benjamini-Hochberg FDR is applied independently within each group. This
+# separates confirmatory tests on theory-driven traits from broader exploratory
+# tests, preventing the dilution of statistical power that would result from
+# correcting all traits jointly.
+#
+# Inputs:
+#   blups_df:      long-format from extract_blups, one row per (subject, term, comp)
+#   df_traits:     one row per subject; columns include traits listed in
+#                  stage2_trait_groups
+#   out_dir:       parent directory; per-group subdirectories are created here
+#   trait_groups:  named list mapping group_name -> character vector of trait
+#                  column names (defaults to the global stage2_trait_groups)
+#   sig_threshold: cutoff for the 'significant' subset table (default 0.10
+#                  matches interaction_threshold)
+#
+# Outputs (per group):
+#   <group_name>/stage2_full_results.md           all (comp x term x trait) tests
+#   <group_name>/stage2_significant_results.md    cells passing sig_threshold
+# Output (combined):
+#   STAGE2_REPRODUCIBILITY.txt                    methodology and group counts
+# Returns:
+#   Named list of results data frames (one per group), invisibly.
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# Helper: core (component x term x trait) correlation loop. Produces an
+# unadjusted long-format results table; FDR is applied by the caller within
+# each group. Min-N threshold (10) prevents unstable estimates on sparse cells.
+# ------------------------------------------------------------------------------
+compute_blup_trait_table <- function(blups_target, df_traits, traits) {
+  results <- list()
+  
+  available <- intersect(traits, names(df_traits))
+  if (length(available) == 0) return(NULL)
+  
+  merged <- blups_target %>%
+    dplyr::left_join(df_traits, by = "participant_id")
+  
+  for (comp in unique(merged$component)) {
+    for (term_name in unique(merged$term[merged$component == comp])) {
+      sub_data <- merged %>%
+        dplyr::filter(component == comp, term == term_name)
+      
+      for (trait in available) {
+        if (!trait %in% names(sub_data)) next
+        
+        # Build a single working frame with the trait column renamed to a fixed
+        # name. This avoids passing .data[[trait]] into lm(), which does not
+        # support the rlang pronoun outside dplyr contexts.
+        work <- sub_data %>%
+          dplyr::select(participant_id, blup_value, blup_se, trait_value = !!trait) %>%
+          dplyr::filter(!is.na(trait_value), !is.na(blup_value))
+        
+        if (nrow(work) < 10) next
+        
+        # Weighted regression: weights = 1/SE^2 down-weight high-uncertainty BLUPs.
+        # Standard practice for two-stage individual-difference models with
+        # uncertainty propagation (Goldstein, 2011).
+        wts <- if (all(!is.na(work$blup_se)) && all(work$blup_se > 0)) {
+          1 / (work$blup_se^2)
+        } else {
+          rep(1, nrow(work))
+        }
+        
+        m_lm <- tryCatch(
+          lm(blup_value ~ scale(trait_value), data = work, weights = wts),
+          error = function(e) NULL
+        )
+        
+        # Spearman: distribution-robust corroboration for the parametric test.
+        sp <- tryCatch(
+          suppressWarnings(
+            cor.test(work$blup_value, work$trait_value, method = "spearman")
+          ),
+          error = function(e) NULL
+        )
+        
+        if (is.null(m_lm) || is.null(sp)) next
+        
+        coefs <- summary(m_lm)$coefficients
+        if (nrow(coefs) < 2) next
+        
+        results[[length(results) + 1]] <- data.frame(
+          component  = comp,
+          blup_term  = term_name,
+          trait      = trait,
+          n          = nrow(work),
+          beta       = coefs[2, "Estimate"],
+          beta_se    = coefs[2, "Std. Error"],
+          t_stat     = coefs[2, "t value"],
+          p_param    = coefs[2, "Pr(>|t|)"],
+          rho_spear  = unname(sp$estimate),
+          p_spear    = sp$p.value,
+          stringsAsFactors = FALSE
+        )
+      }
+    }
+  }
+  
+  if (length(results) == 0) return(NULL)
+  do.call(rbind, results)
+}
+
+# ------------------------------------------------------------------------------
+# Main entry point: grouped Stage 2 driver.
+# ------------------------------------------------------------------------------
+run_stage2_blup_correlation <- function(blups_df, df_traits, out_dir,
+                                        trait_groups = NULL,
+                                        sig_threshold = NULL) {
+  if (is.null(blups_df) || is.null(df_traits)) {
+    cat("[Stage 2] Insufficient input; skipping.\n")
+    return(invisible(NULL))
+  }
+  
+  # Resolve defaults from global config.
+  if (is.null(trait_groups)) {
+    if (!exists("stage2_trait_groups")) {
+      stop("[Stage 2] No trait_groups argument and stage2_trait_groups not defined.")
+    }
+    trait_groups <- stage2_trait_groups
+  }
+  if (is.null(sig_threshold)) {
+    sig_threshold <- if (exists("interaction_threshold")) interaction_threshold else 0.10
+  }
+  
+  # Exclude (Intercept) BLUPs: reflect overall amplitude, not condition-specific
+  # deviations of theoretical interest.
+  blups_target <- blups_df %>%
+    dplyr::filter(!grepl("^\\(Intercept\\)$", term))
+  
+  if (nrow(blups_target) == 0) {
+    cat("[Stage 2] No condition-specific BLUPs available; skipping.\n")
+    return(invisible(NULL))
+  }
+  
+  cat(sprintf("\n[Stage 2] Grouped analysis across %d trait group(s):\n",
+              length(trait_groups)))
+  for (gname in names(trait_groups)) {
+    available_in_group <- intersect(trait_groups[[gname]], names(df_traits))
+    cat(sprintf("  %-25s traits available: %d/%d\n",
+                gname, length(available_in_group), length(trait_groups[[gname]])))
+  }
+  
+  # ---- Per-group analysis loop ----
+  group_results <- list()
+  group_summary <- list()
+  
+  for (gname in names(trait_groups)) {
+    group_dir <- file.path(out_dir, gname)
+    if (!dir.exists(group_dir)) dir.create(group_dir, recursive = TRUE)
+    
+    group_traits <- trait_groups[[gname]]
+    
+    cat(sprintf("\n  >>> Group: %s\n", gname))
+    
+    raw_table <- compute_blup_trait_table(blups_target, df_traits, group_traits)
+    
+    if (is.null(raw_table)) {
+      cat(sprintf("      No valid (comp x term x trait) cells in this group; skipping.\n"))
+      group_summary[[gname]] <- data.frame(
+        group = gname, n_tests = 0, n_sig_05 = 0, n_marginal_10 = 0,
+        stringsAsFactors = FALSE
+      )
+      next
+    }
+    
+    # FDR within this group only.
+    raw_table$p_param_fdr <- p.adjust(raw_table$p_param, method = "BH")
+    raw_table$p_spear_fdr <- p.adjust(raw_table$p_spear, method = "BH")
+    raw_table$Sig_param   <- add_sig_stars(raw_table$p_param_fdr)
+    raw_table$Sig_spear   <- add_sig_stars(raw_table$p_spear_fdr)
+    raw_table$group       <- gname
+    raw_table             <- raw_table[order(raw_table$p_param_fdr), ]
+    
+    n_sig_05 <- sum(raw_table$p_param_fdr < 0.05, na.rm = TRUE)
+    n_sig_10 <- sum(raw_table$p_param_fdr < sig_threshold, na.rm = TRUE)
+    
+    cat(sprintf("      %d tests; %d FDR p < 0.05; %d FDR p < %g.\n",
+                nrow(raw_table), n_sig_05, n_sig_10, sig_threshold))
+    
+    group_summary[[gname]] <- data.frame(
+      group = gname,
+      n_tests = nrow(raw_table),
+      n_sig_05 = n_sig_05,
+      n_marginal_10 = n_sig_10,
+      stringsAsFactors = FALSE
+    )
+    
+    # Write per-group output tables.
+    full_disp <- kill_scipen(beautify_labels(raw_table))
+    writeLines(
+      knitr::kable(full_disp, format = "markdown",
+                   caption = sprintf("Stage 2 [%s]: full BLUP x trait table (within-group FDR).",
+                                     gname)),
+      con = file.path(group_dir, "stage2_full_results.md")
+    )
+    
+    sig_subset <- raw_table[raw_table$p_param_fdr < sig_threshold, , drop = FALSE]
+    if (nrow(sig_subset) > 0) {
+      sig_disp <- kill_scipen(beautify_labels(sig_subset))
+      writeLines(
+        knitr::kable(sig_disp, format = "markdown",
+                     caption = sprintf("Stage 2 [%s]: cells passing FDR p < %g.",
+                                       gname, sig_threshold)),
+        con = file.path(group_dir, "stage2_significant_results.md")
+      )
+    }
+    
+    group_results[[gname]] <- raw_table
+  }
+  
+  # ---- Combined reproducibility log ----
+  sink(file.path(out_dir, "STAGE2_REPRODUCIBILITY.txt"))
+  cat("# Stage 2 Reproducibility Metadata (Grouped FDR)\n")
+  cat("# Generated:", format(Sys.time(), "%Y-%m-%d %H:%M:%S"), "\n\n")
+  cat("## Multiple-testing strategy:\n")
+  cat("FDR method:           Benjamini-Hochberg, applied INDEPENDENTLY within each group.\n")
+  cat("Significance cutoff:  ", sig_threshold, "(values < 0.05 marked confirmatory)\n")
+  cat("Min N per cell:        10 subjects\n")
+  cat("Weights:               1 / blup_se^2\n")
+  cat("Robust check:          Spearman rank correlation\n\n")
+  cat("## Trait groups:\n")
+  for (gname in names(trait_groups)) {
+    available_in_group <- intersect(trait_groups[[gname]], names(df_traits))
+    cat(sprintf("  %-25s [%d traits available / %d configured]: %s\n",
+                gname,
+                length(available_in_group),
+                length(trait_groups[[gname]]),
+                paste(available_in_group, collapse = ", ")))
+  }
+  cat("\n## Per-group test counts:\n")
+  if (length(group_summary) > 0) {
+    summary_df <- do.call(rbind, group_summary)
+    print(summary_df, row.names = FALSE)
+  }
+  cat("\n## BLUP terms tested:\n")
+  cat("  ", paste(unique(blups_target$term), collapse = ", "), "\n")
+  cat("\n## Components included:\n")
+  cat("  ", paste(unique(blups_target$component), collapse = ", "), "\n")
+  sink()
+  
+  cat(sprintf("\n[Stage 2] Completed across %d groups. Output: %s\n",
+              length(group_results), out_dir))
+  
+  invisible(group_results)
+}
+
+# ==============================================================================
+# v2.2 Confirmatory single-stage moderation engine.
+#
+# WHAT IT DOES
+# For each (component x trait) pair in the confirmatory set, refits a single
+# LMM containing the two-way emotion-by-trait_z interaction (face phase: emotion
+# is the sole design factor). This is the statistically valid implementation of
+# cross-level moderation (Snijders & Bosker, 2012, ch. 5). It avoids the BLUP
+# shrinkage and SE misspecification that affect the two-stage BLUP-then-correlate
+# path.
+#
+# MODEL FORM
+#   amplitude ~ emotion * trait_z + Baseline_c (Alday) +
+#               <random-effects structure inherited from Stage 1>
+#
+# where trait_z = scale(trait_value). The trait enters as a between-subject
+# continuous variable; sum-to-zero contrasts on emotion (set globally) preserve
+# interpretability of the main effect in the presence of the interaction.
+#
+# RANDOM-EFFECTS STRATEGY
+# We re-extract the Stage 1 fitted model's random-effects formula via
+# lme4::findbars() and reuse it verbatim. The trait variable is between-
+# subject, so it cannot enter as a random slope. Reusing the parsimonious
+# Stage 1 random structure (rather than refitting Bates 5-step) is consistent
+# with Matuschek et al. (2017) recommendation that random structure should be
+# determined by the within-subject design, which is unchanged.
+#
+# INFERENCE
+# Type III F-tests with cascading Satterthwaite -> Kenward-Roger -> Wald,
+# identical to Stage 1. The term of theoretical interest is:
+#   emotion:trait_z              (does the trait moderate the emotion effect?)
+#
+# MULTIPLE-TESTING CORRECTION
+# BH-FDR within each trait family across components (n_tests = n_components x 1
+# per trait, one emotion:trait_z term each). Cross-trait correction is not
+# applied because each trait corresponds to a distinct a priori hypothesis;
+# treating them as a single family would conflate hypothesis-level inference
+# with within-hypothesis multiple testing.
+#
+# INPUTS
+#   df_long       : trial-level data frame (output of load_and_prep)
+#   stage1_models : named list of Stage 1 fits (one per component) -- used to
+#                   recover (i) the random-effects formula and (ii) the
+#                   amplitude column name corresponding to each component.
+#   df_traits     : one row per subject; must contain the traits listed in
+#                   `traits` plus 'participant_id'.
+#   traits        : character vector of trait column names to test as
+#                   confirmatory moderators (default: confirmatory_traits).
+#   out_dir       : output directory for tables and reproducibility log.
+#
+# OUTPUTS
+#   <out_dir>/Trait_<trait>/moderation_results.md  per-trait full result table
+#   <out_dir>/Trait_<trait>/moderation_results.csv same data, machine readable
+#   <out_dir>/STAGE2_CONFIRMATORY_REPRODUCIBILITY.txt   metadata log
+#
+# RETURNS
+#   Named list of per-trait result data frames, invisibly.
+# ==============================================================================
+
+run_stage2_singlestage_moderation <- function(df_long,
+                                              stage1_models,
+                                              df_traits,
+                                              traits = NULL,
+                                              out_dir,
+                                              fdr_alpha = 0.05) {
+  if (is.null(stage1_models) || length(stage1_models) == 0) {
+    cat("[Stage 2 Confirmatory] No Stage 1 models supplied; skipping.\n")
+    return(invisible(NULL))
+  }
+  if (is.null(df_traits)) {
+    cat("[Stage 2 Confirmatory] No trait file available; skipping.\n")
+    return(invisible(NULL))
+  }
+  if (is.null(traits)) {
+    if (!exists("confirmatory_traits")) {
+      stop("[Stage 2 Confirmatory] No traits argument and confirmatory_traits not defined.")
+    }
+    traits <- confirmatory_traits
+  }
+  
+  available_traits <- intersect(traits, names(df_traits))
+  missing_traits   <- setdiff(traits, available_traits)
+  if (length(missing_traits) > 0) {
+    cat(sprintf("[Stage 2 Confirmatory] Traits not found in covariate file (skipping): %s\n",
+                paste(missing_traits, collapse = ", ")))
+  }
+  if (length(available_traits) == 0) {
+    cat("[Stage 2 Confirmatory] No usable traits; skipping.\n")
+    return(invisible(NULL))
+  }
+  
+  cat(sprintf("\n[Stage 2 Confirmatory] Single-stage moderation across %d trait(s) x %d component(s).\n",
+              length(available_traits), length(stage1_models)))
+  
+  # Merge trait values onto trial-level data.
+  # 
+  # Defensive note: load_and_prep() already left-joins df_covariates onto each
+  # per-component data frame in Stage 1 (search "df <- dplyr::left_join(df,
+  # df_covariates" in load_and_prep). Consequently df_long arrives with trait
+  # columns already attached. A naive second left_join would trigger dplyr's
+  # automatic .x/.y suffixing and break the .data[[trait_name]] lookup below.
+  # We therefore drop any pre-existing trait columns from df_long first, then
+  # rejoin from df_traits as the canonical source of trait values.
+  trait_cols_used <- c("participant_id", available_traits)
+  preexisting_trait_cols <- intersect(available_traits, names(df_long))
+  if (length(preexisting_trait_cols) > 0) {
+    df_long <- df_long %>% dplyr::select(-dplyr::all_of(preexisting_trait_cols))
+  }
+  df_with_traits <- dplyr::left_join(
+    df_long,
+    df_traits[, trait_cols_used, drop = FALSE],
+    by = "participant_id"
+  )
+  
+  per_trait_results <- list()
+  
+  for (trait_name in available_traits) {
+    cat(sprintf("\n  >>> Trait: %s\n", trait_name))
+    trait_dir <- file.path(out_dir, paste0("Trait_", trait_name))
+    if (!dir.exists(trait_dir)) dir.create(trait_dir, recursive = TRUE)
+    
+    rows <- list()
+    
+    for (comp_name in names(stage1_models)) {
+      m1 <- stage1_models[[comp_name]]
+      if (is.null(m1)) {
+        cat(sprintf("    [%s] Stage 1 model is NULL; skipping.\n", comp_name))
+        next
+      }
+      
+      # Recover the response variable name and random-effects formula from
+      # the Stage 1 fit. Stage 1 LMMs in this pipeline are fitted with
+      # response = Mean_<comp>; we read it from formula(m1) to avoid hard-
+      # coding the convention.
+      f_stage1   <- stats::formula(m1)
+      response   <- as.character(f_stage1[[2L]])
+      re_terms   <- lme4::findbars(f_stage1)
+      re_string  <- if (length(re_terms) > 0) {
+        paste0("(", sapply(re_terms, deparse), ")", collapse = " + ")
+      } else {
+        "(1 | participant_id)"
+      }
+      
+      # Build the moderation formula. The trait enters as scale()-transformed
+      # predictor in the model fit (via I(scale(...)) on the data side: we
+      # compute it directly to keep predictor names readable in anova output).
+      df_trait_complete <- df_with_traits %>%
+        dplyr::filter(!is.na(.data[[trait_name]])) %>%
+        dplyr::mutate(trait_z = as.numeric(scale(.data[[trait_name]])))
+      
+      n_subj_trait <- length(unique(df_trait_complete$participant_id))
+      if (n_subj_trait < 10) {
+        cat(sprintf("    [%s] Only %d subjects with non-missing %s; skipping.\n",
+                    comp_name, n_subj_trait, trait_name))
+        next
+      }
+      
+      # Mod formula. Baseline_c retained per Alday (2019); presence is checked
+      # against Stage 1 fixed effects.
+      stage1_fixed_terms <- attr(stats::terms(f_stage1), "term.labels")
+      baseline_term <- if ("Baseline_c" %in% stage1_fixed_terms) " + Baseline_c" else ""
+      
+      # Face phase: two-way emotion-by-trait moderation (no offer factor).
+      mod_formula <- stats::as.formula(sprintf(
+        "%s ~ emotion * trait_z%s + %s",
+        response, baseline_term, re_string
+      ))
+      
+      # Fit. Use the same control settings as the Stage 1 engine for
+      # numerical comparability.
+      cat(sprintf("    [%s] Fitting moderation LMM (%d subjects)...",
+                  comp_name, n_subj_trait))
+      flush.console()
+      t0 <- Sys.time()
+      
+      fit_mod <- tryCatch(
+        suppressWarnings(suppressMessages(
+          lmerTest::lmer(mod_formula, data = df_trait_complete,
+                         REML = TRUE,
+                         control = lme4::lmerControl(
+                           optimizer = "bobyqa",
+                           optCtrl = list(maxfun = 2e5),
+                           calc.derivs = FALSE
+                         ))
+        )),
+        error = function(e) {
+          cat(sprintf("    [%s] Moderation LMM failed: %s\n",
+                      comp_name, conditionMessage(e)))
+          NULL
+        }
+      )
+      elapsed <- as.numeric(difftime(Sys.time(), t0, units = "secs"))
+      cat(sprintf(" done in %.1fs.\n", elapsed))
+      
+      if (is.null(fit_mod)) next
+      
+      # Cascade ANOVA inference: Satterthwaite -> Kenward-Roger -> Wald.
+      # 
+      # Defensive note: column "Pr(>F)" may be absent if lmerTest dispatch
+      # silently fell through to lme4 base anova (e.g., model class downgraded
+      # to bare lmerMod). The has_pf_col() helper guards against subscript
+      # errors while still exercising the cascade as designed.
+      anova_obj <- NULL
+      ddf_used  <- NA_character_
+      
+      has_pf_col <- function(obj) {
+        !is.null(obj) && "Pr(>F)" %in% colnames(obj) &&
+          all(!is.na(obj[, "Pr(>F)"]))
+      }
+      
+      anova_obj <- tryCatch(
+        stats::anova(fit_mod, type = 3, ddf = "Satterthwaite"),
+        error = function(e) NULL
+      )
+      if (has_pf_col(anova_obj)) {
+        ddf_used <- "Satterthwaite"
+      } else {
+        anova_obj <- tryCatch(
+          stats::anova(fit_mod, type = 3, ddf = "Kenward-Roger"),
+          error = function(e) NULL
+        )
+        if (has_pf_col(anova_obj)) {
+          ddf_used <- "Kenward-Roger"
+        } else {
+          anova_obj <- tryCatch(
+            car::Anova(fit_mod, type = 3, test.statistic = "Chisq"),
+            error = function(e) NULL
+          )
+          ddf_used <- if (!is.null(anova_obj)) "Wald" else NA_character_
+        }
+      }
+      
+      if (is.null(anova_obj)) {
+        cat(sprintf("    [%s] All inference methods failed; skipping.\n", comp_name))
+        next
+      }
+      
+      # Extract the three terms of interest. Different ddf paths return
+      # different column names; we normalise to a common schema.
+      target_terms <- c("emotion:trait_z")
+      anova_df <- as.data.frame(anova_obj)
+      anova_df$term <- rownames(anova_df)
+      
+      for (tt in target_terms) {
+        if (!tt %in% anova_df$term) {
+          rows[[length(rows) + 1]] <- data.frame(
+            component = comp_name, term = tt,
+            F_or_Chisq = NA_real_, df_num = NA_real_, df_den = NA_real_,
+            p_raw = NA_real_, ddf_used = ddf_used,
+            stringsAsFactors = FALSE
+          )
+          next
+        }
+        row_i <- anova_df[anova_df$term == tt, , drop = FALSE]
+        
+        # Column name normalisation across Satterthwaite, KR, and Wald paths.
+        f_or_chisq <- if ("F value" %in% names(row_i)) row_i[["F value"]]
+        else if ("F" %in% names(row_i)) row_i[["F"]]
+        else if ("Chisq" %in% names(row_i)) row_i[["Chisq"]]
+        else NA_real_
+        
+        df_num <- if ("NumDF" %in% names(row_i)) row_i[["NumDF"]]
+        else if ("Df" %in% names(row_i)) row_i[["Df"]]
+        else if ("Df.res" %in% names(row_i)) NA_real_
+        else NA_real_
+        
+        df_den <- if ("DenDF" %in% names(row_i)) row_i[["DenDF"]] else NA_real_
+        
+        p_raw  <- if ("Pr(>F)" %in% names(row_i)) row_i[["Pr(>F)"]]
+        else if ("Pr(>Chisq)" %in% names(row_i)) row_i[["Pr(>Chisq)"]]
+        else NA_real_
+        
+        rows[[length(rows) + 1]] <- data.frame(
+          component  = comp_name,
+          term       = tt,
+          F_or_Chisq = as.numeric(f_or_chisq),
+          df_num     = as.numeric(df_num),
+          df_den     = as.numeric(df_den),
+          p_raw      = as.numeric(p_raw),
+          ddf_used   = ddf_used,
+          stringsAsFactors = FALSE
+        )
+      }
+    }  # end component loop
+    
+    if (length(rows) == 0) {
+      cat(sprintf("    Trait %s: no valid (component x term) cells; skipping.\n",
+                  trait_name))
+      per_trait_results[[trait_name]] <- NULL
+      next
+    }
+    
+    raw_table <- do.call(rbind, rows)
+    raw_table$p_fdr <- stats::p.adjust(raw_table$p_raw, method = "BH")
+    raw_table$Sig_fdr <- add_sig_stars(raw_table$p_fdr)
+    raw_table$trait <- trait_name
+    raw_table <- raw_table[order(raw_table$p_fdr,
+                                 raw_table$component,
+                                 raw_table$term), ]
+    
+    n_sig <- sum(raw_table$p_fdr < fdr_alpha, na.rm = TRUE)
+    cat(sprintf("    Trait %s: %d tests; %d FDR p < %.3f.\n",
+                trait_name, nrow(raw_table), n_sig, fdr_alpha))
+    
+    # Write per-trait outputs.
+    write.csv(raw_table, file.path(trait_dir, "moderation_results.csv"),
+              row.names = FALSE)
+    
+    raw_disp <- raw_table
+    raw_disp$F_or_Chisq <- format(round(raw_disp$F_or_Chisq, 3))
+    raw_disp$p_raw      <- format.pval(raw_disp$p_raw, digits = 3, eps = 1e-4)
+    raw_disp$p_fdr      <- format.pval(raw_disp$p_fdr, digits = 3, eps = 1e-4)
+    
+    writeLines(
+      knitr::kable(raw_disp, format = "markdown",
+                   caption = sprintf(
+                     "Stage 2 Confirmatory single-stage moderation: %s. Within-trait BH-FDR across n_tests = %d (one emotion:trait_z term per component).",
+                     trait_name, nrow(raw_table)
+                   )),
+      con = file.path(trait_dir, "moderation_results.md")
+    )
+    
+    per_trait_results[[trait_name]] <- raw_table
+  }  # end trait loop
+  
+  # Combined reproducibility log.
+  sink(file.path(out_dir, "STAGE2_CONFIRMATORY_REPRODUCIBILITY.txt"))
+  cat("# Stage 2 Confirmatory Single-Stage Moderation: Reproducibility Metadata\n")
+  cat("# Generated:", format(Sys.time(), "%Y-%m-%d %H:%M:%S"), "\n\n")
+  cat("## Methodological framework\n")
+  cat("Approach:           Single-stage LMM with two-way emotion*trait_z interaction (face phase).\n")
+  cat("Justification:      Snijders & Bosker (2012); avoids BLUP shrinkage bias in confirmatory inference.\n")
+  cat("Inference:          Type III F-tests, cascade Satterthwaite -> Kenward-Roger -> Wald.\n")
+  cat("FDR method:         Benjamini-Hochberg, applied INDEPENDENTLY within each trait family.\n")
+  cat("Significance alpha:", fdr_alpha, "\n")
+  cat("Min N per cell:     10 subjects with non-missing trait\n\n")
+  cat("## Confirmatory traits tested:\n")
+  for (tr in available_traits) {
+    n_avail <- sum(!is.na(df_traits[[tr]]))
+    cat(sprintf("  %-25s [N with trait = %d]\n", tr, n_avail))
+  }
+  cat("\n## Components tested:\n")
+  cat("  ", paste(names(stage1_models), collapse = ", "), "\n")
+  cat("\n## Per-trait test counts:\n")
+  for (tr in names(per_trait_results)) {
+    if (!is.null(per_trait_results[[tr]])) {
+      n_total <- nrow(per_trait_results[[tr]])
+      n_sig   <- sum(per_trait_results[[tr]]$p_fdr < fdr_alpha, na.rm = TRUE)
+      cat(sprintf("  %-25s n_tests = %d, n_sig (FDR < %.3f) = %d\n",
+                  tr, n_total, fdr_alpha, n_sig))
+    }
+  }
+  sink()
+  
+  cat(sprintf("\n[Stage 2 Confirmatory] Completed across %d traits. Output: %s\n",
+              length(per_trait_results), out_dir))
+  
+  invisible(per_trait_results)
+}
+```
+
+
+``` {r execution}
+# ==============================================================================
+# 7. Execution Phase
+# ==============================================================================
+path_pipeline <- here("data", paste0("02_Pipeline_Output_", experiment_version))
+# Face-locked single-trial table from the method-specific Face_Locked dir
+# (method_dir set by the use_baseline_correction toggle in setup).
+path_stim <- file.path(path_pipeline, method_dir, "Face_Locked", "trials.csv")
+
+path_cov_base <- file.path(path_pipeline, "Covariates")
+path_cov_candidates <- c(
+  file.path(path_cov_base, sprintf("SVO_PID5BF_PostRating_%s.csv", experiment_version)),
+  file.path(path_cov_base, sprintf("SVO_PID5BF_PostRating_%s.xlsx", experiment_version)),
+  file.path(path_cov_base, "SVO_PID5BF_PostRating.csv"),
+  file.path(path_cov_base, "SVO_PID5BF_PostRating.xlsx")
+)
+
+path_cov <- NA_character_
+for (cand in path_cov_candidates) {
+  if (file.exists(cand)) { path_cov <- cand; break }
+}
+
+if (is.na(path_cov)) warning("No covariate file found; Stage 2 will be skipped.")
+if (!file.exists(path_stim)) {
+  stop(sprintf("Stimulus file not found: %s\nVerify upstream preprocessing.", path_stim))
+}
+
+cat("--- Loading Covariates ---\n")
+df_covs <- load_covariates(path_cov)
+
+# ---- Stage 1: stimulus-locked components ----
+stage1_models <- list()
+stage1_blups <- list()
+# v2.2: stage1_data holds per-component trial-level data, used by Stage 2
+# confirmatory single-stage moderation. Initialised at outer scope so that
+# downstream chunks can test length(stage1_data) > 0 unconditionally.
+stage1_data <- list()
+
+if (file.exists(path_stim)) {
+  progress_log("=== Processing Stimulus-Locked Components ===")
+  total_stim <- length(analyze_stim_components)
+  pipeline_t0 <- Sys.time()
+  
+  for (comp_idx in seq_along(analyze_stim_components)) {
+    comp_name <- analyze_stim_components[comp_idx]
+    progress_log(sprintf(">>> [%d/%d] Component: %s [%s] (cumulative: %s)",
+                         comp_idx, total_stim, comp_name,
+                         component_status(comp_name),
+                         format_elapsed(pipeline_t0)))
+    baseline_col_name <- paste0("Baseline_", comp_name)
+    df_comp <- load_and_prep(path_stim, df_covs, comp_name, baseline_col_name)
+    
+    if (!is.null(df_comp)) {
+      check_uniqueness(df_comp, comp_name)
+      
+      # Baseline balance pre-check (diagnostic only; does not gate analysis).
+      # Output to Supplementary/baseline_balance/<component>_baseline_balance.md.
+      pre_check_baseline_balance(
+        data     = df_comp,
+        comp_name = comp_name,
+        out_dir   = file.path(out_suppl, "baseline_balance")
+      )
+      
+      fit <- run_stage1_component(df_comp, comp_name, out_stage1, experiment_version)
+      
+      if (!is.null(fit)) {
+        stage1_models[[comp_name]] <- fit
+        stage1_blups[[comp_name]]  <- extract_blups(fit, comp_name)
+        stage1_data[[comp_name]]   <- df_comp  # v2.2: retain for Stage 2 confirmatory
+      }
+    }
+    progress_log(sprintf(">>> [%d/%d] %s complete.", comp_idx, total_stim, comp_name))
+  }
+}
+
+# Note: response-locked components (formerly CPP) removed in v2 as out of
+# scope for the offer-phase analysis. Pipeline now processes only stimulus-
+# locked components. To restore CPP analysis, re-introduce response-locked
+# block above with explicit baseline merge from the stimulus-locked file.
+
+# ---- Multi-component side-by-side table for manuscript supplementary ----
+report_stage1_multi(stage1_models, experiment_version, out_tables)
+
+cat(sprintf("\n[Stage 1 complete] Fitted %d/%d components.\n",
+            length(stage1_models),
+            length(analyze_stim_components)))
+```
+
+``` {r execution-stage2}
+# ==============================================================================
+# 8. Stage 2 Execution (v2.2 dual-track)
+# ==============================================================================
+# Track A: Confirmatory single-stage moderation for traits with established
+# UG-ERP literature support (Rating_1/2/3, SVO_angle, Negative_Affectivity).
+# Each (component x trait) cell is refitted as a single LMM containing the
+# two-way emotion*trait_z interaction (face phase).
+#
+# Track B: Exploratory BLUP-based screen for the five PID-5-BF maladaptive
+# personality dimensions lacking direct UG-ERP literature. Output goes to
+# Supplementary; explicitly hypothesis-generating, not interpreted as
+# confirmatory evidence.
+# ==============================================================================
+
+stage2_confirmatory_results <- NULL
+stage2_exploratory_results  <- NULL
+
+# Stage 2 runs only under the Alday method (run_stage2 == TRUE). In the
+# Traditional sensitivity analysis it is deliberately disabled: BLUPs/moderation
+# from traditional baseline subtraction reflect a different latent quantity than
+# the Alday baseline-as-covariate estimates and are not directly comparable; the
+# sensitivity analysis exists to verify Stage 1 fixed-effect conclusions, not to
+# re-analyse individual differences (and re-running would inflate the FDR family).
+if (!run_stage2) {
+  dir.create(out_stage2, recursive = TRUE, showWarnings = FALSE)
+  writeLines(c(
+    "# Stage 2 (Trait Moderation): DELIBERATELY DISABLED",
+    sprintf("Generated: %s", format(Sys.time(), "%Y-%m-%d %H:%M:%S")),
+    "",
+    "This is the TRADITIONAL baseline-subtraction SENSITIVITY analysis",
+    "(use_baseline_correction = TRUE). Stage 2 individual-difference analysis",
+    "is intentionally not run here, for three reasons:",
+    "",
+    "1. Estimates from traditional baseline subtraction reflect a different",
+    "   latent quantity than the Alday baseline-as-covariate estimates;",
+    "   the two are not directly comparable.",
+    "2. The sensitivity analysis exists to verify the Stage 1 fixed-effect",
+    "   conclusions, not to re-analyse individual differences.",
+    "3. Re-running Stage 2 would double the FDR-adjusted family count with no",
+    "   interpretable gain.",
+    "",
+    "For the primary Stage 2 results see the Alday output tree",
+    "(results/EEG/FacePhase_E1/Bates_Alday/Stage2_TraitModeration/)."
+  ), file.path(out_stage2, "STAGE2_DISABLED_README.md"))
+  cat("\n[Stage 2 disabled] Traditional sensitivity analysis; wrote STAGE2_DISABLED_README.md\n")
+}
+
+# ------------------------------------------------------------------------------
+# Nuisance-covariate control check (Rating_1/2/3).
+# The three cover-story belief ratings are manipulation checks, NOT theoretical
+# moderators (decision 2026-06). They enter a SEPARATE control model as grand-
+# mean-centered MAIN-EFFECT covariates (no interaction), leaving the primary
+# Stage 1 inference untouched. Purpose: confirm the design effect(s) are robust
+# to controlling for belief strength, and report each rating's main-effect
+# association with amplitude. Output: Stage2_TraitModeration/Covariate_Control_Ratings/.
+# `design_rhs` is the design portion of the fixed effects ("emotion" here; the
+# offer-phase script passes "emotion * offer_type").
+# ------------------------------------------------------------------------------
+run_covariate_control_check <- function(stage1_models, stage1_data, df_traits,
+                                        rating_covs, out_dir,
+                                        design_rhs = "emotion") {
+  if (is.null(df_traits) || length(stage1_models) == 0) {
+    cat("[Covariate control] No models or covariates; skipping.\n"); return(invisible(NULL))
+  }
+  available <- intersect(rating_covs, names(df_traits))
+  if (length(available) == 0) {
+    cat("[Covariate control] No rating covariates in covariate file; skipping.\n")
+    return(invisible(NULL))
+  }
+  if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
+  cat(sprintf("\n=== Stage 2C: Ratings as nuisance covariates (control model) ===\n"))
+  cat(sprintf("[Covariate control] Ratings: %s\n", paste(available, collapse = ", ")))
+
+  for (comp_name in names(stage1_models)) {
+    m1   <- stage1_models[[comp_name]]
+    df_c <- stage1_data[[comp_name]]
+    if (is.null(m1) || is.null(df_c)) next
+
+    f_stage1  <- stats::formula(m1)
+    response  <- as.character(f_stage1[[2L]])
+    re_terms  <- lme4::findbars(f_stage1)
+    re_string <- if (length(re_terms) > 0)
+      paste0("(", sapply(re_terms, deparse), ")", collapse = " + ")
+    else "(1 | participant_id)"
+
+    # Grand-mean center each available rating present in this component's data.
+    rating_terms <- c()
+    for (rc in available) {
+      if (!rc %in% names(df_c)) next
+      cc <- paste0(rc, "_c")
+      df_c[[cc]] <- df_c[[rc]] - mean(df_c[[rc]], na.rm = TRUE)
+      rating_terms <- c(rating_terms, cc)
+    }
+    if (length(rating_terms) == 0) {
+      cat(sprintf("  [%s] no rating columns present; skipping.\n", comp_name)); next
+    }
+    df_c <- df_c[stats::complete.cases(df_c[, rating_terms, drop = FALSE]), ]
+    if (nrow(df_c) == 0) next
+
+    baseline_term <- if ("Baseline_c" %in% all.vars(f_stage1)) " + Baseline_c" else ""
+    f_ctrl <- stats::as.formula(sprintf(
+      "%s ~ %s + %s%s + %s", response, design_rhs,
+      paste(rating_terms, collapse = " + "), baseline_term, re_string))
+
+    fit <- tryCatch(
+      suppressWarnings(suppressMessages(
+        lmerTest::lmer(f_ctrl, data = df_c, REML = TRUE, control = custom_control))),
+      error = function(e) {
+        cat(sprintf("  [%s] control model failed: %s\n", comp_name, conditionMessage(e))); NULL })
+    if (is.null(fit)) next
+    if (!inherits(fit, "lmerModLmerTest"))
+      fit <- tryCatch(lmerTest::as_lmerModLmerTest(fit), error = function(e) fit)
+
+    res <- tryCatch(suppressWarnings(anova(fit, type = 3, ddf = "Satterthwaite")),
+                    error = function(e) NULL)
+    if (is.null(res) || !any(grepl("^Pr", colnames(res))))
+      res <- tryCatch(suppressWarnings(anova(fit, type = 3, ddf = "Kenward-Roger")),
+                      error = function(e) NULL)
+    if (is.null(res))
+      res <- tryCatch(car::Anova(fit, type = 3, test.statistic = "Chisq"), error = function(e) NULL)
+
+    anova_apa <- if (!is.null(res)) format_anova_apa(res, fit) else NULL
+    coefs <- tryCatch(format_coefs(fit), error = function(e) NULL)
+
+    comp_dir <- file.path(out_dir, comp_name)
+    if (!dir.exists(comp_dir)) dir.create(comp_dir, recursive = TRUE)
+    writeLines(c(
+      sprintf("# Nuisance-covariate control (Ratings): %s", comp_name),
+      sprintf("Generated: %s", format(Sys.time(), "%Y-%m-%d %H:%M:%S")),
+      "",
+      sprintf("Model: %s", paste(deparse(f_ctrl), collapse = " ")),
+      "",
+      "Ratings (Rating_1/2/3) enter as grand-mean-centered MAIN-EFFECT nuisance",
+      "covariates (no interaction). This checks whether the design effect(s) are",
+      "robust to controlling for cover-story belief strength, and reports each",
+      "rating's main-effect association with amplitude. NOT a moderation test;",
+      "the primary Stage 1 inference is unchanged.",
+      "",
+      "## Type III ANOVA (design effects controlling for ratings)",
+      if (!is.null(anova_apa)) knitr::kable(anova_apa, format = "markdown", row.names = FALSE) else "ANOVA failed.",
+      "",
+      "## Fixed-effect coefficients (incl. rating covariates)",
+      if (!is.null(coefs)) knitr::kable(coefs, format = "markdown", row.names = FALSE) else "Coefficient extraction failed."
+    ), file.path(comp_dir, "covariate_control.md"))
+    cat(sprintf("  [%s] control model done.\n", comp_name))
+  }
+  invisible(out_dir)
+}
+
+# ---- Track A: Confirmatory single-stage moderation ----
+if (run_stage2 && length(stage1_models) > 0 && length(stage1_data) > 0 && !is.null(df_covs)) {
+  cat(sprintf("\n=== Stage 2A: Confirmatory single-stage trait moderation ===\n"))
+  
+  # Build a unified trial-level frame across components. Single-stage
+  # moderation refits each (component x trait) independently, but it is
+  # convenient to pass one component's df at a time -- we therefore call
+  # the engine separately per component below by routing through the
+  # function's stage1_models argument (which iterates internally).
+  #
+  # The function expects df_long aligned to component column convention:
+  # we pass a per-component data list via dplyr::bind_rows with a 'component'
+  # marker. The engine then filters by comp inside its loop using the model
+  # response variable to identify amplitude column.
+  #
+  # Implementation note: rather than build a long-tall data frame (which
+  # would force unification of all amplitude columns onto a single
+  # 'amplitude' column), we route data through stage1_data in the engine
+  # by minor modification: see run_stage2_singlestage_moderation() which
+  # accepts a list of per-component dfs.
+  
+  # We therefore concatenate the trial-level frames carefully: each frame
+  # already has its native amplitude column (Mean_<comp>) and Baseline_<comp>;
+  # the engine reads the response variable from the Stage 1 formula. The
+  # concatenation below stacks frames keyed by 'component'. NOTE: amplitude
+  # columns are component-specific and contain NA for non-matching rows;
+  # the engine's filter by response variable resolves this.
+  df_long_concat <- dplyr::bind_rows(
+    lapply(names(stage1_data), function(comp_nm) {
+      df_c <- stage1_data[[comp_nm]]
+      df_c$component_marker <- comp_nm
+      df_c
+    })
+  )
+  
+  stage2_confirmatory_results <- run_stage2_singlestage_moderation(
+    df_long       = df_long_concat,
+    stage1_models = stage1_models,
+    df_traits     = df_covs,
+    traits        = confirmatory_traits,
+    out_dir       = out_stage2_confirm,
+    fdr_alpha     = 0.05
+  )
+} else {
+  cat("\n[Stage 2A skipped] Insufficient inputs (no Stage 1 models, data, or covariates).\n")
+}
+
+# ---- Track B: Exploratory BLUP screen for PID-5-BF dimensions ----
+if (run_stage2 && length(stage1_blups) > 0 && !is.null(df_covs)) {
+  blups_combined <- dplyr::bind_rows(stage1_blups)
+  
+  cat(sprintf("\n=== Stage 2B: Exploratory BLUP screen (PID-5-BF) ===\n"))
+  cat(sprintf("[Stage 2B] N BLUP rows: %d (across %d components, %d terms).\n",
+              nrow(blups_combined),
+              dplyr::n_distinct(blups_combined$component),
+              dplyr::n_distinct(blups_combined$term)))
+  
+  stage2_exploratory_results <- run_stage2_blup_correlation(
+    blups_df     = blups_combined,
+    df_traits    = df_covs,
+    out_dir      = out_stage2_explore,
+    trait_groups = stage2_trait_groups   # contains only Exploratory_PID5BF
+  )
+} else {
+  cat("\n[Stage 2B skipped] No BLUPs or no covariates available.\n")
+}
+
+# ---- Track C: Ratings as nuisance covariates (main-effect control model) ----
+if (run_stage2 && length(stage1_models) > 0 && length(stage1_data) > 0 && !is.null(df_covs)) {
+  run_covariate_control_check(
+    stage1_models = stage1_models,
+    stage1_data   = stage1_data,
+    df_traits     = df_covs,
+    rating_covs   = rating_covariates,
+    out_dir       = out_stage2_covctrl,
+    design_rhs    = "emotion"   # face phase: emotion is the sole design factor
+  )
+} else {
+  cat("\n[Stage 2C skipped] Insufficient inputs for covariate-control model.\n")
+}
+
+# Aggregate handle for downstream chunks (e.g., Methods paragraph generation).
+stage2_results <- list(
+  confirmatory = stage2_confirmatory_results,
+  exploratory  = stage2_exploratory_results
+)
+```
+
+``` {r methods-paragraph}
+# ==============================================================================
+# 8.5 Methods Paragraph Generation
+#
+# Auto-generated manuscript Methods text based on the runtime configuration of
+# this analysis (component lists, exact package versions, sample N, cascade
+# methods used). The paragraph tracks the actual code path; if upstream
+# settings change, regenerating this file ensures the manuscript stays in
+# sync with the analysis.
+#
+# Rationale for auto-generation: hand-writing Methods invites drift between
+# script and prose. Reviewers increasingly expect such drift to surface, and
+# JASP/JAMOVI-style auto-generated Methods text is an emerging norm.
+# ==============================================================================
+
+methods_path <- file.path(out_tables,
+                          sprintf("Methods_paragraph_%s.md", experiment_version))
+
+# Component count summaries.
+n_confirmatory <- length(confirmatory_components)
+n_exploratory  <- length(exploratory_components)
+
+confirmatory_str <- paste(confirmatory_components, collapse = ", ")
+exploratory_str  <- if (n_exploratory > 0) {
+  paste(exploratory_components, collapse = ", ")
+} else {
+  "none"
+}
+
+# Sample summary from the first available stage1 model.
+sample_n_subj  <- NA_integer_
+sample_n_trial <- NA_integer_
+if (length(stage1_models) > 0) {
+  first_model <- stage1_models[[1]]
+  sample_n_subj  <- as.integer(lme4::ngrps(first_model)["participant_id"])
+  sample_n_trial <- as.integer(nobs(first_model))
+}
+
+# Design description (face-locked, E1 only).
+design_desc <- paste(
+  "Experiment 1 used a sequential design in which the proposer's face was",
+  "presented before the offer. The present analysis is FACE-LOCKED: ERPs are",
+  "time-locked to face onset, at which point the upcoming offer has not yet",
+  "been shown. Emotion (five facial expressions: neutral, affiliative,",
+  "disgust, dominance, reward) is therefore the sole experimental factor;",
+  "offer fairness is not a factor at face onset and is not modeled. This",
+  "face-locked analysis is reported as supplementary to the offer-locked",
+  "analyses.")
+
+# Method-dependent framing (Alday baseline-as-covariate vs traditional
+# subtraction), spliced into the writeLines vector below (c() flattens).
+if (use_baseline_covariate) {
+  baseline_para <- c(
+    "Single-trial ERP amplitudes were analyzed using the Alday (2019)",
+    "baseline-as-covariate framework, in which baseline amplitude is fitted",
+    "as a fixed-effect covariate rather than subtracted from the epoch. This",
+    "is the PRIMARY face-phase analysis. Baseline amplitude was mean-centered",
+    "(per Alday 2019) but kept on the microvolt scale.")
+  fixed_spec_para <- c(
+    "### Fixed-effect specification (Alday)",
+    "",
+    "For each component the fixed-effect search space was the pairwise model",
+    "amplitude ~ (emotion + Baseline_c)^2. The core terms emotion and",
+    "Baseline_c were forced to be retained via buildmer's 'include' argument;",
+    "the emotion:Baseline_c interaction was subjected to LRT-based inclusion",
+    "testing within the same buildmer call.")
+  stage2_para <- c(
+    "### Stage 2: individual-difference analyses (trait role by theory)",
+    "",
+    "Stage 2 (Alday analysis only) partitioned the individual-difference",
+    "measures by their theoretical role rather than entering them as a single",
+    "covariate block. (A) Two traits with established literature support -",
+    "Social Value Orientation (SVO_angle) and Negative Affectivity - were",
+    "tested as confirmatory MODERATORS: for each, a single LMM was refit with",
+    "the two-way emotion x trait_z interaction plus the Alday baseline",
+    "covariate, reusing the Stage 1 random-effects structure (Snijders &",
+    "Bosker, 2012); Type III F-tests with cascading Satterthwaite ->",
+    "Kenward-Roger -> Wald inference, Benjamini-Hochberg FDR within trait",
+    "across components.",
+    "",
+    "(B) The three cover-story belief ratings (Rating_1/2/3) are manipulation",
+    "checks, not theoretical moderators; they were entered as grand-mean-",
+    "centered MAIN-EFFECT NUISANCE COVARIATES (no interaction) in a separate",
+    "control model, to confirm the emotion effect is robust to belief strength",
+    "and to report each rating's main-effect association with amplitude. The",
+    "primary Stage 1 inference was left unchanged.",
+    "",
+    "(C) The five PID-5-BF maladaptive personality dimensions (Detachment,",
+    "Antagonism, Disinhibition, Anankastia, Psychoticism) lack direct",
+    "literature support and were screened in a secondary BLUP-based",
+    "exploratory analysis: per-participant emotion random-slope BLUPs were",
+    "weighted-regressed (weights 1/SE^2) against each dimension, with",
+    "within-group BH-FDR correction and a Spearman rank check. These",
+    "exploratory tests are reported in Supplementary Materials only.")
+} else {
+  baseline_para <- c(
+    "Single-trial ERP amplitudes, baseline-corrected by subtraction of the",
+    "mean pre-stimulus interval (-200 to 0 ms) during preprocessing, were",
+    "analyzed. This traditional baseline-subtraction analysis is reported as a",
+    "SENSITIVITY check on the primary Alday baseline-as-covariate analysis.")
+  fixed_spec_para <- c(
+    "### Fixed-effect specification (traditional baseline subtraction)",
+    "",
+    "For each component the fixed-effect model was amplitude ~ emotion. No",
+    "baseline covariate is included because baseline was subtracted upstream.")
+  stage2_para <- c(
+    "### Stage 2",
+    "",
+    "Stage 2 trait-moderation analysis is deliberately not run in this",
+    "traditional baseline-subtraction sensitivity analysis; see",
+    "STAGE2_DISABLED_README.md for the rationale.")
+}
+
+writeLines(c(
+  sprintf("# Methods Paragraph (EEG Single-trial LMM, %s)", experiment_version),
+  "",
+  sprintf("Generated: %s", format(Sys.time(), "%Y-%m-%d %H:%M:%S")),
+  "",
+  "## Statistical Analysis",
+  "",
+  baseline_para,
+  "",
+  "Mixed-effects models were fitted in R with the lme4",
+  sprintf("(%s) and lmerTest (%s) packages.",
+          packageVersion("lme4"), packageVersion("lmerTest")),
+  "Categorical predictors used sum-to-zero contrasts (R option contr.sum)",
+  "to support valid Type III tests in the presence of interactions",
+  "(Schad, Vasishth, Hohenstein, & Kliegl, 2020). Trials were excluded",
+  "if |amplitude| > 200 microvolts at any electrode (HU pipeline",
+  "peak-to-peak rejection, marked as NaN in the single-trial data),",
+  "if the participant did not respond (reaction == 0), or if the",
+  sprintf("response time fell outside [%d, %d] ms. (Unlike the offer-phase",
+          rt_lower_ms, rt_upper_ms),
+  "analysis, no 7:3 filler exclusion is applied: the face is identical",
+  "regardless of the as-yet-unseen offer, so all emotion trials are valid",
+  "face trials.) The response-based criteria were applied at the analysis",
+  "layer rather than in upstream",
+  "preprocessing, to keep the canonical trials.csv as a single source",
+  "of truth and to maintain identical inclusion logic across the",
+  "parallel behavioral analysis (Sta_Behaviour_RefAlday.Rmd) and the",
+  "Stage 1 EEG analysis reported here.",
+  "",
+  "### Components and confirmatory framing",
+  "",
+  design_desc,
+  "",
+  sprintf("Face-locked components fitted as confirmatory analyses: %s.",
+          confirmatory_str),
+  sprintf("Face-locked components fitted as exploratory analyses: %s.", exploratory_str),
+  "The confirmatory/exploratory label is a reporting-layer distinction",
+  "(it sets the FDR family); all components run the identical Stage 1",
+  "pipeline. Exploratory components are reported descriptively only.",
+  "",
+  fixed_spec_para,
+  "",
+  "### Random-effects structure",
+  "",
+  "Random-effects structures were selected following the parsimonious-",
+  "Bates protocol (Bates, Kliegl, Vasishth, & Baayen, 2015; Matuschek,",
+  "Kliegl, Vasishth, Baayen, & Bates, 2017). For each component:",
+  "Step 1 specified a maximal model with main-effect random slopes and",
+  "full correlations (interaction random slopes were omitted because",
+  "cell-level variance components rarely identify in single-trial EEG",
+  "with typical N). Step 2 fitted a zero-correlation-parameter (ZCP)",
+  "model. Step 3 used buildmer LRT-based backward elimination at",
+  "alpha = 0.20 (Matuschek et al., 2017). Step 4 tested whether adding",
+  "correlation parameters improved fit. Step 5 ran rePCA dimensionality",
+  "diagnostics to confirm that the final structure was data-supported.",
+  "Stimulus identity was counterbalanced via Latin-square design and",
+  "was not modeled as a separate random effect (cf. Westfall, Kenny, &",
+  "Judd, 2014).",
+  "",
+  "### Inferential strategy",
+  "",
+  "Fixed-effect inference used a Type III F-test with denominator",
+  "degrees of freedom approximated via a cascading method preference:",
+  "Satterthwaite (Kuznetsova, Brockhoff, & Christensen, 2017; Luke,",
+  "2017) was attempted first; on numerical failure, Kenward-Roger",
+  "(Kenward & Roger, 1997; via the pbkrtest backend) was attempted",
+  "next; Wald chi-square (car::Anova) was used only as a final",
+  "fallback. The method actually used per component is reported in",
+  "supplementary tables. Post-hoc contrasts were computed using emmeans",
+  "(Lenth, 2024) with asymptotic standard errors and false-discovery-",
+  "rate (FDR) correction within each effect family.",
+  "",
+  "### Effect-size reporting",
+  "",
+  "Partial eta-squared with 95% confidence intervals are reported",
+  "alongside F-tests (effectsize::eta_squared). Marginal and conditional",
+  "R-squared (Nakagawa & Schielzeth, 2013) are reported per component.",
+  "All contrast estimates are reported in microvolts with 95% CIs.",
+  "",
+  "### Post-hoc",
+  "",
+  "Pairwise comparisons among the five emotion levels (FDR-corrected) were",
+  "computed for every component and tagged by the omnibus emotion effect:",
+  "Confirmatory (p < 0.05), Exploratory_Marginal (0.05 <= p < 0.10), or NS.",
+  "",
+  stage2_para,
+  "",
+  "## Sample",
+  "",
+  if (!is.na(sample_n_trial) && !is.na(sample_n_subj)) {
+    sprintf("%d trials from %d participants entered Stage 1 analysis (%s).",
+            sample_n_trial, sample_n_subj, experiment_version)
+  } else "Sample size: extraction failed; check stage1_models.",
+  "",
+  "## References (cite as appropriate)",
+  "",
+  "Alday, P. M. (2019). How much baseline correction do we need in ERP",
+  "  research? Extended GLM model can replace baseline correction while",
+  "  lifting its limits. Psychophysiology, 56, e13451.",
+  "Bates, D., Kliegl, R., Vasishth, S., & Baayen, R. H. (2015).",
+  "  Parsimonious mixed models. arXiv:1506.04967.",
+  "Halekoh, U., & Hojsgaard, S. (2014). A Kenward-Roger approximation",
+  "  and parametric bootstrap methods for tests in linear mixed models",
+  "  -- the R package pbkrtest. Journal of Statistical Software, 59(9).",
+  "Kenward, M. G., & Roger, J. H. (1997). Small sample inference for",
+  "  fixed effects from restricted maximum likelihood. Biometrics, 53,",
+  "  983-997.",
+  "Kuznetsova, A., Brockhoff, P. B., & Christensen, R. H. B. (2017).",
+  "  lmerTest package: Tests in linear mixed effects models. Journal of",
+  "  Statistical Software, 82(13).",
+  "Lenth, R. V. (2024). emmeans: Estimated marginal means.",
+  "Luke, S. G. (2017). Evaluating significance in linear mixed-effects",
+  "  models in R. Behavior Research Methods, 49, 1494-1502.",
+  "Matuschek, H., Kliegl, R., Vasishth, S., Baayen, H., & Bates, D.",
+  "  (2017). Balancing Type I error and power in linear mixed models.",
+  "  Journal of Memory and Language, 94, 305-315.",
+  "Nakagawa, S., & Schielzeth, H. (2013). A general and simple method",
+  "  for obtaining R^2 from generalized linear mixed-effects models.",
+  "  Methods in Ecology and Evolution, 4, 133-142.",
+  "Schad, D. J., Vasishth, S., Hohenstein, S., & Kliegl, R. (2020).",
+  "  How to capitalize on a priori contrasts in linear (mixed) models.",
+  "  Journal of Memory and Language, 110, 104038.",
+  "Westfall, J., Kenny, D. A., & Judd, C. M. (2014). Statistical power",
+  "  and optimal design in experiments in which samples of participants",
+  "  respond to samples of stimuli. Journal of Experimental Psychology:",
+  "  General, 143, 2020-2045.",
+  "",
+  "References added in v2.2 (single-stage moderation rationale):",
+  "Hofmann, D. A., & Rovine, M. J. (2007). Multilevel models in",
+  "  organizational and management research. In Modern Methods for",
+  "  Business Research. Lawrence Erlbaum.",
+  "Krueger, R. F., Derringer, J., Markon, K. E., Watson, D., &",
+  "  Skodol, A. E. (2012). Initial construction of a maladaptive",
+  "  personality trait model and inventory for DSM-5. Psychological",
+  "  Medicine, 42, 1879-1890.",
+  "Rouder, J. N., & Haaf, J. M. (2019). A psychometrics of",
+  "  individual differences in experimental tasks. Psychonomic",
+  "  Bulletin & Review, 26, 452-467.",
+  "Snijders, T. A. B., & Bosker, R. J. (2012). Multilevel Analysis:",
+  "  An Introduction to Basic and Advanced Multilevel Modeling",
+  "  (2nd ed.). Sage.",
+  "Wu, Y., Liu, J., Qu, L., Eisenegger, C., Clark, L., & Zhou, X.",
+  "  (2021). Social value orientation modulates fairness processing",
+  "  during social decision-making: evidence from behavior and brain",
+  "  potentials. Social Cognitive and Affective Neuroscience, 16,",
+  "  670-682."
+), methods_path)
+
+cat(sprintf("[Methods] Auto-generated paragraph: %s\n", methods_path))
+```
+
+``` {r session-info}
+# ==============================================================================
+# 9. Session Information
+# ==============================================================================
+sink(file.path(out_root, "SESSION_INFO.txt"))
+print(sessionInfo())
+sink()
+
+cat(sprintf("\n========================================\n   %s pipeline complete.\n   Output: %s\n========================================\n",
+            experiment_version, out_root))
+sessionInfo()
+```

@@ -1,19 +1,16 @@
-Table: Stage 2 Confirmatory single-stage moderation: SVO_angle. Within-trait BH-FDR across n_tests = 15 (components x 3 interaction terms).
+Table: Stage 2 Confirmatory single-stage moderation: SVO_angle. Within-trait BH-FDR across n_tests = 12 (components x 3 interaction terms).
 
-|   |component |term                       |F_or_Chisq | df_num|    df_den|p_raw    |ddf_used      |p_fdr    |Sig_fdr |trait     |
-|:--|:---------|:--------------------------|:----------|------:|---------:|:--------|:-------------|:--------|:-------|:---------|
-|10 |N170      |emotion:trait_z            |14.906     |      4| 106691.00|< 0.0001 |Satterthwaite |< 0.0001 |***     |SVO_angle |
-|5  |N400      |offer_type:trait_z         |25.819     |      1| 106691.00|< 0.0001 |Satterthwaite |< 0.0001 |***     |SVO_angle |
-|13 |EPN       |emotion:trait_z            |5.454      |      4| 106663.21|0.000218 |Satterthwaite |0.000818 |***     |SVO_angle |
-|9  |LPP_offer |emotion:offer_type:trait_z |5.595      |      4| 106663.07|0.000168 |Satterthwaite |0.000818 |***     |SVO_angle |
-|12 |N170      |emotion:offer_type:trait_z |3.608      |      4| 106691.00|0.006038 |Satterthwaite |0.016043 |*       |SVO_angle |
-|11 |N170      |offer_type:trait_z         |7.430      |      1| 106691.00|0.006417 |Satterthwaite |0.016043 |*       |SVO_angle |
-|3  |FRN       |emotion:offer_type:trait_z |3.375      |      4| 106691.01|0.009076 |Satterthwaite |0.018321 |*       |SVO_angle |
-|2  |FRN       |offer_type:trait_z         |6.676      |      1| 106691.00|0.009771 |Satterthwaite |0.018321 |*       |SVO_angle |
-|15 |EPN       |emotion:offer_type:trait_z |3.003      |      4| 106663.05|0.017257 |Satterthwaite |0.028761 |*       |SVO_angle |
-|1  |FRN       |emotion:trait_z            |2.723      |      4| 106691.00|0.027795 |Satterthwaite |0.041692 |*       |SVO_angle |
-|6  |N400      |emotion:offer_type:trait_z |1.581      |      4| 106691.02|0.176331 |Satterthwaite |0.240451 |ns      |SVO_angle |
-|14 |EPN       |offer_type:trait_z         |1.628      |      1|     27.93|0.212446 |Satterthwaite |0.265557 |ns      |SVO_angle |
-|7  |LPP_offer |emotion:trait_z            |1.171      |      4| 106663.18|0.321311 |Satterthwaite |0.370744 |ns      |SVO_angle |
-|8  |LPP_offer |offer_type:trait_z         |0.543      |      1|     27.96|0.467465 |Satterthwaite |0.500855 |ns      |SVO_angle |
-|4  |N400      |emotion:trait_z            |0.293      |      4| 106691.01|0.882891 |Satterthwaite |0.882891 |ns      |SVO_angle |
+|   |component  |term                       |F_or_Chisq | df_num|   df_den|p_raw    |ddf_used      |p_fdr    |Sig_fdr |trait     |
+|:--|:----------|:--------------------------|:----------|------:|--------:|:--------|:-------------|:--------|:-------|:---------|
+|4  |LPP_pre    |emotion:trait_z            |6.719      |      4| 85315.09|< 0.0001 |Satterthwaite |0.000253 |***     |SVO_angle |
+|10 |P3_explor  |emotion:trait_z            |6.077      |      4| 85315.08|< 0.0001 |Satterthwaite |0.000417 |***     |SVO_angle |
+|3  |FRN_pre    |emotion:offer_type:trait_z |4.180      |      4| 85343.01|0.00219  |Satterthwaite |0.007305 |**      |SVO_angle |
+|2  |FRN_pre    |offer_type:trait_z         |9.189      |      1| 85343.00|0.00243  |Satterthwaite |0.007305 |**      |SVO_angle |
+|12 |P3_explor  |emotion:offer_type:trait_z |3.976      |      4| 85315.01|0.00315  |Satterthwaite |0.007566 |**      |SVO_angle |
+|6  |LPP_pre    |emotion:offer_type:trait_z |3.453      |      4| 85315.02|0.00792  |Satterthwaite |0.015843 |*       |SVO_angle |
+|9  |FRN_explor |emotion:offer_type:trait_z |1.985      |      4| 85343.01|0.09382  |Satterthwaite |0.160841 |ns      |SVO_angle |
+|1  |FRN_pre    |emotion:trait_z            |1.263      |      4| 85343.00|0.28196  |Satterthwaite |0.422946 |ns      |SVO_angle |
+|5  |LPP_pre    |offer_type:trait_z         |0.999      |      1|    27.94|0.32603  |Satterthwaite |0.434705 |ns      |SVO_angle |
+|11 |P3_explor  |offer_type:trait_z         |0.696      |      1|    27.95|0.41114  |Satterthwaite |0.493372 |ns      |SVO_angle |
+|7  |FRN_explor |emotion:trait_z            |0.617      |      4| 85343.01|0.65053  |Satterthwaite |0.709665 |ns      |SVO_angle |
+|8  |FRN_explor |offer_type:trait_z         |0.000      |      1| 85343.00|0.98386  |Satterthwaite |0.983857 |ns      |SVO_angle |

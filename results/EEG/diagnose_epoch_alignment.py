@@ -70,27 +70,24 @@ INCL_OFFERS    = [5, 6, 8, 9]
 INCL_RT_MIN_MS = 300
 INCL_RT_MAX_MS = 3000
 
-# Component window and ROI specs — must match upstream HU pipeline component
-# definition (Pipline_UG_OfferPhase.Rmd). FRN window differs by experiment.
-COMPONENT_WINDOWS_E2 = {
-    "N170":      (0.150, 0.200),
-    "EPN":       (0.250, 0.350),
-    "FRN":       (0.200, 0.250),
-    "N400":      (0.350, 0.450),
-    "LPP_offer": (0.500, 0.800),
-}
-COMPONENT_WINDOWS_E1 = {
-    "EPN":       (0.250, 0.350),
-    "FRN":       (0.250, 0.300),
-    "N400":      (0.350, 0.450),
-    "LPP_offer": (0.500, 0.800),
-}
+# Component window and ROI specs are read from the single source of truth
+# shared with the pipeline, stats, and viz scripts: config/erp_components.csv
+# (t_min/t_max in SECONDS; roi pipe-delimited). Edit ONLY that file to change
+# a window/ROI or add/remove a component.
+_COMP_CSV = PROJECT_ROOT / "config" / "erp_components.csv"
+if not _COMP_CSV.exists():
+    sys.exit(f"[ABORT] Component config not found: {_COMP_CSV}")
+_COMP_DF = pd.read_csv(_COMP_CSV)
+# Windows are now EXPERIMENT-SPECIFIC (FRN differs E1 vs E2); build per experiment.
+def _windows_for(exp):
+    sub = _COMP_DF[_COMP_DF['experiment'] == exp]
+    return {row['comp_name']: (float(row['t_min']), float(row['t_max']))
+            for _, row in sub.iterrows()}
+COMPONENT_WINDOWS_E1 = _windows_for("E1")
+COMPONENT_WINDOWS_E2 = _windows_for("E2")
 COMPONENT_ROIS = {
-    "N170":      ["P7", "P8", "PO7", "PO8"],
-    "EPN":       ["PO7", "PO8", "P7", "P8", "O1", "O2"],
-    "FRN":       ["F3", "Fz", "F4", "FC1", "FC2", "Cz"],
-    "N400":      ["Cz", "CPz", "Pz"],
-    "LPP_offer": ["Pz", "Cz", "C1", "C2", "CP1", "CP2"],
+    row['comp_name']: str(row['roi']).split('|')
+    for _, row in _COMP_DF.iterrows()
 }
 
 # Tolerance for Sanity 4. Floating-point recomputation of a mean over the
