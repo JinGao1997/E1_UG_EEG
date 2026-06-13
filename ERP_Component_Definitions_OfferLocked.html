@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Offer-locked ERP component definitions (FRN &amp; late positivity)</title>
+<style>
+  :root{ --ink:#1a2230; --muted:#5b6776; --line:#e2e6ec; --pre:#1f6f54; --exp:#9a5b1f;
+         --prebg:#eef7f3; --expbg:#fbf3e9; --warnbg:#fdf0ef; --warn:#b3402f; }
+  *{ box-sizing:border-box; }
+  body{ font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif; color:var(--ink);
+        line-height:1.55; max-width:980px; margin:32px auto; padding:0 22px; }
+  h1{ font-size:25px; margin:0 0 4px; }
+  .sub{ color:var(--muted); margin:0 0 22px; font-size:14px; }
+  h2{ font-size:19px; margin:34px 0 10px; padding-bottom:6px; border-bottom:2px solid var(--line); }
+  h3{ font-size:16px; margin:22px 0 6px; }
+  p{ margin:8px 0; }
+  table{ border-collapse:collapse; width:100%; margin:12px 0 18px; font-size:14px; }
+  th,td{ border:1px solid var(--line); padding:7px 10px; text-align:left; vertical-align:top; }
+  th{ background:#f5f7fa; font-weight:600; }
+  code{ background:#f2f4f7; padding:1px 5px; border-radius:4px; font-size:13px; }
+  .tag{ display:inline-block; font-size:11px; font-weight:700; letter-spacing:.04em;
+        padding:2px 8px; border-radius:999px; text-transform:uppercase; }
+  .tag.pre{ color:var(--pre); background:var(--prebg); }
+  .tag.exp{ color:var(--exp); background:var(--expbg); }
+  tr.prebg td:first-child{ box-shadow:inset 4px 0 0 var(--pre); }
+  tr.expbg td:first-child{ box-shadow:inset 4px 0 0 var(--exp); }
+  .box{ border:1px solid var(--line); border-radius:10px; padding:14px 16px; margin:14px 0; background:#fafbfc; }
+  .warn{ border:1px solid #f0cdc8; background:var(--warnbg); border-radius:10px; padding:14px 16px; margin:14px 0; }
+  .warn b{ color:var(--warn); }
+  ul{ margin:8px 0; padding-left:22px; }
+  li{ margin:4px 0; }
+  .small{ font-size:13px; color:var(--muted); }
+  .refs{ font-size:13px; }
+  .refs li{ margin:6px 0; }
+  footer{ margin-top:34px; padding-top:12px; border-top:1px solid var(--line); color:var(--muted); font-size:12px; }
+  @media print{ body{ margin:0; } a{ color:inherit; } }
+</style>
+</head>
+<body>
+
+<h1>Offer-locked ERP component definitions &mdash; FRN &amp; late positivity</h1>
+<p class="sub">Ultimatum Game EEG study (E1 sequential, E2 simultaneous) &middot; offer-phase fairness analysis &middot; prepared 2026-06-07</p>
+
+<div class="box">
+  <b>Reporting structure (agreed with W. Sommer).</b> Two tiers are reported, in this order, for transparency:
+  <span class="tag pre">Preregistered</span> analyses first (exactly as registered), then
+  <span class="tag exp">Exploratory</span> analyses using the data-driven peak-based definitions below.
+  Both tiers are extracted in a single pipeline pass and analysed with the same single-trial LMM amplitude approach.
+</div>
+
+<h2>1&nbsp;&nbsp;Summary of all component definitions</h2>
+<table>
+  <thead>
+    <tr><th>Tier</th><th>Component</th><th>ROI (electrodes)</th><th>Window E1</th><th>Window E2</th><th>Pipeline name</th></tr>
+  </thead>
+  <tbody>
+    <tr class="prebg"><td><span class="tag pre">Pre</span></td><td><b>FRN</b></td><td>F3, Fz, F4, FC1, FC2, Cz</td><td>252&ndash;304 ms</td><td>192&ndash;244 ms</td><td><code>FRN_pre</code></td></tr>
+    <tr class="prebg"><td><span class="tag pre">Pre</span></td><td><b>LPP</b></td><td>Pz, Cz, C1, C2, CP1, CP2</td><td>400&ndash;600 ms</td><td>400&ndash;600 ms</td><td><code>LPP_pre</code></td></tr>
+    <tr class="expbg"><td><span class="tag exp">Expl</span></td><td><b>FRN</b></td><td>Fz, FC1, FC2, Cz</td><td>310&ndash;360 ms</td><td>324&ndash;376 ms</td><td><code>FRN_explor</code></td></tr>
+    <tr class="expbg"><td><span class="tag exp">Expl</span></td><td><b>P3</b></td><td>Cz, CPz, Pz, CP1, CP2</td><td>490&ndash;590 ms</td><td>490&ndash;590 ms</td><td><code>P3_explor</code></td></tr>
+  </tbody>
+</table>
+<p class="small">Windows in milliseconds; stored in seconds in <code>config/erp_components.csv</code>. FRN windows are
+experiment-specific; the late component window is common to E1 and E2.</p>
+
+<h2>2&nbsp;&nbsp;FRN (fronto-central; Unfair &minus; Fair)</h2>
+
+<h3><span class="tag pre">Preregistered</span></h3>
+<p><b>ROI:</b> F3, Fz, F4, FC1, FC2, Cz. &nbsp; <b>Search range:</b> 200&ndash;300 ms.
+<b>Window selection:</b> peak detection across all conditions using a collapsed-localizer technique
+(Luck &amp; Gaspelin, 2017) &mdash; the measurement window is centred (&plusmn;25 ms) on the most-negative
+peak of the <i>condition-collapsed grand average</i> at the FRN ROI within 200&ndash;300 ms.</p>
+<table>
+  <thead><tr><th>Experiment</th><th>Collapsed-localizer peak (200&ndash;300 ms)</th><th>Resulting window (peak &plusmn;25 ms)</th></tr></thead>
+  <tbody>
+    <tr><td>E1</td><td>278 ms</td><td><b>253&ndash;303 ms</b></td></tr>
+    <tr><td>E2</td><td>218 ms</td><td><b>193&ndash;243 ms</b></td></tr>
+  </tbody>
+</table>
+<p style="font-size:0.9em;color:#555;"><b>Sampling-grid note.</b> Epochs are sampled at 500 Hz on an even-millisecond grid.
+The &plusmn;25 ms edges (odd ms) are rounded <i>outward</i> to the nearest sample, so the stated window equals the
+time points actually averaged: <b>E1 252&ndash;304 ms</b>, <b>E2 192&ndash;244 ms</b>. This is a numeric no-op
+(MNE already realizes the &plusmn;25 ms spec as exactly these samples).</p>
+<div class="warn">
+  <b>Caveat for E2 (report transparently).</b> In E2 the face and offer appear simultaneously, so the
+  200&ndash;300 ms range contains a large early <b>visual</b> negativity (peaking ~218 ms, ~&minus;3.3 µV) that is
+  most likely face-evoked rather than the feedback-related FRN. Applying the preregistered rule therefore
+  places the E2 window on this early visual deflection; the genuine fronto-central FRN appears later
+  (&gt;300 ms), which motivates the exploratory window below. The preregistered E2 result is reported as-is,
+  with this limitation noted.
+</div>
+
+<h3><span class="tag exp">Exploratory</span></h3>
+<p><b>ROI:</b> Fz, FC1, FC2, Cz (medial fronto-central). &nbsp; <b>Search range:</b> 250&ndash;350 ms.
+<b>Window selection:</b> most-negative peak of the <i>emotion-collapsed Unfair &minus; Fair difference wave</i>
+at the FRN ROI, &plusmn;25 ms.</p>
+<table>
+  <thead><tr><th>Experiment</th><th>Difference-wave peak (250&ndash;350 ms)</th><th>Resulting window (peak &plusmn;25 ms)</th></tr></thead>
+  <tbody>
+    <tr><td>E1</td><td>334 ms</td><td><b>310&ndash;360 ms</b></td></tr>
+    <tr><td>E2</td><td>350 ms</td><td><b>325&ndash;375 ms</b></td></tr>
+  </tbody>
+</table>
+<p style="font-size:0.9em;color:#555;"><b>Sampling-grid note.</b> Rounded outward to the even-ms 500 Hz grid for analysis:
+<b>E2 324&ndash;376 ms</b> (E1 310&ndash;360 already on-grid).</p>
+
+<div class="box">
+  <b>FRN ROI rationale.</b> The exploratory ROI drops <b>F3</b> and <b>F4</b> relative to the preregistered ROI.
+  F3/F4 are more anterior/frontal than the electrodes typically emphasised for the FRN; they had originally been
+  included to compensate for <b>FCz</b> being unavailable (FCz was the recording ground electrode). However, in the
+  Cartool maps F3/F4 emphasise an atypical right-frontal lateralised negativity that may bias the FRN interpretation,
+  so the exploratory analysis focuses on the medial fronto-central electrodes (Fz, FC1, FC2, Cz).
+</div>
+
+<h2>3&nbsp;&nbsp;Late positivity &mdash; preregistered LPP / exploratory P3</h2>
+
+<h3><span class="tag pre">Preregistered (LPP)</span></h3>
+<p><b>ROI:</b> Pz, Cz, C1, C2, CP1, CP2. &nbsp; <b>Window:</b> 400&ndash;600 ms (fixed; both experiments;
+Abdel Rahman, 2011). Mean amplitude over the fixed window.</p>
+
+<h3><span class="tag exp">Exploratory (P3)</span></h3>
+<p><b>ROI:</b> Cz, CPz, Pz, CP1, CP2 (centro-parietal). &nbsp; <b>Search range:</b> 300&ndash;700 ms.
+<b>Window selection:</b> most-positive peak of the <i>condition-collapsed grand average</i> at the P3 ROI.</p>
+<table>
+  <thead><tr><th>Experiment</th><th>Grand-average peak (300&ndash;700 ms)</th><th>Window used</th></tr></thead>
+  <tbody>
+    <tr><td>E1</td><td>522 ms</td><td rowspan="2" style="vertical-align:middle"><b>490&ndash;590 ms</b><br><span class="small">single common window (similar timing across experiments)</span></td></tr>
+    <tr><td>E2</td><td>548 ms</td></tr>
+  </tbody>
+</table>
+<div class="box">
+  <b>P3 ROI rationale.</b> The exploratory P3 ROI overlaps the preregistered LPP ROI but is adjusted toward the
+  typical centro-parietal P3 distribution: relative to the preregistered ROI (Pz, Cz, C1, C2, CP1, CP2) it
+  <b>drops C1 and C2</b> and <b>adds CPz</b>. The window (490&ndash;590 ms) is close to the preregistered 400&ndash;600 ms
+  LPP window but targets the later centro-parietal positivity seen in the present data.
+</div>
+
+<h2>4&nbsp;&nbsp;Window-derivation method (both tiers)</h2>
+<p>All windows are set by a peak-based rule within a predefined search interval, then mean amplitude is measured in
+that window (per component &times; ROI) and entered into the single-trial LMM amplitude analyses. The localizers differ
+by tier:</p>
+<ul>
+  <li><span class="tag pre">Preregistered</span> FRN &mdash; <b>collapsed localizer</b> on the condition-collapsed grand average (Luck &amp; Gaspelin, 2017).</li>
+  <li><span class="tag exp">Exploratory</span> FRN &mdash; peak of the <b>Unfair &minus; Fair difference wave</b> (targets the fairness effect).</li>
+  <li><span class="tag exp">Exploratory</span> P3 &mdash; peak of the <b>condition-collapsed grand average</b>.</li>
+  <li>Preregistered LPP uses a fixed 400&ndash;600 ms window (no peak step).</li>
+</ul>
+<p class="small">Peak detection used the baseline-corrected (Standard) grand averages; half-window = &plusmn;25 ms.
+This proposal is broadly consistent with the Cartool topographic segmentation, which helped separate the earlier
+fronto-central activity from the later centro-parietal positivity. The exploratory FRN windows are later than the
+preregistered 200&ndash;300 ms range but fall within the range summarised by Liang et al. (2026).</p>
+
+<h2>5&nbsp;&nbsp;References (as cited in the preregistration / proposal)</h2>
+<ol class="refs">
+  <li>Abdel Rahman, R. (2011). &mdash; preregistered LPP window/ROI.</li>
+  <li>Kaltwasser, L., et&nbsp;al. (2016). &mdash; preregistered FRN range.</li>
+  <li>Rodrigues, J., et&nbsp;al. (2024). &mdash; preregistered FRN range.</li>
+  <li>Luck, S.&nbsp;J., &amp; Gaspelin, N. (2017). &mdash; collapsed-localizer technique.</li>
+  <li>Liang et&nbsp;al. (2026). &mdash; meta-analysis on proposer features &amp; inequity-aversion ERPs (FRN range).</li>
+</ol>
+<p class="small">Full citations to be completed from the manuscript reference list.</p>
+
+<footer>
+  Source of truth: <code>config/erp_components.csv</code> (8 rows = 2 tiers &times; 2 components &times; 2 experiments).
+  Every analysis/visualisation script reads this file at startup; changing a window or ROI means editing only the CSV
+  and re-running. Component names: <code>FRN_pre</code>, <code>LPP_pre</code>, <code>FRN_explor</code>, <code>P3_explor</code>.
+</footer>
+
+</body>
+</html>

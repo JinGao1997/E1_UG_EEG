@@ -242,6 +242,10 @@ log/
 !config/erp_components.csv
 !config/erp_components_face_E1.csv
 
+# Offer-locked ERP component-definition report (HTML) — tracked despite the
+# global *.html ignore.
+!ERP_Component_Definitions_OfferLocked.html
+
 
 ############################################
 # 10) Keep analysis scripts under results
