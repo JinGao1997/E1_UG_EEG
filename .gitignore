@@ -138,8 +138,9 @@ _LOCAL_ONLY_BACKUP/
 # CLAUDE.md: references are local-only).
 docs/references/
 
-# Project-specific Claude Code instructions: keep local, do not upload.
-.claude/CLAUDE.md
+# Project-specific Claude Code config (instructions, rules, local settings):
+# keep entirely local, do not upload to the public repo.
+.claude/
 
 # Scratch / one-off patcher scripts.
 _*.py
