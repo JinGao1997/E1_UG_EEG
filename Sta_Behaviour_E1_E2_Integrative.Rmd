@@ -602,21 +602,100 @@ format_descriptives_table <- function(df, group_vars = c("emotion", "offer_type"
 # When performance::r2 fails (e.g., 3-way GLMM with complex random structure),
 # returns a placeholder row with NAs and a note.
 extract_r2_table <- function(model, analysis_name) {
-  r2_obj <- tryCatch(performance::r2(model), error = function(e) NULL)
-  if (is.null(r2_obj)) {
-    return(data.frame(
-      Analysis = analysis_name,
-      R2_marginal    = NA_real_,
-      R2_conditional = NA_real_,
-      Note = "performance::r2 failed; consider MuMIn::r.squaredGLMM as alternative."
-    ))
+  # Detect a binomial GLMM (vs Gaussian LMM). For binomial GLMMs the CONDITIONAL
+  # Nakagawa R2 frequently cannot be computed because the random-effect variance
+  # is not extractable for some glmmTMB structures (performance::r2 then warns
+  # "Random effect variances not available ..."). This affects ONLY the R2 fit
+  # statistic, never the fixed-effect inference. We therefore: (i) suppress that
+  # specific warning, (ii) keep the marginal R2, and (iii) add Tjur's coefficient
+  # of discrimination (Tjur, 2009) as a binary-specific model-fit measure. Per
+  # Meteyard & Davies (2020) the model-output table should carry "some measure of
+  # model fit"; Bolker et al. (2009) do not require R2 for GLMMs at all.
+  is_binomial <- tryCatch(
+    isTRUE(grepl("binomial", stats::family(model)$family)),
+    error = function(e) inherits(model, "glmmTMB"))
+
+  r2_obj  <- tryCatch(suppressWarnings(suppressMessages(
+                        performance::r2(model, verbose = FALSE))),
+                      error = function(e) NULL)
+  r2_marg <- if (!is.null(r2_obj)) r2_obj$R2_marginal    %||% NA_real_ else NA_real_
+  r2_cond <- if (!is.null(r2_obj)) r2_obj$R2_conditional %||% NA_real_ else NA_real_
+
+  tjur_d <- if (is_binomial) {
+    tryCatch(as.numeric(suppressWarnings(suppressMessages(performance::r2_tjur(model)))),
+             error = function(e) NA_real_)
+  } else NA_real_
+
+  note <- if (is_binomial) {
+    if (is.na(r2_cond))
+      "Binomial GLMM: marginal R2 (Nakagawa-Schielzeth 2013) + Tjur's D (Tjur 2009). Conditional R2 unavailable (random-effect variance not extractable); fixed-effect inference unaffected."
+    else
+      "Binomial GLMM: Nakagawa-Schielzeth (2013) R2 + Tjur's D (Tjur 2009)."
+  } else if (is.null(r2_obj)) {
+    "performance::r2 failed; consider MuMIn::r.squaredGLMM as alternative."
+  } else {
+    "Nakagawa-Schielzeth (2013) marginal=fixed-only, conditional=fixed+random."
   }
+
   data.frame(
-    Analysis = analysis_name,
-    R2_marginal    = r2_obj$R2_marginal %||% NA_real_,
-    R2_conditional = r2_obj$R2_conditional %||% NA_real_,
-    Note = "Nakagawa-Schielzeth (2013) marginal=fixed-only, conditional=fixed+random."
+    Analysis       = analysis_name,
+    R2_marginal    = r2_marg,
+    R2_conditional = r2_cond,
+    Tjur_D         = tjur_d,
+    Note           = note,
+    stringsAsFactors = FALSE
   )
+}
+
+# LMM residual-assumption diagnostics (Meteyard & Davies 2020, Table 7
+# "Assumptions": report whether the fitted LMM meets assumptions). At single-
+# trial N, formal normality tests (e.g. Shapiro-Wilk) are over-powered and
+# reject negligible departures, so residual normality is assessed descriptively
+# (skewness and excess kurtosis ~ 0 under normality) and graphically (a best-
+# effort Q-Q + residual-vs-fitted PDF). Homoscedasticity is indexed by the
+# Spearman correlation between |residual| and fitted value (near 0 = homosced.).
+# Writes assumptions_<label>.md (+ .pdf) to out_dir. Gaussian LMMs only.
+lmm_assumption_diagnostics <- function(model, label, out_dir) {
+  r <- tryCatch(stats::residuals(model), error = function(e) NULL)
+  f <- tryCatch(stats::fitted(model),    error = function(e) NULL)
+  if (is.null(r) || is.null(f) || length(r) < 3) return(invisible(NULL))
+  if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
+  mu <- mean(r); v <- mean((r - mu)^2)
+  skew   <- if (v > 0) mean((r - mu)^3) / v^1.5 else NA_real_
+  exkurt <- if (v > 0) mean((r - mu)^4) / v^2 - 3 else NA_real_
+  homo_rho <- suppressWarnings(tryCatch(
+    stats::cor(abs(r), f, method = "spearman"), error = function(e) NA_real_))
+  tbl <- data.frame(
+    Label = label, N_residuals = length(r),
+    Residual_skewness = round(skew, 3),
+    Residual_excess_kurtosis = round(exkurt, 3),
+    Homoscedasticity_rho_absResid_fitted = round(homo_rho, 3),
+    stringsAsFactors = FALSE)
+  # Best-effort Q-Q + residual-vs-fitted figure (never breaks the run).
+  tryCatch({
+    grDevices::pdf(file.path(out_dir, sprintf("assumptions_%s.pdf", label)),
+                   width = 9, height = 4.5)
+    op <- graphics::par(mfrow = c(1, 2))
+    stats::qqnorm(r, pch = ".", main = sprintf("%s: residual Q-Q", label))
+    stats::qqline(r, col = "red")
+    plot(f, r, pch = ".", xlab = "Fitted", ylab = "Residual",
+         main = "Residual vs fitted"); graphics::abline(h = 0, col = "red")
+    graphics::par(op); grDevices::dev.off()
+  }, error = function(e) try(grDevices::dev.off(), silent = TRUE))
+  writeLines(c(
+    sprintf("# LMM residual-assumption diagnostics: %s", label),
+    sprintf("Generated: %s", format(Sys.time(), "%Y-%m-%d %H:%M:%S")),
+    "",
+    "Whether the fitted LMM meets residual assumptions (Meteyard & Davies, 2020,",
+    "Table 7). At single-trial N, formal normality tests (e.g. Shapiro-Wilk) are",
+    "over-powered, so normality is assessed descriptively (skewness and excess",
+    "kurtosis are ~0 under normality) and graphically (assumptions_*.pdf: Q-Q and",
+    "residual-vs-fitted). The homoscedasticity index is the Spearman correlation",
+    "between |residual| and fitted value (near 0 = homoscedastic).",
+    "",
+    knitr::kable(tbl, format = "markdown", row.names = FALSE)
+  ), file.path(out_dir, sprintf("assumptions_%s.md", label)))
+  invisible(tbl)
 }
 ```
 
@@ -2216,13 +2295,29 @@ write_outputs_common <- function(FINAL_MODEL, list_of_tables, list_of_supp_table
     cat("Note: Satterthwaite was attempted but failed (no p-value column or\n")
     cat("error). Wald chi-square (car::Anova) used as fallback.\n")
   }
+  if (model_family == "binomial") {
+    cat("\n## GLMM estimation & overdispersion:\n")
+    cat("Estimation:     maximum likelihood, Laplace approximation (glmmTMB).\n")
+    cat("Overdispersion: responses are Bernoulli (0/1); observation-level\n")
+    cat("                overdispersion is not identifiable (Var = p(1-p), fixed\n")
+    cat("                by the mean), so no scale/dispersion parameter was\n")
+    cat("                estimated. Wald chi-square is appropriate (Bolker\n")
+    cat("                et al., 2009).\n")
+  }
   sink()
   
   # 2. Full model summary.
   sink(file.path(out_dir, "summary_text.txt"))
   print(summary(FINAL_MODEL))
   sink()
-  
+
+  # 2b. LMM residual-assumption diagnostics (Gaussian only; Meteyard & Davies
+  # 2020, Table 7 "Assumptions"). Best-effort; never blocks the analysis.
+  if (model_family == "gaussian") {
+    tryCatch(lmm_assumption_diagnostics(FINAL_MODEL, analysis_name, out_dir),
+             error = function(e) NULL)
+  }
+
   # 3. ANOVA table in markdown.
   writeLines(
     knitr::kable(anova_apa, format = "markdown",
@@ -2687,7 +2782,20 @@ for (stage in stages_to_run) {
 3. **Response time, unfair-only (LMM_RT_unfair):** linear mixed-effects model
    on log RT restricted to unfair trials, with predictors emotion x reaction
    and their interaction. This stratum parallels HDDM decision-dynamics
-   modeling.")
+   modeling.
+
+4. **Exploratory individual-differences screen (Trait_MainEffects):** as a
+   separate exploratory analysis, each of 10 z-scored subject-level variables
+   (Social Value Orientation [SVO_angle]; the six PID5BF+ personality domains;
+   and the three post-task belief ratings) was added one at a time as a single
+   between-subjects MAIN-EFFECT covariate to the rejection (GLMM) and main RT
+   (LMM) models above, reusing each model's design-selected random structure. No
+   trait x design interaction was fitted, so a significant covariate indexes an
+   overall shift in rejection or RT, not moderation of the emotion or fairness
+   effects. Effects are reported per +1 SD with 95%% CIs and Benjamini-Hochberg
+   FDR within family (SVO / PID5BF+ / Ratings); given n ~= 30 they are
+   interpreted as exploratory. Output:
+   results/Behavior/<EXP>_TwoStage_Bates/Trait_MainEffects/.")
   } else if (stage == "Integrative") {
     stage_subtitle <- "Integrative cross-experiment analysis (E1 + E2 pooled)"
     stage_models_summary <- sprintf(
@@ -2735,6 +2843,14 @@ to support valid Type III tests in the presence of interactions (Schad,
 Vasishth, Hohenstein, & Kliegl, 2020). Trials were excluded if the
 participant did not respond (reaction = 0), if response time fell outside
 %d-%d ms, or if the offer was the medium-fairness filler (Offers_Other = 7).
+Response time was log-transformed for the linear models to stabilize variance
+and better meet the assumption of normally distributed residuals. For each
+fitted linear model, residual assumptions were assessed via residual skewness
+and excess kurtosis, a homoscedasticity index (the Spearman correlation between
+the absolute residual and the fitted value), and Q-Q and residual-vs-fitted
+plots (assumptions_<analysis>.md and .pdf in each output directory). At the
+single-trial sample sizes used here, formal normality tests are over-powered
+and were therefore not used for this purpose.
 
 %s
 
@@ -2773,7 +2889,12 @@ log. For the binomial model, Wald chi-square tests were used because
 Satterthwaite and Kenward-Roger are not defined for non-Gaussian
 likelihoods (the residual variance term they require does not exist in
 binomial likelihoods, where Var(y) is determined by the mean structure as
-p(1-p)).
+p(1-p)). Binomial models were fitted by maximum likelihood with the Laplace
+approximation (glmmTMB; Brooks et al., 2017). Because the responses are binary
+(Bernoulli, 0/1), observation-level overdispersion is not identifiable -- the
+variance p(1-p) is fixed entirely by the mean -- so no scale or dispersion
+parameter was estimated and the Wald chi-square test is appropriate (Bolker
+et al., 2009).
 
 Post-hoc contrasts were computed using the emmeans package (Lenth, 2024)
 with asymptotic standard errors and false-discovery-rate (FDR) correction
@@ -2784,9 +2905,11 @@ within each effect family.
 For Gaussian models, partial eta-squared with 95%% confidence intervals are
 reported alongside F-tests (effectsize::eta_squared). For the binomial
 model, partial eta-squared is not defined; odds ratios with 95%% CIs are
-reported for fixed-effect contrasts, and marginal/conditional R-squared
-(Nakagawa-Schielzeth, 2013) are reported for overall model fit. For
-log-RT contrasts, percent RT change is reported as (exp(b) - 1) x 100.
+reported for fixed-effect contrasts, and marginal R-squared (Nakagawa-
+Schielzeth, 2013) together with the Tjur (2009) coefficient of discrimination
+are reported for overall model fit (the conditional R-squared is reported
+additionally when the random-effect variance is extractable). For log-RT
+contrasts, percent RT change is reported as (exp(b) - 1) x 100.
 
 ### Post-hoc gating
 
@@ -2840,6 +2963,403 @@ the unfair-only stratum included %d trials.
 
 cat(sprintf("\n\n========================================\n   ALL STAGES COMPLETE.\n   Total elapsed: %s\n   Output root: %s\n========================================\n",
             format_elapsed(pipeline_t0), out_root_base))
+```
+
+``` {r trait-maineffect-screen}
+# ==============================================================================
+# 7b. Exploratory individual-differences (trait) main-effect screen  [E1, E2]
+# ==============================================================================
+# PURPOSE. A screen of whether stable between-subjects characteristics shift
+# OVERALL task behaviour. For each experiment SEPARATELY (E1, E2; NOT the pooled
+# Integrative stage), and for each of the two primary behavioural outcomes
+# (rejection: reject_binary, GLMM binomial; speed: logRT, LMM Gaussian), each
+# candidate variable is added as a single grand-standardized (z) MAIN-EFFECT
+# covariate on top of the already-selected design model:
+#
+#   <outcome> ~ (emotion + offer_type)^2 + <var>_z + <design random structure>
+#
+# The design random structure is inherited from the corresponding primary model
+# (Section 7) so the trait models within an outcome share one data-supported
+# random structure and are mutually comparable (mirrors the EEG nuisance-
+# covariate control in Sta_EEG_OfferPhase_RefAlday.Rmd).
+#
+# VARIABLES (10), in three families:
+#   SVO      : SVO_angle  -- Social Value Orientation (the one a-priori variable).
+#   PID5BF+  : Negative_Affectivity, Detachment, Antagonism, Disinhibition,
+#              Anankastia, Psychoticism  -- the 6 ICD-11-aligned PID5BF+ domains.
+#   Ratings  : Rating_1, Rating_2, Rating_3  -- post-task cover-story belief
+#              checks (manipulation checks; z-scored here only for comparability).
+#
+# INTERPRETATION & LIMITS (read before using any result):
+#   * MAIN EFFECT ONLY, by request. No trait x design interaction is fitted. A
+#     purely between-subjects covariate is, in expectation, orthogonal to the
+#     within-subject design contrasts (emotion, offer_type, their interaction),
+#     so it can only absorb between-subjects intercept variance. A significant
+#     <var>_z thus means individuals higher on that variable reject more/less
+#     (GLMM) or are slower/faster (LMM) OVERALL -- NOT that the trait moderates
+#     the emotion or fairness effects.
+#   * EXPLORATORY at n ~= 30 subjects/experiment: between-subjects effects are
+#     low-powered. Estimates are reported with 95% CIs and BH-FDR within family;
+#     neither significant nor null results should be over-interpreted. SVO_angle
+#     is a-priori; PID5BF+ and the ratings are screened, not hypothesis-tested.
+# ==============================================================================
+
+# ---- Configuration ------------------------------------------------------------
+trait_screen_stages <- c("E1", "E2")          # per-experiment only
+
+trait_families <- list(
+  SVO     = c("SVO_angle"),
+  PID5BF  = c("Negative_Affectivity", "Detachment", "Antagonism",
+              "Disinhibition", "Anankastia", "Psychoticism"),
+  Ratings = c("Rating_1", "Rating_2", "Rating_3")
+)
+trait_screen_vars <- unlist(trait_families, use.names = FALSE)
+trait_var_family  <- setNames(rep(names(trait_families), lengths(trait_families)),
+                              trait_screen_vars)
+family_of <- function(v) unname(trait_var_family[[v]])
+
+# The two primary single-experiment outcomes (reuse their design + family).
+trait_outcomes <- list(
+  GLMM_Rejection = list(main_name = "GLMM_rejection", outcome = "reject_binary",
+                        family = "binomial", scale = "logit", effect_type = "OR"),
+  LMM_RT_main    = list(main_name = "LMM_RT_main",    outcome = "logRT",
+                        family = "gaussian", scale = "logRT", effect_type = "pctRT")
+)
+trait_design_fixed   <- "(emotion + offer_type)^2"
+trait_design_include <- c("emotion", "offer_type", "emotion:offer_type")
+trait_random_vars    <- c("emotion", "offer_type")
+trait_timeout_sec    <- 1800
+
+# ---- Helpers ------------------------------------------------------------------
+# Type III ANOVA cascade (compact mirror of run_behavior_analysis): Wald chi2 for
+# GLMM; Satterthwaite -> Kenward-Roger -> Wald for LMM. Returns list(table, method).
+trait_anova_cascade <- function(model, family) {
+  if (family == "binomial") {
+    return(list(table = car::Anova(model, type = 3, test.statistic = "Chisq"),
+                method = "Wald_chi_square_GLMM"))
+  }
+  m <- model
+  if (inherits(m, "merMod") && !inherits(m, "lmerModLmerTest")) {
+    m2 <- tryCatch(lmerTest::as_lmerModLmerTest(m), error = function(e) NULL)
+    if (!is.null(m2)) m <- m2
+  }
+  for (ddf in c("Satterthwaite", "Kenward-Roger")) {
+    res <- tryCatch(suppressWarnings(anova(m, type = 3, ddf = ddf)),
+                    error = function(e) NULL)
+    if (!is.null(res) && any(grepl("^Pr", colnames(res))))
+      return(list(table = res, method = paste0(gsub("-", "_", ddf), "_F")))
+  }
+  list(table = car::Anova(m, type = 3, test.statistic = "Chisq"),
+       method = "Wald_chi_square")
+}
+
+# Random-structure string from a fitted base model (mirror EEG Track C).
+trait_re_string <- function(model, group = "participant_id_internal") {
+  re <- tryCatch(lme4::findbars(stats::formula(model)), error = function(e) NULL)
+  if (is.null(re) || length(re) == 0)
+    return(sprintf("(1 | %s)", group))
+  paste0("(", vapply(re, function(b) paste(deparse(b), collapse = " "), character(1)),
+         ")", collapse = " + ")
+}
+
+# Extract the focal trait coefficient row from a fitted model.
+trait_coef_row <- function(model, vz) {
+  pp <- tryCatch(as.data.frame(parameters::parameters(model, effects = "fixed",
+                                                      ci = 0.95)),
+                 error = function(e) NULL)
+  if (is.null(pp)) return(NULL)
+  row <- pp[pp$Parameter == vz, , drop = FALSE]
+  if ("Component" %in% names(pp) && nrow(row) > 1)
+    row <- row[row$Component %in% c("conditional", "cond"), , drop = FALSE]
+  if (nrow(row) == 0) return(NULL)
+  row <- row[1, ]
+  stat_col <- intersect(c("z", "t", "Statistic", "Chi2"), names(row))
+  stat <- if (length(stat_col)) suppressWarnings(as.numeric(row[[stat_col[1]]])) else NA_real_
+  list(est = row$Coefficient, se = row$SE,
+       ci_low = row$CI_low, ci_high = row$CI_high,
+       stat = stat, p = row$p)
+}
+
+# ---- Screen loop --------------------------------------------------------------
+trait_screen_summaries <- list()
+
+for (stage in trait_screen_stages) {
+  progress_log(sprintf("\n%s\n>>> TRAIT MAIN-EFFECT SCREEN: %s\n%s",
+                       strrep("=", 70), stage, strrep("=", 70)))
+
+  # Data (reload; cheap and keeps this section self-contained).
+  path_trials <- here("data", paste0("02_Pipeline_Output_", stage),
+                      "Method_Regression", "Stimulus_Locked", "trials.csv")
+  if (!file.exists(path_trials)) {
+    progress_log(sprintf("[Trait screen | %s] trials.csv missing; skipping stage.", stage))
+    next
+  }
+  df_clean <- load_single_experiment(path_trials, stage)
+
+  # Covariate table.
+  cov_path <- here("data", paste0("02_Pipeline_Output_", stage), "Covariates",
+                   sprintf("SVO_PID5BF_PostRating_%s.xlsx", stage))
+  if (!file.exists(cov_path)) {
+    progress_log(sprintf("[Trait screen | %s] covariate file missing (%s); skipping stage.",
+                         stage, basename(cov_path)))
+    next
+  }
+  cov <- readxl::read_excel(cov_path)
+  cov$participant_id_internal <- standardize_id_within_exp(cov[[1]])
+  cov <- cov[!duplicated(cov$participant_id_internal), , drop = FALSE]   # one row/subject
+
+  # Restrict to the analysis sample, then z-score each variable over THOSE
+  # subjects (subject-level standardization: a trait is constant within subject,
+  # so it must be standardized across subjects, never across trials).
+  analysis_subj <- unique(df_clean$participant_id_internal)
+  cov <- cov[cov$participant_id_internal %in% analysis_subj, , drop = FALSE]
+  n_cov_subj <- nrow(cov)
+  avail_vars <- intersect(trait_screen_vars, names(cov))
+  for (v in avail_vars) {
+    x <- suppressWarnings(as.numeric(cov[[v]]))
+    s <- sd(x, na.rm = TRUE)
+    cov[[paste0(v, "_z")]] <- if (is.na(s) || s == 0) NA_real_
+                              else (x - mean(x, na.rm = TRUE)) / s
+  }
+  z_cols <- paste0(avail_vars, "_z")
+  df_merged <- dplyr::left_join(
+    df_clean,
+    cov[, c("participant_id_internal", z_cols), drop = FALSE],
+    by = "participant_id_internal"
+  )
+
+  out_stage <- file.path(out_root_base, sprintf("%s_TwoStage_Bates", stage),
+                         "Trait_MainEffects")
+  if (!dir.exists(out_stage)) dir.create(out_stage, recursive = TRUE)
+
+  for (oc_key in names(trait_outcomes)) {
+    oc       <- trait_outcomes[[oc_key]]
+    response <- oc$outcome
+    out_oc   <- file.path(out_stage, oc_key)
+    if (!dir.exists(out_oc)) dir.create(out_oc, recursive = TRUE)
+
+    progress_log(sprintf("[Trait screen | %s | %s] design model + %d trait refits",
+                         stage, oc_key, length(avail_vars)))
+
+    # Base design model: reuse the primary Section-7 fit when available, else fit.
+    base_model <- NULL
+    if (exists("all_stage_models") && !is.null(all_stage_models[[stage]]) &&
+        !is.null(all_stage_models[[stage]][[oc$main_name]])) {
+      base_model <- all_stage_models[[stage]][[oc$main_name]]
+      progress_log("  Reusing primary design model from Section 7.", indent = 1)
+    }
+    if (is.null(base_model)) {
+      base_model <- tryCatch(
+        fit_stage1_bates(df_merged, response, trait_design_fixed,
+                         trait_design_include, oc$family,
+                         random_max_vars = trait_random_vars,
+                         group_name = "participant_id_internal",
+                         timeout_sec = trait_timeout_sec),
+        error = function(e) {
+          progress_log(sprintf("  base fit failed: %s", conditionMessage(e)), indent = 1)
+          NULL
+        })
+    }
+    if (is.null(base_model)) {
+      progress_log(sprintf("[Trait screen | %s | %s] no base model; skipping outcome.",
+                           stage, oc_key))
+      next
+    }
+    re_string <- trait_re_string(base_model)
+
+    rows <- list()
+    for (v in avail_vars) {
+      vz <- paste0(v, "_z")
+      if (!vz %in% names(df_merged) || all(is.na(df_merged[[vz]]))) {
+        progress_log(sprintf("  [%s] no usable values; skipped.", v), indent = 1)
+        next
+      }
+      sub    <- df_merged[!is.na(df_merged[[vz]]), , drop = FALSE]
+      n_used <- nrow(sub)
+      n_drop <- nrow(df_merged) - n_used
+      n_subj <- dplyr::n_distinct(sub$participant_id_internal)
+      f_v <- stats::as.formula(sprintf("%s ~ %s + %s + %s",
+                                       response, trait_design_fixed, vz, re_string))
+      fit <- tryCatch(
+        if (oc$family == "binomial")
+          glmmTMB::glmmTMB(f_v, data = sub, family = binomial(link = "logit"),
+                           control = custom_control_glmmTMB)
+        else
+          lmerTest::lmer(f_v, data = sub, REML = TRUE, control = custom_control_lmer),
+        error = function(e) {
+          progress_log(sprintf("  [%s] fit failed: %s", v, conditionMessage(e)), indent = 1)
+          NULL
+        })
+      if (is.null(fit)) next
+
+      ca        <- trait_anova_cascade(fit, oc$family)
+      anova_apa <- tryCatch(format_anova_apa(ca$table, fit), error = function(e) NULL)
+      coefs     <- tryCatch(format_coefs(fit), error = function(e) NULL)
+      cr        <- trait_coef_row(fit, vz)
+      if (is.null(cr)) {
+        progress_log(sprintf("  [%s] trait coefficient not recovered; skipped.", v), indent = 1)
+        next
+      }
+
+      # Effect on the report scale.
+      if (oc$effect_type == "OR") {
+        eff <- exp(cr$est); eff_l <- exp(cr$ci_low); eff_h <- exp(cr$ci_high)
+        eff_str <- sprintf("OR = %.3f [%.3f, %.3f] per +1 SD", eff, eff_l, eff_h)
+      } else {
+        eff   <- (exp(cr$est) - 1) * 100
+        eff_l <- (exp(cr$ci_low) - 1) * 100
+        eff_h <- (exp(cr$ci_high) - 1) * 100
+        eff_str <- sprintf("%+.2f%% RT [%+.2f%%, %+.2f%%] per +1 SD", eff, eff_l, eff_h)
+      }
+      p_str <- if (is.na(cr$p)) "p = NA" else if (cr$p < .001) "p < .001"
+               else sprintf("p = %.3f", cr$p)
+      n_msg <- if (n_drop == 0)
+        sprintf("N: %d trials (%d subjects); no rows dropped for missing %s.",
+                n_used, n_subj, v)
+      else
+        sprintf("N: %d trials (%d subjects) after dropping %d trials with missing %s.",
+                n_used, n_subj, n_drop, v)
+
+      # ---- Per-variable markdown (mirror EEG covariate_control.md) ----
+      comp_dir <- file.path(out_oc, paste0("Trait_", v))
+      if (!dir.exists(comp_dir)) dir.create(comp_dir, recursive = TRUE)
+      writeLines(c(
+        sprintf("# Trait main-effect screen (%s): %s  [%s]", oc_key, v, stage),
+        sprintf("Generated: %s", format(Sys.time(), "%Y-%m-%d %H:%M:%S")),
+        "",
+        sprintf("Family: %s", family_of(v)),
+        sprintf("Model: %s", paste(deparse(f_v), collapse = " ")),
+        "",
+        "EXPLORATORY, per-experiment, MAIN-EFFECT-ONLY screen. The variable is a",
+        "subject-level (between-subjects) covariate entered as a single grand-",
+        "standardized (z) main effect; no trait x design interaction is fitted.",
+        "A between-subjects covariate is (in expectation) orthogonal to the",
+        "within-subject design contrasts, so a significant term reflects an",
+        "OVERALL shift (in rejection / in RT) with the variable, NOT moderation",
+        "of the emotion or fairness effects. Interpret cautiously at n ~= 30.",
+        "",
+        n_msg,
+        "",
+        "## Focal trait main effect",
+        sprintf("- %s (z): %s", v, eff_str),
+        sprintf("- b = %.4f (model scale: %s), SE = %.4f, stat = %.3f, %s",
+                cr$est, oc$scale, cr$se, cr$stat, p_str),
+        "",
+        "## Type III ANOVA (design effects with the trait covariate)",
+        if (!is.null(anova_apa))
+          knitr::kable(anova_apa, format = "markdown", row.names = FALSE)
+        else "ANOVA failed.",
+        "",
+        "## Fixed-effect coefficients (incl. trait covariate)",
+        if (!is.null(coefs))
+          knitr::kable(coefs, format = "markdown", row.names = FALSE)
+        else "Coefficient extraction failed."
+      ), file.path(comp_dir, "trait_maineffect.md"))
+
+      rows[[v]] <- data.frame(
+        Family         = family_of(v),
+        Variable       = v,
+        Outcome        = oc_key,
+        N_subjects     = n_subj,
+        N_trials       = n_used,
+        Estimate       = cr$est,
+        SE             = cr$se,
+        Statistic      = cr$stat,
+        p_raw          = cr$p,
+        Effect_type    = oc$effect_type,
+        Effect         = eff,
+        Effect_CI_low  = eff_l,
+        Effect_CI_high = eff_h,
+        stringsAsFactors = FALSE
+      )
+      progress_log(sprintf("  [%s] %s, %s", v, eff_str, p_str), indent = 1)
+    }
+
+    if (length(rows) == 0) {
+      progress_log(sprintf("[Trait screen | %s | %s] no models fitted.", stage, oc_key))
+      next
+    }
+
+    summ <- do.call(rbind, rows)
+    # BH-FDR within each family (per outcome). SVO has 1 member -> fdr == raw.
+    summ$p_fdr <- NA_real_
+    for (fam in unique(summ$Family)) {
+      idx <- summ$Family == fam
+      summ$p_fdr[idx] <- p.adjust(summ$p_raw[idx], method = "BH")
+    }
+    fam_order <- c("SVO", "PID5BF", "Ratings")
+    summ <- summ[order(match(summ$Family, fam_order), summ$p_raw), ]
+
+    # CSV (full precision).
+    utils::write.csv(summ,
+                     file.path(out_oc, sprintf("TRAIT_SUMMARY_%s_%s.csv", oc_key, stage)),
+                     row.names = FALSE)
+
+    # Markdown (formatted).
+    eff_hdr <- if (oc$effect_type == "OR") "OR [95% CI] /SD" else "%RT change [95% CI] /SD"
+    summ_md <- data.frame(
+      Family   = summ$Family,
+      Variable = summ$Variable,
+      N        = summ$N_subjects,
+      Effect   = if (oc$effect_type == "OR")
+                   sprintf("%.3f [%.3f, %.3f]", summ$Effect, summ$Effect_CI_low, summ$Effect_CI_high)
+                 else
+                   sprintf("%+.2f [%+.2f, %+.2f]", summ$Effect, summ$Effect_CI_low, summ$Effect_CI_high),
+      b        = sprintf("%.4f", summ$Estimate),
+      stat     = sprintf("%.3f", summ$Statistic),
+      p_raw    = ifelse(summ$p_raw < .001, "<.001", sprintf("%.3f", summ$p_raw)),
+      p_FDR    = ifelse(summ$p_fdr < .001, "<.001", sprintf("%.3f", summ$p_fdr)),
+      check.names = FALSE,
+      stringsAsFactors = FALSE
+    )
+    names(summ_md)[names(summ_md) == "Effect"] <- eff_hdr
+    writeLines(c(
+      sprintf("# Trait main-effect screen summary -- %s, %s", oc_key, stage),
+      sprintf("Generated: %s", format(Sys.time(), "%Y-%m-%d %H:%M:%S")),
+      "",
+      sprintf("Outcome: %s (%s). Each row adds one z-scored variable as a main",
+              response, oc$family),
+      "effect to the primary design model (emotion x offer_type) with the",
+      "design-selected random structure. Effects are per +1 SD of the variable.",
+      "p_FDR = Benjamini-Hochberg within family (SVO / PID5BF+ / Ratings).",
+      "EXPLORATORY; main-effect only; n ~= 30. See per-variable folders for full",
+      "ANOVA and coefficient tables.",
+      "",
+      knitr::kable(summ_md, format = "markdown", row.names = FALSE)
+    ), file.path(out_oc, sprintf("TRAIT_SUMMARY_%s_%s.md", oc_key, stage)))
+
+    trait_screen_summaries[[stage]][[oc_key]] <- summ
+    progress_log(sprintf("[Trait screen | %s | %s] summary written (%d variables).",
+                         stage, oc_key, nrow(summ)))
+  }
+
+  # ---- Stage reproducibility log ----
+  sink(file.path(out_stage, "TRAIT_MAINEFFECT_REPRODUCIBILITY.txt"))
+  cat("# Trait main-effect screen -- reproducibility log\n")
+  cat("# Stage:", stage, "\n")
+  cat("# Generated:", format(Sys.time(), "%Y-%m-%d %H:%M:%S"), "\n\n")
+  cat("## Design\n")
+  cat("Per-experiment, exploratory, MAIN-EFFECT-ONLY screen.\n")
+  cat("Outcomes:", paste(names(trait_outcomes), collapse = ", "), "\n")
+  cat("Fixed design:", trait_design_fixed, "+ <var>_z\n")
+  cat("Random structure: inherited from the primary Section-7 design model per outcome.\n")
+  cat("Variables (z-scored over the analysis sample,", n_cov_subj, "subjects):\n")
+  for (fam in names(trait_families))
+    cat(sprintf("  %-8s: %s\n", fam, paste(trait_families[[fam]], collapse = ", ")))
+  cat("\n## Multiplicity\n")
+  cat("Benjamini-Hochberg FDR within each family, separately per outcome.\n\n")
+  cat("## Software versions\n")
+  cat("R:         ", R.version.string, "\n")
+  cat("lme4:      ", as.character(packageVersion("lme4")), "\n")
+  cat("lmerTest:  ", as.character(packageVersion("lmerTest")), "\n")
+  cat("glmmTMB:   ", as.character(packageVersion("glmmTMB")), "\n")
+  cat("parameters:", as.character(packageVersion("parameters")), "\n")
+  sink()
+  progress_log(sprintf("[Trait screen | %s] reproducibility log written -> %s",
+                       stage, out_stage))
+}
+
+cat("\n>>> Trait main-effect screen complete.\n")
 ```
 
 ``` {r session-info}
