@@ -280,5 +280,6 @@ log/
 !results/**/*.toml
 !results/**/*.ini
 !results/**/*.cfg
-!results/**/*.md
+# Result markdown tables are regenerable analysis OUTPUTS, not source -> NOT tracked.
+# (Removed the prior "!results/**/*.md" re-include so only scripts under results/ are kept.)
 .positai
