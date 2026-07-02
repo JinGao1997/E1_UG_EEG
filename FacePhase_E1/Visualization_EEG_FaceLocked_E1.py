@@ -159,10 +159,14 @@ def _style(ax, win_ms, y):
         sp.set_visible(True); sp.set_linewidth(1.2); sp.set_color('black')
     ax.set_xlim(PLOT_XLIM)
     ax.xaxis.set_major_locator(ticker.MultipleLocator(100))
+    ax.xaxis.set_minor_locator(ticker.MultipleLocator(50))
     ax.set_xticklabels([str(int(x)) if x % 200 == 0 else "" for x in ax.get_xticks()])
     if y is not None:
-        ax.set_ylim(y[0], y[1]); ax.yaxis.set_major_locator(ticker.MultipleLocator(y[2]))
-    ax.tick_params(axis='both', which='major', labelsize=13, length=6, width=1.2, direction='out')
+        ax.set_ylim(y[0], y[1])
+        ax.yaxis.set_major_locator(ticker.MultipleLocator(y[2]))
+        ax.yaxis.set_minor_locator(ticker.MultipleLocator(y[2] / 2.0))   # fine, unlabeled minor ticks (half the label step)
+    ax.tick_params(axis='both', which='major', labelsize=14, length=6, width=1.2, direction='out')
+    ax.tick_params(axis='both', which='minor', length=3, width=1.0, direction='out')
 
 
 def _save(fig, save_path):
@@ -185,7 +189,7 @@ def _sym_scale(arrays, pad=1.15):
     return (-lim, lim, step)
 
 
-def plot_overlay(roi_tc, comp, method, title_suffix, save_path):
+def plot_overlay(roi_tc, comp, method, save_path):
     fig, ax = plt.subplots(figsize=(10, 6), facecolor='white', dpi=300)
     plt.rcParams.update({'font.size': 14, 'font.family': 'sans-serif', 'font.sans-serif': ['Arial']})
     win_ms = tuple(w * 1000 for w in COMPONENT_SPECS[comp]['window'])
@@ -196,16 +200,16 @@ def plot_overlay(roi_tc, comp, method, title_suffix, save_path):
         ax.plot(t_ms, gaussian_filter1d(v, SMOOTHING_SIGMA), color=COLORS[emo],
                 lw=LINE_WIDTH, alpha=0.9, label=LABELS_MAP[emo])
     _style(ax, win_ms, COMPONENT_SPECS[comp]['scale'])
-    leg = ax.legend(title='Emotion', loc='upper left', bbox_to_anchor=(1.02, 1.0),
+    leg = ax.legend(title='Emotion Main Effect', loc='upper left', bbox_to_anchor=(1.02, 1.0),
                     fontsize=11, frameon=True); leg.get_frame().set_edgecolor('#AAAAAA')
-    ax.set_xlabel('Time (ms)', fontsize=15, weight='bold')
-    ax.set_ylabel(f"{comp} (µV)", fontsize=15, weight='bold')
-    ax.set_title(f"{comp} ROI: emotion main effect\n{title_suffix}", fontsize=15, weight='bold', pad=10)
+    ax.set_xlabel('Time (ms)', fontsize=16, weight='bold')
+    ax.set_ylabel(f"{comp} (µV)", fontsize=16, weight='bold')
+    ax.set_title(f"{comp} ROI: Main Effect of Emotion", fontsize=16, weight='bold', pad=12)
     fig.tight_layout(rect=[0, 0, 0.85, 1.0])
     _save(fig, save_path)
 
 
-def plot_diff(roi_tc, comp, method, title_suffix, save_path):
+def plot_diff(roi_tc, comp, method, save_path):
     """Each emotion minus Neutral, overlaid."""
     if REF_EMO not in roi_tc:
         return
@@ -225,13 +229,13 @@ def plot_diff(roi_tc, comp, method, title_suffix, save_path):
     for emo in EMO_ORDER:
         if emo in diffs:
             ax.plot(t_ref, gaussian_filter1d(diffs[emo], SMOOTHING_SIGMA), color=COLORS[emo],
-                    lw=LINE_WIDTH, alpha=0.9, label=f"{LABELS_MAP[emo]} − Neutral")
+                    lw=LINE_WIDTH, alpha=0.9, label=LABELS_MAP[emo])
     _style(ax, win_ms, _sym_scale(list(diffs.values())))
-    leg = ax.legend(title='Difference', loc='upper left', bbox_to_anchor=(1.02, 1.0),
+    leg = ax.legend(title='Emotion (vs Neutral)', loc='upper left', bbox_to_anchor=(1.02, 1.0),
                     fontsize=11, frameon=True); leg.get_frame().set_edgecolor('#AAAAAA')
-    ax.set_xlabel('Time (ms)', fontsize=15, weight='bold')
-    ax.set_ylabel(f"{comp} difference (µV)", fontsize=15, weight='bold')
-    ax.set_title(f"{comp}: emotion − Neutral\n{title_suffix}", fontsize=15, weight='bold', pad=10)
+    ax.set_xlabel('Time (ms)', fontsize=16, weight='bold')
+    ax.set_ylabel(f"{comp} difference (µV)", fontsize=16, weight='bold')
+    ax.set_title(f"{comp}: Emotion − Neutral", fontsize=16, weight='bold', pad=12)
     fig.tight_layout(rect=[0, 0, 0.85, 1.0])
     _save(fig, save_path)
 
@@ -291,11 +295,8 @@ def run_method(comp, method, ts):
         except Exception:
             pass
 
-    suffix = ("Alday (display baseline -200..0 ms)" if method == 'Regression'
-              else "Traditional baseline subtraction")
-
-    plot_overlay(roi_tc, comp, method, suffix, out_dir / f"{comp}_{method}_Waveforms.tif")
-    plot_diff(roi_tc, comp, method, suffix, out_dir / f"{comp}_{method}_Diff_vs_Neutral.tif")
+    plot_overlay(roi_tc, comp, method, out_dir / f"{comp}_{method}_Waveforms.tif")
+    plot_diff(roi_tc, comp, method, out_dir / f"{comp}_{method}_Diff_vs_Neutral.tif")
 
     # ROI grand-mean timecourse CSV (time + one column per emotion).
     wave_df = None

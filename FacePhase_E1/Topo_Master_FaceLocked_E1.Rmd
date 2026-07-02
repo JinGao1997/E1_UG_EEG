@@ -174,8 +174,7 @@ for (comp_name in names(component_specs)) {
     dir_create(out_raw); dir_create(out_diff)
 
     method_lbl <- methods[[mdir]]
-    cap <- sprintf("Face-locked %s, %s. Window %s. ROI: %s. Descriptive map of the window-mean amplitude; inference is in the LMM (Sta_EEG_FacePhase_E1.Rmd).",
-                   comp_name, method_lbl, win_str, roi_str)
+    cap <- sprintf("%s (%s). ROI: %s.", comp_name, win_str, roi_str)
 
     # ---- (a) per-emotion raw maps on a shared scale ----
     emo_cols <- intersect(emotion_order, names(topo_long))
@@ -202,7 +201,7 @@ for (comp_name in names(component_specs)) {
           dat_long = dplyr::select(topo_long, electrode, amplitude = dplyr::all_of(dc)),
           chan_locs = chanlocs, roi = spec$roi,
           main_title = sprintf("%s: %s - Neutral", comp_name, emotion_labels[[emo]]),
-          sub_title = paste0(method_lbl, " (difference)"), caption_text = cap,
+          sub_title = method_lbl, caption_text = cap,
           filename = file.path(out_diff, paste0(comp_name, "_", emo, "_vs_neu.png")),
           limits = diff_lim)
       }
