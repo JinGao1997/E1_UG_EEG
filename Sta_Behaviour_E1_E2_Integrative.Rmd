@@ -1258,8 +1258,15 @@ fit_stage1_bates <- function(data, outcome_var, fixed_terms, include_terms,
   
   fixed_str <- sprintf("%s ~ %s", outcome_var, fixed_terms)
   
-  fixed_include_str <- paste(include_terms,
-                              sprintf("+ (1 | %s)", group_name))
+  # Force ALL design fixed-effect terms (plus the random intercept) into
+  # buildmer's `include` so only RANDOM slopes are eligible for LRT elimination;
+  # the full factorial fixed structure is retained and reported (Bates protocol
+  # simplifies variance components, NOT fixed effects). NB: collapse with " + "
+  # into a SINGLE formula -- paste() without collapse + as.formula() on a vector
+  # silently keeps only the first term, which let buildmer drop non-significant
+  # fixed effects (e.g., a non-significant 3-way interaction).
+  fixed_include_str <- paste(c(include_terms, sprintf("(1 | %s)", group_name)),
+                             collapse = " + ")
   fixed_include <- as.formula(sprintf("~ %s", fixed_include_str))
   
   diag_log <- list(
@@ -2865,6 +2872,12 @@ non-supported variance components were removed via likelihood-ratio tests
 with elimination alpha = 0.20 using the buildmer package. Correlation
 parameters between surviving slopes were tested in a final step.
 Random-effects dimensionality was diagnosed via rePCA (Bates et al., 2015).
+Because this selection is data-driven and applied to each dataset independently,
+the retained structure can differ across experiments; such differences reflect
+genuine between-experiment differences in the supported variance components and
+are reported as-is. Cross-experiment inference is therefore based on the
+Integrative model (the Experiment x condition interaction terms), not on
+comparing the significance of separately fitted per-experiment models.
 
 For the Integrative analysis, Experiment was modeled as a between-subjects
 factor (each participant belongs to exactly one experiment). Random slopes
@@ -2890,11 +2903,11 @@ Satterthwaite and Kenward-Roger are not defined for non-Gaussian
 likelihoods (the residual variance term they require does not exist in
 binomial likelihoods, where Var(y) is determined by the mean structure as
 p(1-p)). Binomial models were fitted by maximum likelihood with the Laplace
-approximation (glmmTMB; Brooks et al., 2017). Because the responses are binary
+approximation (glmmTMB; Brooks et al., 2017), and fixed effects were tested with
+Wald chi-square tests (Bolker et al., 2009). Because the responses are binary
 (Bernoulli, 0/1), observation-level overdispersion is not identifiable -- the
 variance p(1-p) is fixed entirely by the mean -- so no scale or dispersion
-parameter was estimated and the Wald chi-square test is appropriate (Bolker
-et al., 2009).
+parameter was estimated.
 
 Post-hoc contrasts were computed using the emmeans package (Lenth, 2024)
 with asymptotic standard errors and false-discovery-rate (FDR) correction

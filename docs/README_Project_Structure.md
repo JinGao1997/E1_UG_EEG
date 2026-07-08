@@ -175,9 +175,9 @@ results/
 │   │
 │   ├── E2_TwoStage_Bates_Alday/                  PRIMARY: Alday baseline-as-covariate LMM
 │   │   ├── Stage1_TrialLevel/
-│   │   │   ├── FRN/                              (one dir per ERP component)
+│   │   │   ├── FRN_pre/                          (one dir per ERP component; confirmatory)
 │   │   │   │   ├── REPRODUCIBILITY.txt
-│   │   │   │   ├── final_model_FRN.rds
+│   │   │   │   ├── final_model_FRN_pre.rds
 │   │   │   │   ├── summary_text.txt
 │   │   │   │   ├── anova_apa.md
 │   │   │   │   ├── r2.md
@@ -187,17 +187,13 @@ results/
 │   │   │   │   ├── STATS_*.xlsx
 │   │   │   │   ├── Forest_*.pdf
 │   │   │   │   └── Plot_*.pdf
-│   │   │   ├── N400/
-│   │   │   ├── LPP_offer/
-│   │   │   ├── N170/                             E2 only
-│   │   │   └── EPN/                              E2 only
-│   │   ├── Stage2_BLUP_Correlations/
-│   │   │   ├── STAGE2_REPRODUCIBILITY.txt
-│   │   │   ├── Primary_TheoryDriven/
-│   │   │   │   ├── stage2_full_results.md
-│   │   │   │   └── stage2_significant_results.md
-│   │   │   ├── Exploratory_PID5BF/
-│   │   │   └── Exploratory_Rating/
+│   │   │   ├── LPP_pre/                           confirmatory
+│   │   │   ├── FRN_explor/                        exploratory
+│   │   │   └── P3_explor/                         exploratory  (same 4 components in E1 & E2)
+│   │   ├── Stage2_RatingControl/
+│   │   │   └── Covariate_Control_Ratings/        post-rating covariate control, one dir per component
+│   │   │       ├── FRN_pre/   LPP_pre/
+│   │   │       └── FRN_explor/   P3_explor/
 │   │   ├── Tables_Manuscript/
 │   │   │   ├── Stage1_AllComponents_<EXP>.md
 │   │   │   ├── Stage1_AllComponents_<EXP>.html
@@ -208,8 +204,7 @@ results/
 │   │
 │   ├── E2_TwoStage_Bates_Traditional/            SENSITIVITY: traditional baseline subtraction
 │   │   ├── Stage1_TrialLevel/                    (parallel structure to Alday)
-│   │   ├── Stage2_BLUP_Correlations/
-│   │   │   └── STAGE2_DISABLED_README.md         Stage 2 deliberately not run; see file
+│   │   ├── Stage2_RatingControl/                 (rating-covariate control, as in the Alday tree)
 │   │   ├── Tables_Manuscript/
 │   │   └── Supplementary/
 │   │

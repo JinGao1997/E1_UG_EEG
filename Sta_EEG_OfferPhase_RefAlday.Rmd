@@ -39,7 +39,7 @@ options(contrasts = c("contr.sum", "contr.poly"))
 # Global Settings & Analysis Targets (SINGLE SOURCE OF TRUTH)
 # ------------------------------------------------------------------------------
 # Set experiment version to match upstream preprocessing pipeline output.
-experiment_version <- "E2"  # Options: "E1" or "E2"
+experiment_version <- "E1"  # Options: "E1" or "E2"
 
 # ------------------------------------------------------------------------------
 # Stage 2 covariate handling (revised 2026-06).

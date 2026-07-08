@@ -68,9 +68,9 @@ mpl.rcParams.update({
 # ==============================================================================
 # 1) Global Configuration
 # ==============================================================================
-EXPERIMENT_VERSION = "E1"  # Default. Override with --e1, --e2, --crossexp.
-                            # Cross-experiment is not yet implemented in
-                            # the upstream R pipeline (planned for next round).
+EXPERIMENT_VERSION = "integrative"  # Default. Override with --e1, --e2, --integrative.
+                            # This is the E1+E2 Integrative behavior viz; the default
+                            # targets the Integrative_TwoStage_Bates/ outputs.
 ERROR_BAR_TYPE = "SE"
 CI_MULTIPLIER = 1.0
 RT_Y_MIN = 300
@@ -156,18 +156,21 @@ def choose_output_root(project_root: Path, exp_version: str, prefer_debug: bool 
 def find_trials_csv(project_root: Path, exp_version: str) -> list[Path]:
     all_trials = list(project_root.rglob("trials.csv"))
     if not all_trials: return []
-    if exp_version in ("CrossExp_E1_vs_E2", "Integrative"):
+    if exp_version.lower() in ("crossexp_e1_vs_e2", "integrative"):
         # Both modes marginalise across experiments and so require the union
         # of E1 + E2 trials. Prefer Method_Regression copies when present.
         union = [p for p in all_trials
-                 if ("E1" in str(p) or "E2" in str(p))
-                 and "Method_Regression" in str(p)]
+                 if ("e1" in str(p).lower() or "e2" in str(p).lower())
+                 and "method_regression" in str(p).lower()]
         if not union:
-            union = [p for p in all_trials if "E1" in str(p) or "E2" in str(p)]
+            union = [p for p in all_trials
+                     if "e1" in str(p).lower() or "e2" in str(p).lower()]
         return union
-    strict = [p for p in all_trials if exp_version in str(p) and "Method_Regression" in str(p)]
+    ev = exp_version.lower()
+    strict = [p for p in all_trials
+              if ev in str(p).lower() and "method_regression" in str(p).lower()]
     if strict: return strict
-    vers = [p for p in all_trials if exp_version in str(p)]
+    vers = [p for p in all_trials if ev in str(p).lower()]
     return vers if vers else [all_trials[0]]
 
 def get_first_col(df: pd.DataFrame, candidates: list[str]) -> str | None:
@@ -813,6 +816,247 @@ def plot_interaction_profile_combined(
             f.write(caption_text)
     except Exception:
         pass
+
+
+def _render_spaghetti_by_fairness(
+    df_emm: pd.DataFrame,
+    df_subj: pd.DataFrame,
+    value_col_subj: str,
+    ylabel: str,
+    ylim_low: float,
+    ylim_high: float,
+    main_title: str,
+    filename: Path,
+    dv_key: str,
+    subject_col: str = "participant_id",
+    emotion_col: str = "emotion",
+    offer_col: str = "offer_type",
+):
+    # By-FAIRNESS transpose of _render_dot_summary_figure. The x-axis carries the
+    # two fairness clusters (Fair, Unfair); WITHIN each cluster the five emotions
+    # are shown side-by-side as rainclouds (half-violin KDE of subject means +
+    # jittered subject-mean dots + emmean +/- 95% CI diamond), coloured by
+    # emotion. No connecting lines are drawn (mirrors the original raincloud);
+    # the interaction is read by comparing the emotion spread/ordering between
+    # the Fair and Unfair clusters.
+    df_emm = df_emm.copy()
+    df_emm[offer_col] = df_emm[offer_col].astype(str).str.strip().str.capitalize()
+    df_subj = df_subj.copy()
+    df_subj[offer_col] = df_subj[offer_col].astype(str).str.strip().str.capitalize()
+
+    n_emo = len(EMOTION_ORDER)
+    n_subj = int(df_subj[subject_col].nunique()) if not df_subj.empty else 0
+
+    EMO_SLOT = 0.5
+    EMO_OFF = {e: (j - (n_emo - 1) / 2.0) * EMO_SLOT
+               for j, e in enumerate(EMOTION_ORDER)}
+    cluster_span = (n_emo - 1) * EMO_SLOT
+    CLUSTER_X = {"Fair": 0.0, "Unfair": cluster_span + 1.1}
+
+    X_EMM_OFF = -0.155
+    X_DOT_OFF = 0.0
+    X_VIOLIN_OFF = 0.115
+    VIOLIN_MAX_W = 0.155
+    DOT_JITTER_HW = 0.055
+    KDE_BW_FACTOR = 0.6 if dv_key == "rejection" else 0.7
+    rng = np.random.default_rng(42)
+
+    fig_w_in = 183 / 25.4
+    fig_h_in = 100 / 25.4
+    fig, ax = plt.subplots(figsize=(fig_w_in, fig_h_in))
+
+    for emo in EMOTION_ORDER:
+        emo_rgb = mcolors.to_rgb(COLOR_MAP.get(emo, "#888888"))
+        for offer in ("Fair", "Unfair"):
+            cx = CLUSTER_X[offer] + EMO_OFF[emo]
+
+            d = df_subj[(df_subj[emotion_col] == emo)
+                        & (df_subj[offer_col] == offer)][value_col_subj]
+            d = pd.to_numeric(d, errors="coerce").dropna().values
+
+            # 1. half-violin (cloud), opening to the right of the slot
+            if len(d) >= 2 and np.std(d) > 1e-8:
+                try:
+                    kde = gaussian_kde(d)
+                    kde.set_bandwidth(kde.factor * KDE_BW_FACTOR)
+                    lo = max(ylim_low, float(np.min(d)))
+                    hi = min(ylim_high, float(np.max(d)))
+                    if hi > lo:
+                        yy = np.linspace(lo, hi, 256)
+                        dd = kde(yy)
+                        peak = float(dd.max())
+                        if peak > 0:
+                            w = dd / peak * VIOLIN_MAX_W
+                            ax.fill_betweenx(yy, cx + X_VIOLIN_OFF,
+                                             cx + X_VIOLIN_OFF + w,
+                                             facecolor=(*emo_rgb, 0.30),
+                                             edgecolor=(*emo_rgb, 0.85),
+                                             linewidth=0.6, zorder=2)
+                except Exception:
+                    pass
+
+            # 2. jittered subject-mean dots (rain)
+            if len(d) > 0:
+                xj = cx + X_DOT_OFF + rng.uniform(-DOT_JITTER_HW, DOT_JITTER_HW,
+                                                  size=len(d))
+                ax.scatter(xj, d, s=7, facecolor=(*emo_rgb, 0.55),
+                           edgecolor="none", zorder=3)
+
+            # 3. emmean +/- 95% CI (lightning), emotion-coloured filled diamond
+            row = df_emm[(df_emm[emotion_col] == emo)
+                         & (df_emm[offer_col] == offer)]
+            if not row.empty:
+                mv = pd.to_numeric(row["mean_val"].iloc[0], errors="coerce")
+                lo_ = pd.to_numeric(row["lower_val"].iloc[0], errors="coerce")
+                hi_ = pd.to_numeric(row["upper_val"].iloc[0], errors="coerce")
+                if pd.notna(mv):
+                    ex = cx + X_EMM_OFF
+                    yerr = [[max(0.0, float(mv - lo_))],
+                            [max(0.0, float(hi_ - mv))]]
+                    ax.errorbar(ex, mv, yerr=yerr, fmt="D", markersize=4.0,
+                                markerfacecolor=COLOR_MAP.get(emo, "#888888"),
+                                markeredgecolor="#111111", markeredgewidth=0.5,
+                                ecolor="#111111", elinewidth=1.0, capsize=3.0,
+                                capthick=1.0, zorder=6)
+
+    ax.set_xticks([CLUSTER_X["Fair"], CLUSTER_X["Unfair"]])
+    ax.set_xticklabels(["Fair offer", "Unfair offer"])
+    xpad = cluster_span / 2.0 + 0.5
+    ax.set_xlim(CLUSTER_X["Fair"] - xpad, CLUSTER_X["Unfair"] + xpad)
+    ax.set_ylim(ylim_low, ylim_high)
+    ax.set_xlabel("Offer fairness", fontsize=7)
+    ax.set_ylabel(ylabel, fontsize=7)
+    if dv_key == "rejection":
+        ax.set_yticks(np.arange(0, 101, 10))
+    else:
+        ax.set_yticks(np.arange(300, int(ylim_high) + 1, 200))
+    ax.tick_params(axis="both", which="major", labelsize=7, length=3, width=0.7)
+    for spine in ("left", "bottom"):
+        ax.spines[spine].set_linewidth(0.7)
+    sns.despine(ax=ax)
+
+    # --- Two-row legend: (1) emotion colour key, (2) raincloud element key.
+    # Row 1 maps hue -> emotion (the only cue distinguishing emotions here);
+    # row 2 defines the three layers, including a real ErrorbarContainer handle
+    # drawn off-screen so the legend shows the emmean diamond WITH its CI caps.
+    emotion_handles = [
+        mlines.Line2D([], [], marker="D", linestyle="None", markersize=4.5,
+                      markerfacecolor=COLOR_MAP.get(e, "#888888"),
+                      markeredgecolor="#111111", markeredgewidth=0.5,
+                      label=LABEL_MAP.get(e, e))
+        for e in EMOTION_ORDER
+    ]
+    grey = (0.35, 0.35, 0.35)
+    density_patch = mpatches.Patch(facecolor=(*grey, 0.30),
+                                   edgecolor=(*grey, 0.85), linewidth=0.6,
+                                   label="Participant-mean density (KDE)")
+    dots_handle = mlines.Line2D([], [], marker="o", linestyle="None",
+                                markerfacecolor=(*grey, 0.55),
+                                markeredgecolor="none", markersize=4.0,
+                                label="Participant means")
+    off_x = CLUSTER_X["Unfair"] + 100.0   # off-screen anchor; only used for the handle
+    emm_handle = ax.errorbar([off_x], [ylim_low], yerr=[[0.0], [0.0]], fmt="D",
+                             markersize=4.0, markerfacecolor=grey,
+                             markeredgecolor="#111111", markeredgewidth=0.5,
+                             ecolor="#111111", elinewidth=1.0, capsize=3.0,
+                             capthick=1.0, label="Model emmean ± 95% CI")
+
+    leg1 = fig.legend(handles=emotion_handles, loc="lower center",
+                      bbox_to_anchor=(0.5, 0.085), ncol=n_emo, frameon=False,
+                      fontsize=6.5, handlelength=1.2, columnspacing=1.3,
+                      handletextpad=0.3, title="Proposer emotion",
+                      title_fontsize=6.5)
+    fig.add_artist(leg1)
+    fig.legend(handles=[density_patch, dots_handle, emm_handle],
+               loc="lower center", bbox_to_anchor=(0.5, 0.014), ncol=3,
+               frameon=False, fontsize=6.5, handlelength=1.8,
+               columnspacing=2.0, handletextpad=0.4)
+
+    fig.suptitle(main_title, fontsize=8.5, fontweight="bold",
+                 x=0.075, ha="left", y=0.985)
+    fig.subplots_adjust(left=0.07, right=0.99, top=0.93, bottom=0.28)
+
+    png_path = filename.with_suffix(".png")
+    pdf_path = filename.with_suffix(".pdf")
+    svg_path = filename.with_suffix(".svg")
+    plt.savefig(svg_path, format="svg", bbox_inches="tight", transparent=True)
+    plt.savefig(pdf_path, format="pdf", bbox_inches="tight", transparent=True)
+    plt.savefig(png_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+    if dv_key == "rejection":
+        err_desc = ("from the generalised linear mixed model (logistic link) "
+                    "with delta-method back-transformation to the probability scale")
+        cloud_caveat = (" The half-violins are compressed under the floor (Fair "
+                        "near 0%) and ceiling (Unfair near 100%) of this measure.")
+    else:
+        err_desc = ("from the linear mixed model on log-transformed RT, "
+                    "back-transformed to milliseconds")
+        cloud_caveat = ""
+    caption_text = (
+        f"Figure caption -- {main_title}\n"
+        f"-------------------------------------------------------------\n"
+        f"{ylabel} grouped by offer fairness (two clusters: fair vs unfair). Within "
+        f"each cluster the five emotion contexts are shown side by side as "
+        f"rainclouds, coloured by emotion (Neutral, Affiliative, Disgust, "
+        f"Dominance, Reward). N = {n_subj} participants. Each raincloud comprises a "
+        f"half-violin (kernel-density estimate of participant means, normalised "
+        f"independently), jittered subject-mean dots, and the model emmean +/- 95% "
+        f"confidence interval (emotion-coloured diamond, black caps), {err_desc}. "
+        f"No lines connect the clusters (matching the emotion-x raincloud); the "
+        f"emotion x fairness interaction is read by comparing the spread and "
+        f"ordering of emotions between the fair and unfair clusters.{cloud_caveat}\n"
+    )
+    try:
+        with open(filename.with_suffix(".caption.txt"), "w", encoding="utf-8") as f:
+            f.write(caption_text)
+    except Exception:
+        pass
+
+
+def plot_spaghetti_by_fairness_combined(
+    df_emm_rt: pd.DataFrame,
+    df_subj_rt: pd.DataFrame,
+    df_emm_rej: pd.DataFrame,
+    df_subj_rej: pd.DataFrame,
+    main_title: str,
+    filename: Path,
+    subject_col: str = "participant_id",
+    emotion_col: str = "emotion",
+    offer_col: str = "offer_type",
+    out_root: Path | None = None,
+    exp_version: str | None = None,
+    exp_filter: str | None = None,
+):
+    # Two figures (Rejection, RT) mirroring plot_interaction_spaghetti_combined,
+    # but with fairness on the x-axis. out_root/exp_version/exp_filter are accepted
+    # for call-site symmetry with the emotion-x version and are not used here.
+    p = Path(filename)
+    parent, stem, suffix = p.parent, p.stem, p.suffix
+    if "Combined" in stem:
+        rej_name = parent / (stem.replace("Combined", "Rejection") + suffix)
+        rt_name = parent / (stem.replace("Combined", "RT") + suffix)
+    else:
+        rej_name = parent / (stem + "_Rejection" + suffix)
+        rt_name = parent / (stem + "_RT" + suffix)
+    _render_spaghetti_by_fairness(
+        df_emm=df_emm_rej, df_subj=df_subj_rej,
+        value_col_subj="rejection_rate", ylabel="Rejection rate (%)",
+        ylim_low=-5.0, ylim_high=115.0,
+        main_title=f"Rejection Rate — {main_title}",
+        filename=rej_name, dv_key="rejection",
+        subject_col=subject_col, emotion_col=emotion_col, offer_col=offer_col,
+    )
+    rt_lo = float(RT_Y_MIN) if RT_Y_MIN is not None else 400.0
+    rt_hi = float(RT_Y_MAX) if RT_Y_MAX is not None else 1800.0
+    _render_spaghetti_by_fairness(
+        df_emm=df_emm_rt, df_subj=df_subj_rt,
+        value_col_subj="RT", ylabel="Reaction time (ms)",
+        ylim_low=rt_lo, ylim_high=rt_hi,
+        main_title=f"Reaction Time — {main_title}",
+        filename=rt_name, dv_key="rt",
+        subject_col=subject_col, emotion_col=emotion_col, offer_col=offer_col,
+    )
 
 
 def plot_interaction_spaghetti(
@@ -1745,6 +1989,16 @@ def plot_distributions_from_trials(trials_paths: list[Path], figures_dir: Path, 
                 main_title=f"Interaction Profile{title_suffix}",
                 filename=prof_dir / f"Profile_{tag}_Combined.png"
             )
+            # By-fairness raincloud (transpose of the spaghetti): x = Fair/Unfair,
+            # five emotions as side-by-side rainclouds within each cluster, with a
+            # faint emotion line joining each emotion's fair and unfair emmean.
+            plot_spaghetti_by_fairness_combined(
+                df_emm_rt=lmm_stats_rt, df_subj_rt=df_subj_rt_p,
+                df_emm_rej=lmm_stats_rej, df_subj_rej=df_subj_rej_p,
+                main_title=f"Behavior by Fairness{title_suffix}",
+                filename=spag_dir / f"SpagByFairness_{tag}_Combined.png",
+                out_root=out_root, exp_version=exp_version, exp_filter=exp_filter_arg
+            )
     
     if exp_version in ("Integrative", "CrossExp_E1_vs_E2") and len(exps) > 1:
         print(f"   -> Generating MERGED spaghetti (all experiments)")
@@ -1773,12 +2027,25 @@ def plot_distributions_from_trials(trials_paths: list[Path], figures_dir: Path, 
                 filename=spag_dir / f"Spag_{exp_version}_Merged.png",
                 out_root=None, exp_version=None, exp_filter=None
             )
+            plot_spaghetti_by_fairness_combined(
+                df_emm_rt=lmm_stats_rt_m, df_subj_rt=df_subj_rt_m,
+                df_emm_rej=lmm_stats_rej_m, df_subj_rej=df_subj_rej_m,
+                main_title=f"Behavior by Fairness (Merged across Experiments)",
+                filename=spag_dir / f"SpagByFairness_{exp_version}_Merged.png",
+                out_root=None, exp_version=None, exp_filter=None
+            )
 
 if __name__ == "__main__":
     run_version = EXPERIMENT_VERSION
     if "--e1" in sys.argv: run_version = "E1"
     elif "--e2" in sys.argv: run_version = "E2"
     elif "--integrative" in sys.argv: run_version = "Integrative"
+
+    # Canonicalise the version so a lowercase EXPERIMENT_VERSION (e.g. "integrative",
+    # "e2") still selects the correct case-sensitive code paths and output dirs.
+    _CANON = {"e1": "E1", "e2": "E2", "integrative": "Integrative",
+              "crossexp_e1_vs_e2": "CrossExp_E1_vs_E2"}
+    run_version = _CANON.get(run_version.lower(), run_version)
 
     root = detect_project_root(Path(__file__).resolve())
     if not root: raise FileNotFoundError("Project root not found.")
