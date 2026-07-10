@@ -33,12 +33,12 @@ UG_ERP_Project/
 ├── Old_Scripts/                                  archived legacy scripts (not run)
 │
 ├── Pipline_UG_OfferPhase.Rmd                     EEG preprocessing                 (4.1)
-├── Sta_Behaviour_RefAlday.Rmd                    behavioral statistics             (4.2)
+├── Sta_Behaviour_E1_E2_Integrative.Rmd                    behavioral statistics             (4.2)
 ├── Sta_EEG_OfferPhase_RefAlday.Rmd               EEG primary statistics            (4.3)
 ├── Sta_EEG_OfferPhase_RefTraditional.Rmd         EEG sensitivity statistics        (4.4)
-├── Topo_Master_StiLocked.Rmd                     EEG topographic plotting          (4.6)
-├── Visualization_Cluster_Permutation.Rmd         cluster permutation plotting      (4.7)
-├── Final_vazt-Unfair_Grouplevel_InformativePr.ipynb   HDDM modeling           (see note)
+├── Topo_Master_StiLocked_RefAlday.Rmd                     EEG topographic plotting          (4.6)
+├── Visualization_Cluster_Permutation.Rmd         cluster-perm plotting — ARCHIVED (Old_Scripts/)  (4.7)
+├── hDDMdetails/                                  HDDM reference copies (E1, E2 notebooks)  (see note)
 │
 ├── .claude/                                      Claude Code config (CLAUDE.md, rules/, settings.json)
 └── docs/                                         project documentation & references
@@ -52,19 +52,26 @@ project root:
 
 ```
 results/
-├── Visualization_Behavior_RefAlday.py            behavioral visualization          (4.5)
+├── Behavior/
+│   └── Visualization_Behavior_E1E2Integrative.py        behavioral visualization          (4.5)
 └── EEG/
-    └── Visualization_EEG_StiLocked.py            EEG waveform & topo data export   (4.8)
+    └── Visualization_EEG_StiLocked_RefAlday.py            EEG waveform & topo data export   (4.8)
 ```
 
 ### Note on the HDDM script
 
-`Final_vazt-Unfair_Grouplevel_InformativePr.ipynb` performs Hierarchical
-Drift Diffusion Modeling on the unfair-trial RT/choice data. The HDDM
-analysis is maintained in a parallel project tree (separate environment
-and dependencies). The .ipynb here is a reference copy. Anyone running
-HDDM should consult that parallel project for the canonical version
-and the environment specification.
+`hDDMdetails/Final_vazt-Unfair_Grouplevel_InformativePr_E1.ipynb` and its
+`_E2.ipynb` counterpart run Hierarchical Drift Diffusion Modeling on the
+unfair-trial RT/choice data — one notebook per experiment, same 6-step
+pipeline. Model: 4-parameter DDM (v, a, t, z; no across-trial variability
+sv/st/sz) fit with HDDMRegressor, every parameter regressed on emotion via
+group-level treatment contrasts (`group_only_regressors=True`) under
+informative priors (Wiecki, Sofer & Frank, 2013). Trials: unfair only;
+Accept=1 -> upper boundary (1), Reject=2 -> lower boundary (0).
+The canonical HDDM analysis is maintained in a parallel project tree
+(separate environment and dependencies); the notebooks under `hDDMdetails/`
+are reference copies only — consult that parallel project for the canonical
+version and environment specification.
 
 ## 2. Data directory layout
 
@@ -152,7 +159,8 @@ serve different downstream consumers and do not overlap.
 
 ```
 results/
-├── Visualization_Behavior_RefAlday.py            (script lives here)
+├── Behavior/Visualization_Behavior_E1E2Integrative.py   (script lives here)
+├── Behavior/Manipulation_Check_Ratings.py               (manipulation-check ratings; see §4.9)
 │
 ├── Behavior/                                     statistical output of behavior LMM/GLMM
 │   └── E2_TwoStage_Bates/                        (one per experiment)
@@ -171,7 +179,9 @@ results/
 │       └── Supplementary/
 │
 ├── EEG/                                          three independent sub-trees
-│   ├── Visualization_EEG_StiLocked.py            (script lives here)
+│   ├── Visualization_EEG_StiLocked_RefAlday.py            (script lives here)
+│   ├── Visualization_EEG_StiLocked_RefAlday_plusDiff.py   (variant of §4.8: adds difference waves)
+│   ├── diagnose_epoch_alignment.py                        (QC: viz/LMM trial-alignment pre-flight; see §4.9)
 │   │
 │   ├── E2_TwoStage_Bates_Alday/                  PRIMARY: Alday baseline-as-covariate LMM
 │   │   ├── Stage1_TrialLevel/
@@ -274,13 +284,15 @@ generation.
   `data/02_Pipeline_Output_<EXP>/{Method_Standard,Method_Regression,Covariates,Baseline_Raw}/`
 - Path style: `here()`. Position-independent.
 
-### 4.2 Sta_Behaviour_RefAlday.Rmd
+### 4.2 Sta_Behaviour_E1_E2_Integrative.Rmd
 
 Behavioral GLMM + LMM analyses. Three models per experiment:
 GLMM_Rejection (rejection probability), LMM_RT_main (all-trials RT),
 LMM_RT_unfair (unfair-trials RT, parallel to HDDM).
 
-- Toggle `experiment_version <- "E1"` or `"E2"`.
+- Runs all three stages in one render via `stages_to_run <- c("E1", "E2", "Integrative")`
+  (no per-render `experiment_version` toggle); the Integrative stage pools E1+E2 with
+  Experiment as a between-subjects factor for a 3-way interaction.
 - Reads: `data/02_Pipeline_Output_<EXP>/Method_Regression/Stimulus_Locked/trials.csv`
   (also reads from Method_Standard if Method_Regression is unavailable).
 - Reads: `data/02_Pipeline_Output_<EXP>/Covariates/SVO_PID5BF_PostRating_<EXP>.xlsx`
@@ -314,13 +326,13 @@ directory for rationale.
 - Writes: `results/EEG/<EXP>_TwoStage_Bates_Traditional/`
 - Path style: `here()`. Position-independent.
 
-### 4.5 Visualization_Behavior_RefAlday.py
+### 4.5 Visualization_Behavior_E1E2Integrative.py
 
 Behavioral visualization script. Reads the statistical output from
 section 4.2 and renders publication-ready figures (forest plots,
 posthoc panels, raw-data scatter overlays) into the same directory.
 
-- CLI flags: `--e1`, `--e2`, `--crossexp`, `--debug`.
+- CLI flags: `--e1`, `--e2`, `--integrative`, `--debug`.
 - Reads: `results/Behavior/<EXP>_TwoStage_Bates/` (statistical output)
   and `data/02_Pipeline_Output_<EXP>/Method_Regression/Stimulus_Locked/trials.csv`
   (raw scatter data).
@@ -330,7 +342,7 @@ posthoc panels, raw-data scatter overlays) into the same directory.
 - Backward-compat: also recognizes legacy directory names
   (`Behavioral` vs `Behavior`, `_Pub_Output_Final` vs `_TwoStage_Bates`).
 
-### 4.6 Topo_Master_StiLocked.Rmd
+### 4.6 Topo_Master_StiLocked_RefAlday.Rmd
 
 Downstream of section 4.8. Renders ERP topographic maps for each
 component using both Regression-corrected and Standard-baseline data
@@ -344,7 +356,11 @@ exported by the EEG visualization script.
   edit this line to match their local installation. See section 5.
 - Picks the most recent Session_<timestamp> per component automatically.
 
-### 4.7 Visualization_Cluster_Permutation.Rmd
+### 4.7 Visualization_Cluster_Permutation.Rmd (ARCHIVED)
+
+> Retired and moved to `Old_Scripts/`; no longer in the run order.
+> Cluster-permutation is computed in `Pipline_UG_OfferPhase.Rmd`; this
+> standalone figure script is kept for reference only.
 
 Renders MNE-Python cluster-based permutation test results as
 3-panel publication figures (effect time-course, topographic snapshot,
@@ -357,7 +373,7 @@ cluster-thresholded time-electrode plot).
   `project_root <- "C:/Code/UG_ERP_Project"`. Reproducers must edit
   this line. See section 5.
 
-### 4.8 Visualization_EEG_StiLocked.py
+### 4.8 Visualization_EEG_StiLocked_RefAlday.py
 
 Upstream of section 4.6. Reads `hu-neuro-pipeline` output (epochs,
 average waveforms, baseline values) and:
@@ -373,7 +389,7 @@ average waveforms, baseline values) and:
   `data/02_Pipeline_Output_<EXP>/Method_Standard/<comp>/`,
   `data/02_Pipeline_Output_<EXP>/Baseline_Raw/Stimulus_Locked_Values/baseline_values.csv`.
 - Writes: `<script_dir>/Results_<comp>_<EXP>/Session_<timestamp>/{Regression_Results,Standard_Baseline}/`.
-  With the script located at `results/EEG/Visualization_EEG_StiLocked.py`,
+  With the script located at `results/EEG/Visualization_EEG_StiLocked_RefAlday.py`,
   this resolves to `results/EEG/Results_<comp>_<EXP>/...`.
 - Path style: auto-detect project root. The detection fingerprint
   (`data/02_Pipeline_Output`, no version suffix) currently does not
@@ -381,18 +397,35 @@ average waveforms, baseline values) and:
   through to a `cwd` check; running the script from the project root
   ensures correct path resolution.
 
+### 4.9 Auxiliary & QC scripts
+
+Three helper scripts, not part of the numbered main flow:
+
+- `results/Behavior/Manipulation_Check_Ratings.py` — exploratory manipulation
+  check on the three cover-story ratings (`Rating_1/2/3`): one-sample Wilcoxon
+  vs the 0–100 VAS midpoint (50) and E1-vs-E2 Mann–Whitney; writes CSV/MD + a
+  figure to `results/Behavior/Manipulation_Checks/`. n = 30/experiment
+  (E1 excludes the covariate-only subject Vp0022).
+- `results/EEG/Visualization_EEG_StiLocked_RefAlday_plusDiff.py` — variant of
+  section 4.8 (same v2.1 regression-corrected waveform pipeline) that additionally
+  renders difference-wave panels.
+- `results/EEG/diagnose_epoch_alignment.py` — pre-flight QC that verifies the viz
+  pipeline will read exactly the LMM trial set (four layered sanity checks); run
+  before section 4.8. Auto-detects the project root (no path to edit).
+
 ## 5. Reproducibility caveat: hardcoded paths
 
-Two scripts contain hardcoded absolute paths that must be edited when
-the project is moved or copied to a new machine:
+One active script contains a hardcoded absolute path that must be edited when
+the project is moved or copied to a new machine (a second, archived, is listed
+for completeness):
 
 | Script | Line | Current value | Edit to |
 |--------|------|---------------|---------|
-| `Topo_Master_StiLocked.Rmd` | 31 | `"C:/Code/UG_ERP_Project/results/EEG"` | path to your project's `results/EEG` |
-| `Visualization_Cluster_Permutation.Rmd` | 230 | `"C:/Code/UG_ERP_Project"` | path to your project root |
+| `Topo_Master_StiLocked_RefAlday.Rmd` | 31 | `"C:/Code/UG_ERP_Project/results/EEG"` | path to your project's `results/EEG` |
+| `Visualization_Cluster_Permutation.Rmd` (archived) | 230 | `"C:/Code/UG_ERP_Project"` | archived in `Old_Scripts/`, not run — no edit needed |
 
-All other scripts (Pipline, Sta_*, Visualization_Behavior_RefAlday.py,
-Visualization_EEG_StiLocked.py) auto-detect their working directory
+All other scripts (Pipline, Sta_*, Visualization_Behavior_E1E2Integrative.py,
+Visualization_EEG_StiLocked_RefAlday.py) auto-detect their working directory
 and require no edits when relocating.
 
 ## 6. Reproducibility checklist
@@ -472,16 +505,16 @@ The following items are not blocking but are documented for awareness:
 - Two scripts use hardcoded absolute paths (section 5). Migrating them
   to `here()` (R) or `Path(__file__).parents[N]` (Python) would make
   the project fully position-independent without per-machine edits.
-- `Visualization_EEG_StiLocked.py` line 166 searches for a
+- `Visualization_EEG_StiLocked_RefAlday.py` line 166 searches for a
   `data/02_Pipeline_Output` fingerprint that does not match the
   actual versioned directory name (`02_Pipeline_Output_E1`,
   `_E2`). Detection currently falls through to a `cwd` check; running
   from the project root ensures correct resolution. A one-line fix
   would be to search for `data/02_Pipeline_Output_*` via `glob`.
 - Visualization scripts are split between the project root
-  (`Topo_Master_StiLocked.Rmd`, `Visualization_Cluster_Permutation.Rmd`)
+  (`Topo_Master_StiLocked_RefAlday.Rmd`, `Visualization_Cluster_Permutation.Rmd`)
   and `results/` subdirectories
-  (`Visualization_Behavior_RefAlday.py`, `Visualization_EEG_StiLocked.py`).
+  (`Visualization_Behavior_E1E2Integrative.py`, `Visualization_EEG_StiLocked_RefAlday.py`).
   Consolidating them under a `scripts/visualization/` subdirectory
   would simplify discovery, but would require careful path-handling
   audits and is best deferred until after manuscript submission.

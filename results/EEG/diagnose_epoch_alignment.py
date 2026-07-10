@@ -1,7 +1,7 @@
 #! /usr/bin/env python3
 # -*- coding: UTF-8 -*-
 """
-diagnose_viz_lmm_alignment.py  —  v2.1
+diagnose_epoch_alignment.py  —  v2.1
 =============================================================================
 Pre-flight check for the viz pipeline's alignment with the LMM analysis.
 
@@ -18,7 +18,7 @@ A PASS on all four layers establishes that the viz pipeline can read the
 same trials as LMM, in the same order, with the same numerical values.
 
 This script uses the same logic as the v2.1 RegressionAnalysis sanity stack
-in Visualization_EEG_StiLocked.py. Running it independently is recommended
+in Visualization_EEG_StiLocked_RefAlday.py. Running it independently is recommended
 before launching the full viz pipeline because:
   - It does NOT load full epoch timecourses (only `index` + ROI channels at
     the relevant window). Faster than viz by an order of magnitude.
@@ -27,7 +27,7 @@ before launching the full viz pipeline because:
 
 USAGE
     # Default: run all components for the chosen experiment+method.
-    python diagnose_viz_lmm_alignment.py
+    python diagnose_epoch_alignment.py
 
     # Edit EXPERIMENT, METHOD, SINGLE_COMPONENT below as needed.
 
@@ -47,8 +47,17 @@ import numpy as np
 # ==============================================================================
 # Configuration
 # ==============================================================================
-# USER: adjust paths to your local environment.
-PROJECT_ROOT = Path(r"C:\Code\UG_ERP_Project")
+# Project root is auto-detected: walk up from this file until an ancestor that
+# contains both config/ and results/ (the project-layout markers). Position-
+# independent like the sibling viz scripts; no hardcoded path to edit on relocation.
+def _find_project_root(start: Path) -> Path:
+    for cand in (start, *start.parents):
+        if (cand / "config").is_dir() and (cand / "results").is_dir():
+            return cand
+    sys.exit("[ABORT] Could not auto-detect project root (no ancestor has both "
+             "config/ and results/). Run this script from inside the project tree.")
+
+PROJECT_ROOT = _find_project_root(Path(__file__).resolve().parent)
 
 # Experiment and method.
 EXPERIMENT = "E1"                  # "E1" or "E2"
@@ -65,7 +74,7 @@ RUN_SANITY_4 = True
 # Trial inclusion criteria — must match upstream LMM scripts:
 #   Sta_EEG_OfferPhase_RefAlday.Rmd v2.1
 #   Sta_EEG_OfferPhase_RefTraditional.Rmd v2.1
-#   Sta_Behaviour_RefAlday.Rmd
+#   Sta_Behaviour_E1_E2_Integrative.Rmd
 INCL_OFFERS    = [5, 6, 8, 9]
 INCL_RT_MIN_MS = 300
 INCL_RT_MAX_MS = 3000
@@ -98,7 +107,7 @@ SCALAR_TOLERANCE_UV = 0.01
 
 
 def make_paths(experiment, method):
-    """Path layout (mirrors Visualization_EEG_StiLocked.py v2.1 PATHS dict)."""
+    """Path layout (mirrors Visualization_EEG_StiLocked_RefAlday.py v2.1 PATHS dict)."""
     pipe = PROJECT_ROOT / "data" / f"02_Pipeline_Output_{experiment}" / method / "Stimulus_Locked"
     method_tag = "Alday" if method == "Method_Regression" else "Traditional"
     repro_root = (PROJECT_ROOT / "results" / "EEG"
