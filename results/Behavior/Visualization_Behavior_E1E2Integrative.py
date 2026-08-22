@@ -39,6 +39,8 @@ Date: 2026-05-20 (v3.1 - CNS Typography & Dual Vector Export Patch)
 
 from __future__ import annotations
 from pathlib import Path
+from datetime import datetime
+import hashlib
 import sys
 import warnings
 import numpy as np
@@ -68,7 +70,7 @@ mpl.rcParams.update({
 # ==============================================================================
 # 1) Global Configuration
 # ==============================================================================
-EXPERIMENT_VERSION = "integrative"  # Default. Override with --e1, --e2, --integrative.
+EXPERIMENT_VERSION = "e1"  # Default. Override with --e1, --e2, --integrative.
                             # This is the E1+E2 Integrative behavior viz; the default
                             # targets the Integrative_TwoStage_Bates/ outputs.
 ERROR_BAR_TYPE = "SE"
@@ -153,30 +155,88 @@ def choose_output_root(project_root: Path, exp_version: str, prefer_debug: bool 
 
     raise FileNotFoundError(f"Output root for {exp_version} could not be resolved in {beh_root}.")
 
+def _md5(path: Path) -> str:
+    digest = hashlib.md5()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _log_input(path: Path, label: str) -> None:
+    stat = path.stat()
+    modified = datetime.fromtimestamp(stat.st_mtime).astimezone().isoformat(timespec="seconds")
+    print(
+        f"Info: {label}: {path.resolve()} | "
+        f"modified={modified} | bytes={stat.st_size} | md5={_md5(path)}"
+    )
+
+
 def find_trials_csv(project_root: Path, exp_version: str) -> list[Path]:
-    all_trials = list(project_root.rglob("trials.csv"))
-    if not all_trials: return []
-    if exp_version.lower() in ("crossexp_e1_vs_e2", "integrative"):
-        # Both modes marginalise across experiments and so require the union
-        # of E1 + E2 trials. Prefer Method_Regression copies when present.
-        union = [p for p in all_trials
-                 if ("e1" in str(p).lower() or "e2" in str(p).lower())
-                 and "method_regression" in str(p).lower()]
-        if not union:
-            union = [p for p in all_trials
-                     if "e1" in str(p).lower() or "e2" in str(p).lower()]
-        return union
-    ev = exp_version.lower()
-    strict = [p for p in all_trials
-              if ev in str(p).lower() and "method_regression" in str(p).lower()]
-    if strict: return strict
-    vers = [p for p in all_trials if ev in str(p).lower()]
-    return vers if vers else [all_trials[0]]
+    versions = ("E1", "E2") if exp_version.lower() in (
+        "crossexp_e1_vs_e2", "integrative"
+    ) else (exp_version.upper(),)
+    if any(version not in ("E1", "E2") for version in versions):
+        raise ValueError(f"Unsupported experiment version: {exp_version}")
+
+    paths = [
+        project_root / "data" / f"02_Pipeline_Output_{version}"
+        / "Method_Regression" / "Stimulus_Locked" / "trials.csv"
+        for version in versions
+    ]
+    for version, path in zip(versions, paths):
+        if not path.is_file():
+            raise FileNotFoundError(
+                f"Canonical behavioral preprocessing output missing for {version}: {path}"
+            )
+        resolved_lower = path.resolve().as_posix().lower()
+        forbidden = ("/previousresults/", "/olderbehaviourresults/", "/older/")
+        if any(segment in resolved_lower for segment in forbidden):
+            raise RuntimeError(f"Forbidden stale input path: {path.resolve()}")
+        _log_input(path, f"canonical {version} trials")
+    return paths
+
+
+_ANALYSIS_NAME_BY_DIR = {
+    "GLMM_Rejection": "GLMM_rejection",
+    "LMM_RT_main": "LMM_RT_main",
+    "LMM_RT_unfair": "LMM_RT_unfair",
+}
+
+
+def select_stats_workbook(label_dir: Path) -> Path:
+    stage_dir = label_dir.parent.name
+    analysis_name = _ANALYSIS_NAME_BY_DIR.get(label_dir.name)
+    if stage_dir.endswith("_TwoStage_Bates") and analysis_name is not None:
+        stage = stage_dir.removesuffix("_TwoStage_Bates")
+        expected = label_dir / f"STATS_{stage}_{analysis_name}.xlsx"
+        if not expected.is_file():
+            raise FileNotFoundError(f"Canonical statistics workbook missing: {expected}")
+        _log_input(expected, "canonical statistics workbook")
+        return expected
+
+    candidates = sorted(label_dir.glob("STATS_*.xlsx"))
+    if len(candidates) != 1:
+        raise RuntimeError(
+            f"Expected exactly one legacy STATS workbook in {label_dir}; "
+            f"found {len(candidates)}: {[p.name for p in candidates]}"
+        )
+    _log_input(candidates[0], "legacy statistics workbook")
+    return candidates[0]
 
 def get_first_col(df: pd.DataFrame, candidates: list[str]) -> str | None:
     for c in candidates:
         if c in df.columns: return c
     return None
+
+def parse_display_p(value) -> float:
+    """Parse numeric or APA-formatted p values used in exported workbooks."""
+    if pd.isna(value):
+        return np.nan
+    text = str(value).strip().replace("=", "").strip()
+    if text.startswith("<"):
+        text = text[1:].strip()
+    return float(text)
 
 def normalize_emotion(x): 
     return str(x).strip().lower() if pd.notna(x) else x
@@ -566,11 +626,9 @@ def _load_neutral_contrasts(
             break
     if label_dir is None:
         return {}
-    xls_files = list(label_dir.glob("STATS_*.xlsx"))
-    if not xls_files:
-        return {}
+    stats_workbook = select_stats_workbook(label_dir)
     try:
-        sheets = pd.ExcelFile(xls_files[0]).sheet_names
+        sheets = pd.ExcelFile(stats_workbook).sheet_names
         # Try exact name first, then any sheet starting with that prefix
         target = None
         preferred = ["Simple_emotion_by_offer_type",
@@ -587,7 +645,7 @@ def _load_neutral_contrasts(
                     break
         if target is None:
             return {}
-        df = pd.read_excel(xls_files[0], sheet_name=target)
+        df = pd.read_excel(stats_workbook, sheet_name=target)
     except Exception:
         return {}
 
@@ -1358,7 +1416,8 @@ def plot_forest_from_posthoc(df: pd.DataFrame, title: str, filename: Path, mode:
 
     fig, ax = plt.subplots(figsize=(10, max(4, len(df_plot) * 0.42 + 2)))
     y_pos = np.arange(len(df_plot))
-    colors = ["#d73027" if float(p) < 0.05 else "#bdbdbd" for p in df_plot[p_col]]
+    colors = ["#d73027" if parse_display_p(p) < 0.05 else "#bdbdbd"
+              for p in df_plot[p_col]]
     
     ax.scatter(df_plot["x"], y_pos, color=colors, s=60, zorder=3)
     has_ci = ("x_lo" in df_plot.columns) and ("x_hi" in df_plot.columns)
@@ -1412,6 +1471,16 @@ def load_and_clean_trials(trials_paths: list[Path]) -> pd.DataFrame:
                 return f"{prefix}{int(digits):04d}"
             df["participant_id"] = df["participant_id"].apply(clean_id)
             
+        required = {"Offers_You", "Offers_Other", "emotion", "reaction", "RT"}
+        missing = sorted(required.difference(df.columns))
+        if missing:
+            raise ValueError(f"Required columns missing from {path}: {missing}")
+
+        # Match the behavioral analysis filters exactly and in the same order.
+        df = df[df["Offers_Other"].isin([5, 6, 8, 9])].copy()
+        df = df[df["reaction"] != 0].copy()
+        df = df[(df["RT"] >= 300) & (df["RT"] <= 3000)].copy()
+
         if {"Offers_You", "Offers_Other"}.issubset(df.columns):
             ratio_val = df["Offers_You"] / (df["Offers_You"] + df["Offers_Other"]).replace(0, np.nan)
             df["offer_ratio"] = ratio_val.apply(lambda r: "5:5" if abs(r-0.5)<0.01 else ("4:6" if abs(r-0.4)<0.01 else ("3:7" if abs(r-0.3)<0.01 else ("2:8" if abs(r-0.2)<0.01 else ("1:9" if abs(r-0.1)<0.01 else np.nan)))))
@@ -1425,9 +1494,6 @@ def load_and_clean_trials(trials_paths: list[Path]) -> pd.DataFrame:
         if "reaction" in df.columns:
             df["is_reject"] = (df["reaction"] == 2).astype(int)
             df["rejection_rate"] = df["is_reject"] * 100.0
-            
-        if "RT" in df.columns: 
-            df = df[(df["RT"] >= 150) & (df["RT"] <= 3000)].copy()
             
         df_list.append(df)
     return pd.concat(df_list, ignore_index=True) if df_list else pd.DataFrame()
@@ -1451,11 +1517,9 @@ def fetch_lmm_stats(out_root: Path, exp_version: str, y_var: str,
             break
     if label_dir is None: return None
     
-    excel_files = list(label_dir.glob("STATS_*.xlsx"))
-    if not excel_files: return None
-    
     try:
-        xls = pd.ExcelFile(excel_files[0])
+        stats_workbook = select_stats_workbook(label_dir)
+        xls = pd.ExcelFile(stats_workbook)
         target_sheet = None
         for cand in ["Descriptive_Means", "Descriptive_Means_SE"]:
             if cand in xls.sheet_names:
@@ -1463,7 +1527,7 @@ def fetch_lmm_stats(out_root: Path, exp_version: str, y_var: str,
                 break
         if target_sheet is None: return None
         
-        df = pd.read_excel(excel_files[0], sheet_name=target_sheet)
+        df = pd.read_excel(stats_workbook, sheet_name=target_sheet)
         if "emotion" in df.columns: 
             df["emotion"] = df["emotion"].apply(normalize_emotion)
             
@@ -1485,26 +1549,31 @@ def fetch_lmm_stats(out_root: Path, exp_version: str, y_var: str,
         
         if "RT" in y_var and mean_numeric < 20 and se_col:
             res["mean_val"] = np.exp(res[y_col].astype(float))
-            se_ms = res["mean_val"] * res[se_col].astype(float)
-            res["lower_val"] = res["mean_val"] - (CI_MULTIPLIER * se_ms)
-            res["upper_val"] = res["mean_val"] + (CI_MULTIPLIER * se_ms)
+            if lower_col and upper_col:
+                # Back-transform the emmeans 95% CI endpoints (log -> ms).
+                res["lower_val"] = np.exp(res[lower_col].astype(float))
+                res["upper_val"] = np.exp(res[upper_col].astype(float))
+            else:
+                se_ms = res["mean_val"] * res[se_col].astype(float)
+                res["lower_val"] = res["mean_val"] - (CI_MULTIPLIER * se_ms)
+                res["upper_val"] = res["mean_val"] + (CI_MULTIPLIER * se_ms)
         elif is_logit_scale:
             res["mean_val"] = expit(res[y_col].astype(float))
-            if se_col:
+            if lower_col and upper_col:
+                # Back-transform the emmeans 95% CI endpoints (logit -> prob).
+                res["lower_val"] = expit(res[lower_col].astype(float))
+                res["upper_val"] = expit(res[upper_col].astype(float))
+            elif se_col:
                 p = res["mean_val"]
                 se_p = p * (1 - p) * res[se_col].astype(float)
                 res["lower_val"] = p - CI_MULTIPLIER * se_p
                 res["upper_val"] = p + CI_MULTIPLIER * se_p
             else:
-                if lower_col and upper_col:
-                    res["lower_val"] = expit(res[lower_col].astype(float))
-                    res["upper_val"] = expit(res[upper_col].astype(float))
-                else:
-                    res["lower_val"] = res["mean_val"]
-                    res["upper_val"] = res["mean_val"]
+                res["lower_val"] = res["mean_val"]
+                res["upper_val"] = res["mean_val"]
         else:
             res["mean_val"] = res[y_col].astype(float)
-            if lower_col and upper_col and CI_MULTIPLIER > 1.0:
+            if lower_col and upper_col:
                 res["lower_val"] = res[lower_col].astype(float)
                 res["upper_val"] = res[upper_col].astype(float)
             elif se_col:
@@ -1830,9 +1899,8 @@ def format_academic_sheet_name(sheet: str) -> str:
 
 def process_label_folder(label_dir: Path, figures_dir: Path, exp_version: str):
     print(f"\n>>> Processing Label: {label_dir.name} [{exp_version}]")
-    excel_candidates = list(label_dir.glob("STATS_*.xlsx"))
-    if not excel_candidates: return
-    xls = pd.ExcelFile(excel_candidates[0])
+    stats_workbook = select_stats_workbook(label_dir)
+    xls = pd.ExcelFile(stats_workbook)
 
     is_cross_exp = "CrossExp" in exp_version
     if exp_version.startswith("E") and exp_version[1:].isdigit():

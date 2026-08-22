@@ -142,6 +142,11 @@ docs/references/
 # keep entirely local, do not upload to the public repo.
 .claude/
 
+# Project-specific Codex config: AGENTS.md instruction card (local mirror of
+# .claude/CLAUDE.md) + any .Codex/ rules. Keep entirely local, like .claude/.
+AGENTS.md
+.Codex/
+
 # Scratch / one-off patcher scripts.
 _*.py
 

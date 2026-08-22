@@ -94,13 +94,13 @@ sym_limits <- function(values, pad = 1.05) {
 # Mirrors the proven call in Topo_Master_StiLocked_RefAlday.Rmd (RdBu palette,
 # head interpolation, ROI highlights, THEME_CONFIG scaling).
 plot_topo_face <- function(dat_long, chan_locs, roi, main_title, sub_title,
-                           caption_text, filename, limits) {
+                           caption_text, filename, limits, contour = TRUE) {
   if (!"electrode" %in% names(dat_long)) {
     warning("Spatial mapping failure: 'electrode' identifier absent."); return(NULL)
   }
   p <- topoplot(
     dat_long, chan_locs = chan_locs, interp_limit = "head",
-    contour = TRUE, points = TRUE, highlights = roi,
+    contour = contour, points = TRUE, highlights = roi,
     palette = "RdBu", limits = limits, scaling = THEME_CONFIG$topoplot_scaling
   ) +
     labs(title = str_wrap(main_title, 50), subtitle = str_wrap(sub_title, 50),
@@ -203,7 +203,7 @@ for (comp_name in names(component_specs)) {
           main_title = sprintf("%s: %s - Neutral", comp_name, emotion_labels[[emo]]),
           sub_title = method_lbl, caption_text = cap,
           filename = file.path(out_diff, paste0(comp_name, "_", emo, "_vs_neu.png")),
-          limits = diff_lim)
+          limits = diff_lim, contour = FALSE)
       }
     }
     cat(sprintf("  [%s] rendered %d raw + %d diff maps.\n",

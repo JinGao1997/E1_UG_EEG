@@ -212,9 +212,158 @@ colors_off <- c('fair'="#2E86AB",'unfair'="#A23B72")
 labels_off <- c('fair'='Fair', 'unfair'='Unfair')
 
 custom_control <- lmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 200000), calc.derivs = FALSE)
+custom_control_final <- lmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 200000), calc.derivs = TRUE)
 
 # Null-coalescing helper for safe attribute fallback.
 `%||%` <- function(a, b) if (is.null(a)) b else a
+
+capture_canonical_input <- function(path, label, expected_suffix) {
+  if (!file.exists(path)) stop(sprintf("Input file not found for %s: %s", label, path))
+  resolved <- normalizePath(path, winslash = "/", mustWork = TRUE)
+  resolved_lower <- tolower(resolved)
+  forbidden <- c("/previousresults/", "/olderbehaviourresults/", "/older/")
+  if (any(vapply(forbidden, grepl, logical(1), x = resolved_lower, fixed = TRUE))) {
+    stop(sprintf("Forbidden stale input path for %s: %s", label, resolved))
+  }
+  expected_suffix <- tolower(gsub("\\\\", "/", expected_suffix))
+  if (!endsWith(resolved_lower, expected_suffix)) {
+    stop(sprintf(
+      "Non-canonical input for %s.\nExpected suffix: %s\nResolved path: %s",
+      label, expected_suffix, resolved
+    ))
+  }
+  info <- file.info(resolved)
+  provenance <- list(
+    label = label,
+    path = resolved,
+    modified = format(info$mtime, "%Y-%m-%d %H:%M:%S %Z"),
+    bytes = as.numeric(info$size),
+    md5 = unname(tools::md5sum(resolved))
+  )
+  cat(sprintf(
+    "[Input %s] %s | modified=%s | bytes=%s | md5=%s\n",
+    label, provenance$path, provenance$modified,
+    format(provenance$bytes, scientific = FALSE), provenance$md5
+  ))
+  provenance
+}
+
+write_input_provenance <- function(provenance) {
+  if (is.null(provenance)) stop("Canonical input provenance was not captured.")
+  cat("## Canonical preprocessing input:\n")
+  cat("Label:   ", provenance$label, "\n")
+  cat("Path:    ", provenance$path, "\n")
+  cat("Modified:", provenance$modified, "\n")
+  cat("Bytes:   ", format(provenance$bytes, scientific = FALSE), "\n")
+  cat("MD5:     ", provenance$md5, "\n\n")
+}
+
+add_random_contrast_columns <- function(data, random_vars, group_name) {
+  random_terms <- character(0)
+  random_columns <- character(0)
+  random_blocks <- character(0)
+  for (random_var in random_vars) {
+    x <- data[[random_var]]
+    if (!is.factor(x)) stop("Random-slope variable must be a factor: ", random_var)
+    mm <- model.matrix(
+      reformulate(random_var), data = data,
+      contrasts.arg = setNames(list(contr.sum(nlevels(x))), random_var)
+    )[, -1, drop = FALSE]
+    for (j in seq_len(ncol(mm))) {
+      column_name <- sprintf("RE_%s_%d", random_var, j)
+      data[[column_name]] <- mm[, j]
+      random_columns <- c(random_columns, column_name)
+      random_blocks[column_name] <- paste0(random_var, "_slope_block")
+      random_terms <- c(
+        random_terms,
+        sprintf("(0 + %s | %s)", column_name, group_name)
+      )
+    }
+  }
+  list(data = data, random_terms = random_terms,
+       random_columns = random_columns, random_blocks = random_blocks)
+}
+
+make_blocked_buildmer_terms <- function(formula, random_blocks) {
+  terms <- buildmer::tabulate.formula(formula)
+  for (column_name in names(random_blocks)) {
+    is_random_column <- !is.na(terms$grouping) & terms$term == column_name
+    terms$block[is_random_column] <- unname(random_blocks[[column_name]])
+  }
+  terms
+}
+
+final_lmm_diagnostics <- function(model) {
+  optimizer_code <- model@optinfo$conv$opt %||% NA_integer_
+  convergence_messages <- model@optinfo$conv$lme4$messages %||% character(0)
+  hessian <- model@optinfo$derivs$Hessian
+  hessian_available <- !is.null(hessian)
+  hessian_positive_definite <- if (hessian_available) {
+    eigenvalues <- tryCatch(
+      eigen(hessian, symmetric = TRUE, only.values = TRUE)$values,
+      error = function(e) NA_real_
+    )
+    all(is.finite(eigenvalues)) && min(eigenvalues) > 0
+  } else FALSE
+  fixed_se <- sqrt(diag(vcov(model)))
+  diagnostics <- list(
+    optimizer_code = optimizer_code,
+    convergence_messages = paste(convergence_messages, collapse = " | "),
+    singular = lme4::isSingular(model, tol = 1e-4),
+    hessian_available = hessian_available,
+    hessian_positive_definite = hessian_positive_definite,
+    finite_fixed_se = length(fixed_se) > 0 && all(is.finite(fixed_se)),
+    finite_likelihood = is.finite(AIC(model)) && is.finite(as.numeric(logLik(model)))
+  )
+  hard_message_pattern <- paste(
+    c("failed to converge", "unable to evaluate scaled gradient",
+      "degenerate.*Hessian", "negative eigenvalue"),
+    collapse = "|"
+  )
+  messages_ok <- !any(grepl(
+    hard_message_pattern, convergence_messages, ignore.case = TRUE
+  ))
+  diagnostics$valid <- isTRUE(diagnostics$optimizer_code == 0) &&
+    messages_ok &&
+    !diagnostics$singular && diagnostics$hessian_available &&
+    diagnostics$hessian_positive_definite && diagnostics$finite_fixed_se &&
+    diagnostics$finite_likelihood
+  diagnostics
+}
+
+format_final_lmm_diagnostics <- function(d) {
+  sprintf(
+    paste0("valid=%s; optimizer_code=%s; messages=%s; singular=%s; ",
+           "hessian_available=%s; hessian_positive_definite=%s; ",
+           "finite_fixed_se=%s; finite_likelihood=%s"),
+    d$valid, d$optimizer_code,
+    ifelse(nchar(d$convergence_messages) == 0, "none", d$convergence_messages),
+    d$singular, d$hessian_available, d$hessian_positive_definite,
+    d$finite_fixed_se, d$finite_likelihood
+  )
+}
+
+refit_and_validate_final_lmm <- function(model, data) {
+  attrs_to_keep <- attributes(model)[c("step4_selected", "step4_lrt_table")]
+  fit_and_check <- function(candidate_formula, random_tier) {
+    candidate <- lme4::lmer(
+      candidate_formula, data = data, REML = TRUE,
+      control = custom_control_final
+    )
+    for (an in names(attrs_to_keep)) {
+      if (!is.null(attrs_to_keep[[an]])) attr(candidate, an) <- attrs_to_keep[[an]]
+    }
+    attr(candidate, "final_validation") <- final_lmm_diagnostics(candidate)
+    attr(candidate, "final_random_tier") <- random_tier
+    candidate
+  }
+
+  exact <- fit_and_check(formula(model), "selected_formula")
+  if (isTRUE(attr(exact, "final_validation")$valid)) return(exact)
+
+  stop("The exact buildmer-selected LMM failed the acceptance gate: ",
+       format_final_lmm_diagnostics(attr(exact, "final_validation")))
+}
 
 # ------------------------------------------------------------------------------
 # Buildmer engineering helpers (defensive against deadlock on large datasets).
@@ -307,12 +456,30 @@ with_progress <- function(label, expr, indent = 1) {
 # 2. Helper Functions (preserved from original script).
 # ==============================================================================
 
+# APA display formatter for p values in manuscript-facing tables.
+format_p_apa <- function(p, include_equals = FALSE) {
+  out <- rep("-", length(p))
+  valid <- !is.na(p)
+  out[valid & p < .001] <- "< .001"
+  exact <- valid & p >= .001
+  out[exact] <- sub("^0", "", sprintf("%.3f", p[exact]))
+  if (include_equals) out[exact] <- paste("=", out[exact])
+  out
+}
+
+is_p_value_column <- function(column_name) {
+  grepl("^p($|[._-])", column_name, ignore.case = TRUE) ||
+    grepl("^Pr\\(>", column_name, ignore.case = TRUE)
+}
+
 # Universal type conversion, missing-value handling, and column purging.
 kill_scipen <- function(df) {
   df %>%
     dplyr::mutate(across(where(is.factor), as.character)) %>%
     dplyr::mutate(across(everything(), function(vec) {
-      if (is.numeric(vec)) {
+      if (is.numeric(vec) && is_p_value_column(dplyr::cur_column())) {
+        vec <- format_p_apa(vec)
+      } else if (is.numeric(vec)) {
         vec <- format(round(vec, 4), scientific = FALSE, trim = TRUE)
       }
       vec <- ifelse(is.infinite(suppressWarnings(as.numeric(vec))), "Inf", vec)
@@ -373,11 +540,7 @@ format_anova_apa <- function(anova_obj, model = NULL) {
         TRUE ~ NA_real_
       ),
       Sig = add_sig_stars(p_val),
-      p_str = dplyr::case_when(
-        is.na(p_val)  ~ "-",
-        p_val < .001  ~ "< .001",
-        TRUE          ~ paste0("= ", format(round(p_val, 3), scientific = FALSE, trim = TRUE))
-      ),
+      p_str = format_p_apa(p_val, include_equals = TRUE),
       APA_Report = dplyr::case_when(
         !is.na(F_val) & !is.na(NumDF) & !is.na(DenDF) ~
           sprintf("F(%s, %.2f) = %.2f, p %s", NumDF, DenDF, F_val, p_str),
@@ -423,7 +586,7 @@ format_anova_apa <- function(anova_obj, model = NULL) {
   
   df_res <- df_res %>%
     dplyr::select(Effect, APA_Report, eta2_partial_95CI, Sig, p_val)
-  beautify_labels(df_res)
+  kill_scipen(beautify_labels(df_res))
 }
 
 # Format post-hoc emmeans output to APA strings.
@@ -473,10 +636,7 @@ format_posthoc_apa <- function(emm_df) {
   df_clean <- df_clean %>%
     dplyr::mutate(
       Sig = add_sig_stars(p.value),
-      p_str = dplyr::case_when(
-        p.value < .001 ~ "< .001",
-        TRUE ~ paste0("= ", format(round(p.value, 3), scientific = FALSE, trim = TRUE))
-      )
+      p_str = format_p_apa(p.value, include_equals = TRUE)
     )
   
   # Stats_String: with CI when available, fall back to no-CI form otherwise.
@@ -530,7 +690,7 @@ format_posthoc_apa <- function(emm_df) {
   df_clean <- df_clean %>%
     dplyr::select(-p_str) %>%
     dplyr::relocate(Sig, .after = Stats_String)
-  beautify_labels(df_clean)
+  kill_scipen(beautify_labels(df_clean))
 }
 
 # Extract fixed-effect coefficients with safe fallback.
@@ -1030,17 +1190,20 @@ add_correlations_step4 <- function(model_zcp_reduced, fixed_str, data, alpha_lrt
                          cand_idx, total_cands, nm), indent = 2)
     t_cand <- Sys.time()
     fit <- tryCatch(
-      lme4::lmer(candidates[[nm]], data = data, REML = FALSE, control = custom_control),
+      lme4::lmer(candidates[[nm]], data = data, REML = FALSE,
+                 control = custom_control_final),
       error = function(e) NULL
     )
-    if (!is.null(fit) && !lme4::isSingular(fit, tol = 1e-4)) {
+    fit_diag <- if (is.null(fit)) NULL else final_lmm_diagnostics(fit)
+    if (!is.null(fit) && isTRUE(fit_diag$valid)) {
       fits[[nm]] <- fit
       progress_log(sprintf("[Step 4 %d/%d] '%s' converged (%s).",
                            cand_idx, total_cands, nm, format_elapsed(t_cand)),
                    indent = 3)
     } else if (!is.null(fit)) {
-      progress_log(sprintf("[Step 4 %d/%d] '%s' singular; excluded (%s).",
-                           cand_idx, total_cands, nm, format_elapsed(t_cand)),
+      progress_log(sprintf("[Step 4 %d/%d] '%s' invalid; excluded (%s): %s",
+                           cand_idx, total_cands, nm, format_elapsed(t_cand),
+                           format_final_lmm_diagnostics(fit_diag)),
                    indent = 3)
     } else {
       progress_log(sprintf("[Step 4 %d/%d] '%s' failed to converge (%s).",
@@ -1049,19 +1212,12 @@ add_correlations_step4 <- function(model_zcp_reduced, fixed_str, data, alpha_lrt
     }
   }
   
-  if (length(fits) == 0) {
-    # All candidates were singular or failed. Per Bates (2015), this means the
-    # data does not support any random-slope variance components beyond the
-    # intercept. Refit with random-intercept-only structure.
-    progress_log("[Step 4] All candidates singular; data does not support random slopes.",
-                 indent = 1)
-    progress_log("[Step 4] Refitting with random-intercept-only structure.", indent = 2)
-    
-    fixed_only_part <- nobars(formula(model_zcp_reduced))
-    f_min <- as.formula(paste(deparse(fixed_only_part), "+ (1 | participant_id)"))
-    m_min <- lme4::lmer(f_min, data = data, REML = TRUE, control = custom_control)
-    attr(m_min, "step4_selected") <- "RandomIntercept_only"
-    return(m_min)
+  if (is.null(fits[["ZCP_baseline"]])) {
+    stop(
+      "[Step 4] The buildmer-selected ZCP reference failed the mandatory ",
+      "acceptance gate. Correlated candidates cannot be selected without the ",
+      "prespecified LRT reference; stopping for explicit review."
+    )
   }
   
   if (length(fits) == 1) {
@@ -1069,14 +1225,14 @@ add_correlations_step4 <- function(model_zcp_reduced, fixed_str, data, alpha_lrt
     progress_log("[Step 4] Only ZCP candidate viable; correlations not added.", indent = 1)
     # See safety note above re: update() and buildmer-derived models.
     f_zcp_only <- formula(model_zcp_reduced)
-    return(lme4::lmer(f_zcp_only, data = data, REML = TRUE,
-                      control = custom_control))
+    m_zcp_only <- lme4::lmer(f_zcp_only, data = data, REML = TRUE,
+                             control = custom_control_final)
+    attr(m_zcp_only, "step4_selected") <- "ZCP_baseline"
+    return(m_zcp_only)
   }
   
-  # Establish a working reference for LRT comparisons. ZCP_baseline (the simplest
-  # candidate, no correlations) is the preferred reference because all richer
-  # candidates are nested within it. If it failed to converge but other candidates
-  # succeeded, fall back to selecting by AIC alone.
+  # ZCP_baseline is the prespecified reference because all richer candidates are
+  # nested within it. It has already passed the same mandatory acceptance gate.
   # NOTE: "baseline" here refers to the Step 4 reference model, NOT to the
   # pre-stimulus EEG baseline (Baseline_c). The two are unrelated.
   baseline_fit <- fits[["ZCP_baseline"]]
@@ -1084,52 +1240,30 @@ add_correlations_step4 <- function(model_zcp_reduced, fixed_str, data, alpha_lrt
                           chisq = numeric(), p_value = numeric(),
                           AIC = numeric(), stringsAsFactors = FALSE)
   
-  if (is.null(baseline_fit)) {
-    # ZCP_baseline was singular but at least one alternative converged.
-    # Select the candidate with lowest AIC.
-    progress_log("[Step 4] ZCP_baseline singular; selecting best converged candidate by AIC.",
-                 indent = 1)
-    aics <- sapply(fits, AIC)
-    best_name <- names(fits)[which.min(aics)]
-    best_fit  <- fits[[best_name]]
+  best_name <- "ZCP_baseline"
+  best_fit  <- baseline_fit
+
+  for (nm in setdiff(names(fits), "ZCP_baseline")) {
+    cand <- fits[[nm]]
+    lrt <- tryCatch(anova(baseline_fit, cand), error = function(e) NULL)
+    if (is.null(lrt) || nrow(lrt) < 2) next
     
-    for (nm in names(fits)) {
-      lrt_table <- rbind(lrt_table, data.frame(
-        model = nm,
-        df_diff = NA_integer_,
-        chisq = NA_real_,
-        p_value = NA_real_,
-        AIC = aics[nm],
-        stringsAsFactors = FALSE
-      ))
-    }
-  } else {
-    # Standard path: ZCP_baseline available, perform nested LRTs against it.
-    best_name <- "ZCP_baseline"
-    best_fit  <- baseline_fit
+    p_val <- lrt$"Pr(>Chisq)"[2]
+    if (is.na(p_val)) next
     
-    for (nm in setdiff(names(fits), "ZCP_baseline")) {
-      cand <- fits[[nm]]
-      lrt <- tryCatch(anova(baseline_fit, cand), error = function(e) NULL)
-      if (is.null(lrt) || nrow(lrt) < 2) next
-      
-      p_val <- lrt$"Pr(>Chisq)"[2]
-      if (is.na(p_val)) next
-      
-      lrt_table <- rbind(lrt_table, data.frame(
-        model = nm,
-        df_diff = lrt$Df[2],
-        chisq = lrt$Chisq[2],
-        p_value = p_val,
-        AIC = AIC(cand),
-        stringsAsFactors = FALSE
-      ))
-      
-      # Select candidate with lowest AIC among those passing alpha_lrt.
-      if (p_val < alpha_lrt && AIC(cand) < AIC(best_fit)) {
-        best_name <- nm
-        best_fit  <- cand
-      }
+    lrt_table <- rbind(lrt_table, data.frame(
+      model = nm,
+      df_diff = lrt$Df[2],
+      chisq = lrt$Chisq[2],
+      p_value = p_val,
+      AIC = AIC(cand),
+      stringsAsFactors = FALSE
+    ))
+
+    # Select candidate with lowest AIC among those passing alpha_lrt.
+    if (p_val < alpha_lrt && AIC(cand) < AIC(best_fit)) {
+      best_name <- nm
+      best_fit  <- cand
     }
   }
   
@@ -1139,7 +1273,14 @@ add_correlations_step4 <- function(model_zcp_reduced, fixed_str, data, alpha_lrt
   progress_log(sprintf("[Step 4] Selected: %s (alpha_LRT = %.2f).",
                        best_name, alpha_lrt), indent = 1)
   
-  update(best_fit, REML = TRUE)
+  f_best <- formula(best_fit)
+  m_reml <- lme4::lmer(f_best, data = data, REML = TRUE,
+                       control = custom_control_final)
+  for (an in c("step4_lrt_table", "step4_selected")) {
+    a <- attr(best_fit, an)
+    if (!is.null(a)) attr(m_reml, an) <- a
+  }
+  m_reml
 }
 
 # ==============================================================================
@@ -1161,6 +1302,10 @@ fit_stage1_bates <- function(data, erp_name) {
     fixed_str <- sprintf("%s ~ emotion", erp_name)
     fixed_include <- as.formula("~ emotion + (1 | participant_id)")
   }
+  random_design <- add_random_contrast_columns(
+    data, "emotion", "participant_id"
+  )
+  data <- random_design$data
   # Forced-include set for buildmer Step 3: the core emotion term (and, under
   # Alday, Baseline_c) must remain regardless of LRT outcome. The by-subject
   # random intercept is also forced because it reflects the nested data
@@ -1171,6 +1316,8 @@ fit_stage1_bates <- function(data, erp_name) {
     component = erp_name,
     n_obs = nrow(data),
     n_subjects = dplyr::n_distinct(data$participant_id),
+    random_contrast_columns = random_design$random_columns,
+    random_slope_blocks = unique(unname(random_design$random_blocks)),
     step1_status = NA_character_,
     step1_pca = NULL,
     step2_status = NA_character_,
@@ -1186,16 +1333,24 @@ fit_stage1_bates <- function(data, erp_name) {
                        nrow(data), dplyr::n_distinct(data$participant_id)),
                indent = 1)
   
-  random_max <- "(1 + emotion | participant_id)"
+  random_max <- sprintf(
+    "(1 + %s | participant_id)",
+    paste(random_design$random_columns, collapse = " + ")
+  )
   f_max <- as.formula(paste(fixed_str, "+", random_max))
   
   progress_log("[Step 1] Fitting design-justified maximal model with correlations...",
                indent = 1)
   t_step1 <- Sys.time()
   m_max <- tryCatch(
-    lme4::lmer(f_max, data = data, REML = FALSE, control = custom_control),
+    R.utils::withTimeout(
+      lme4::lmer(f_max, data = data, REML = FALSE, control = custom_control),
+      timeout = 300,
+      onTimeout = "error"
+    ),
     error = function(e) {
-      progress_log(sprintf("[ERROR] Maximal fit failed: %s", conditionMessage(e)),
+      progress_log(sprintf("[WARN] Maximal diagnostic failed or timed out: %s",
+                           conditionMessage(e)),
                    indent = 2)
       NULL
     }
@@ -1213,17 +1368,21 @@ fit_stage1_bates <- function(data, erp_name) {
                          nrow(diag_log$step1_pca)),
                  indent = 2)
   } else {
-    diag_log$step1_status <- "failed_to_converge"
+    diag_log$step1_status <- "diagnostic_failed_or_timed_out"
   }
   
   # ---- STEP 2: Zero-correlation-parameter (ZCP) model. ----
   progress_log("[Step 2] Fitting zero-correlation-parameter model...", indent = 1)
   t_step2 <- Sys.time()
   
-  random_zcp <- paste("(1 | participant_id)",
-                      "(0 + emotion | participant_id)",
-                      sep = " + ")
+  random_zcp <- paste(
+    c("(1 | participant_id)", random_design$random_terms),
+    collapse = " + "
+  )
   f_zcp <- as.formula(paste(fixed_str, "+", random_zcp))
+  blocked_terms <- make_blocked_buildmer_terms(
+    f_zcp, random_design$random_blocks
+  )
   
   m_zcp <- tryCatch(
     lme4::lmer(f_zcp, data = data, REML = FALSE, control = custom_control),
@@ -1232,11 +1391,9 @@ fit_stage1_bates <- function(data, erp_name) {
   progress_log(sprintf("[Step 2] elapsed: %s", format_elapsed(t_step2)), indent = 2)
   
   if (is.null(m_zcp)) {
-    progress_log("[Step 2] [ERROR] ZCP fit failed; falling back to random-intercept-only.",
+    progress_log("[Step 2] Contrast-coded ZCP diagnostic fit failed; continuing to buildmer ordering.",
                  indent = 2)
     diag_log$step2_status <- "failed"
-    f_minimal <- as.formula(paste(fixed_str, "+ (1 | participant_id)"))
-    m_zcp <- lme4::lmer(f_minimal, data = data, REML = FALSE, control = custom_control)
   } else {
     is_sing_zcp <- lme4::isSingular(m_zcp, tol = 1e-4)
     diag_log$step2_status <- if (is_sing_zcp) "converged_singular" else "converged_clean"
@@ -1268,11 +1425,12 @@ fit_stage1_bates <- function(data, erp_name) {
                indent = 2)
   progress_log("[Step 3] Engineering protections active: lmerTest detached during",
                indent = 2)
-  progress_log("buildmer call; withTimeout=1800s; ZCP fallback on failure.",
+  progress_log("buildmer call; withTimeout=1800s; stop on selection failure.",
                indent = 2)
   t_step3 <- Sys.time()
   
   bm_ctrl <- buildmer::buildmerControl(
+    dep = erp_name,
     include = fixed_include,
     direction = c("order", "backward"),
     crit = "LRT",
@@ -1286,22 +1444,20 @@ fit_stage1_bates <- function(data, erp_name) {
   
   bm_res <- run_buildmer_protected(
     buildmer::buildmer,
-    formula = f_zcp, data = data,
+    formula = blocked_terms, data = data,
     buildmerControl = bm_ctrl,
     timeout_sec = 1800
   )
   
   if (is.null(bm_res)) {
-    progress_log("[Step 3] buildmer failed or timed out; retaining ZCP model.",
-                 indent = 2)
-    m_reduced <- m_zcp
+    stop("Step 3 buildmer selection failed or timed out; no unvalidated ",
+         "ZCP fallback will be reported.")
   } else {
     m_reduced <- tryCatch({
       bm_res@model
     }, error = function(e) {
-      progress_log(sprintf("[WARN] Could not extract @model: %s; retaining ZCP.",
-                           conditionMessage(e)), indent = 2)
-      m_zcp
+      stop("Could not extract the buildmer-selected model: ",
+           conditionMessage(e))
     })
   }
   
@@ -1388,6 +1544,19 @@ fit_stage1_bates <- function(data, erp_name) {
     }
   }
   
+  # ---- Mandatory final-model validation. ----
+  # Keep derivative-free fits during selection, then refit the exact selected
+  # formula with derivatives before any inference, output, or serialization.
+  progress_log("[Final] Refitting exact LMM formula with derivatives enabled.",
+               indent = 1)
+  m_final <- refit_and_validate_final_lmm(m_final, data)
+  diag_log$final_validation <- attr(m_final, "final_validation")
+  diag_log$final_random_tier <- attr(m_final, "final_random_tier")
+  diag_log$step5_pca <- extract_repca_summary(m_final)
+  progress_log(sprintf("[Final] Acceptance gate: %s",
+                       format_final_lmm_diagnostics(diag_log$final_validation)),
+               indent = 1)
+
   # ---- Defensive lmerTest class upgrade. ----
   # 
   # CRITICAL for Satterthwaite/KR p-values. When fit via lme4::lmer() (rather
@@ -1415,8 +1584,10 @@ fit_stage1_bates <- function(data, erp_name) {
       }
     )
     if (!is.null(m_final_lt)) {
-      existing_attrs <- attributes(m_final)[c("step4_selected",
-                                              "step4_lrt_table")]
+      existing_attrs <- attributes(m_final)[c(
+        "step4_selected", "step4_lrt_table", "final_validation",
+        "final_random_tier"
+      )]
       for (an in names(existing_attrs)) {
         if (!is.null(existing_attrs[[an]])) {
           attr(m_final_lt, an) <- existing_attrs[[an]]
@@ -1607,6 +1778,7 @@ run_stage1_component <- function(data, erp_name, out_dir, exp_version) {
   sink(file.path(comp_dir, "REPRODUCIBILITY.txt"))
   cat("# Reproducibility log for ERP component:", erp_name, "\n")
   cat("# Generated:", format(Sys.time(), "%Y-%m-%d %H:%M:%S"), "\n\n")
+  write_input_provenance(input_provenance)
   cat("## Status: ", comp_status, "\n\n")
   cat("## Final formula:\n")
   cat(formula_str, "\n\n")
@@ -1618,14 +1790,33 @@ run_stage1_component <- function(data, erp_name, out_dir, exp_version) {
   cat("buildmer: ", as.character(packageVersion("buildmer")), "\n")
   cat("emmeans:  ", as.character(packageVersion("emmeans")), "\n\n")
   cat("## Convergence diagnostics:\n")
-  cat("Optimizer:    bobyqa\n")
-  cat("Singular fit:", lme4::isSingular(FINAL_MODEL, tol = 1e-4), "\n")
+  final_validation <- attr(FINAL_MODEL, "final_validation") %||%
+    final_lmm_diagnostics(FINAL_MODEL)
+  cat("Acceptance gate passed:", final_validation$valid, "\n")
+  cat("Optimizer:              bobyqa\n")
+  cat("Optimizer code:        ", final_validation$optimizer_code, "\n")
+  cat("Convergence messages:  ",
+      ifelse(nchar(final_validation$convergence_messages) == 0,
+             "none", final_validation$convergence_messages), "\n")
+  cat("Singular fit:          ", final_validation$singular, "\n")
+  cat("Hessian available:     ", final_validation$hessian_available, "\n")
+  cat("Hessian positive-definite:", final_validation$hessian_positive_definite, "\n")
+  cat("Finite fixed-effect SE:", final_validation$finite_fixed_se, "\n")
+  cat("Finite likelihood/AIC: ", final_validation$finite_likelihood, "\n")
+  cat("Final random tier:     ",
+      attr(FINAL_MODEL, "final_random_tier") %||% "selected_formula", "\n")
   cat("REML:         TRUE\n")
   cat("Observations:", nobs(FINAL_MODEL), "\n")
   cat("Subjects:    ", lme4::ngrps(FINAL_MODEL)["participant_id"], "\n\n")
   cat("## Bates 5-step diagnostic log:\n")
   cat("Term ordering criterion:     LRT (default)\n")
   cat("Term elimination criterion:  LRTalpha(0.20) (Matuschek et al., 2017)\n")
+  cat("Random contrast columns:     ",
+      paste(diag_log$random_contrast_columns %||% character(0), collapse = ", "),
+      "\n")
+  cat("Random slope blocks:         ",
+      paste(diag_log$random_slope_blocks %||% character(0), collapse = ", "),
+      "\n")
   cat("Step 1 (Maximal):           ", diag_log$step1_status, "\n")
   if (!is.null(diag_log$step1_pca)) {
     cat("  Step 1 effective/nominal: ",
@@ -1941,6 +2132,12 @@ if (is.na(path_cov)) warning("No covariate file found; Stage 2 will be skipped."
 if (!file.exists(path_stim)) {
   stop(sprintf("Stimulus file not found: %s\nVerify upstream preprocessing.", path_stim))
 }
+input_provenance <- capture_canonical_input(
+  path_stim,
+  sprintf("%s face phase (%s)", experiment_version, method_dir),
+  file.path("data", paste0("02_Pipeline_Output_", experiment_version),
+            method_dir, "Face_Locked", "trials.csv")
+)
 
 cat("--- Loading Covariates ---\n")
 df_covs <- load_covariates(path_cov)
@@ -2073,6 +2270,10 @@ run_covariate_control_check <- function(stage1_models, stage1_data, df_traits,
     m1   <- stage1_models[[comp_name]]
     df_c <- stage1_data[[comp_name]]
     if (is.null(m1) || is.null(df_c)) next
+    rating_random_design <- add_random_contrast_columns(
+      df_c, "emotion", "participant_id"
+    )
+    df_c <- rating_random_design$data
 
     f_stage1  <- stats::formula(m1)
     response  <- as.character(f_stage1[[2L]])
@@ -2109,12 +2310,44 @@ run_covariate_control_check <- function(stage1_models, stage1_data, df_traits,
       "%s ~ %s + %s%s + %s", response, design_rhs,
       paste(rating_terms, collapse = " + "), baseline_term, re_string))
 
-    fit <- tryCatch(
-      suppressWarnings(suppressMessages(
-        lmerTest::lmer(f_ctrl, data = df_c, REML = TRUE, control = custom_control))),
-      error = function(e) {
-        cat(sprintf("  [%s] control model failed: %s\n", comp_name, conditionMessage(e))); NULL })
-    if (is.null(fit)) next
+    comp_dir <- file.path(out_dir, comp_name)
+    if (!dir.exists(comp_dir)) dir.create(comp_dir, recursive = TRUE)
+    fit_result <- tryCatch(
+      list(
+        model = suppressWarnings(suppressMessages(
+          lmerTest::lmer(
+            f_ctrl, data = df_c, REML = TRUE,
+            control = custom_control_final
+          )
+        )),
+        error = NULL
+      ),
+      error = function(e) list(model = NULL, error = conditionMessage(e))
+    )
+    fit <- fit_result$model
+    if (is.null(fit)) {
+      writeLines(c(
+        sprintf("# Nuisance-covariate control (Ratings): %s", comp_name),
+        sprintf("Generated: %s", format(Sys.time(), "%Y-%m-%d %H:%M:%S")),
+        "", "Status: FAILED", sprintf("Model: %s", paste(deparse(f_ctrl), collapse = " ")),
+        sprintf("Reason: fitting error: %s", fit_result$error)
+      ), file.path(comp_dir, "covariate_control.md"))
+      cat(sprintf("  [%s] control model failed: %s\n", comp_name, fit_result$error))
+      next
+    }
+    fit_diag <- final_lmm_diagnostics(fit)
+    if (!isTRUE(fit_diag$valid)) {
+      writeLines(c(
+        sprintf("# Nuisance-covariate control (Ratings): %s", comp_name),
+        sprintf("Generated: %s", format(Sys.time(), "%Y-%m-%d %H:%M:%S")),
+        "", "Status: FAILED", sprintf("Model: %s", paste(deparse(f_ctrl), collapse = " ")),
+        sprintf("Reason: acceptance gate failed: %s",
+                format_final_lmm_diagnostics(fit_diag))
+      ), file.path(comp_dir, "covariate_control.md"))
+      cat(sprintf("  [%s] control model invalid: %s\n", comp_name,
+                  format_final_lmm_diagnostics(fit_diag)))
+      next
+    }
     if (!inherits(fit, "lmerModLmerTest"))
       fit <- tryCatch(lmerTest::as_lmerModLmerTest(fit), error = function(e) fit)
 
@@ -2129,11 +2362,12 @@ run_covariate_control_check <- function(stage1_models, stage1_data, df_traits,
     anova_apa <- if (!is.null(res)) format_anova_apa(res, fit) else NULL
     coefs <- tryCatch(format_coefs(fit), error = function(e) NULL)
 
-    comp_dir <- file.path(out_dir, comp_name)
-    if (!dir.exists(comp_dir)) dir.create(comp_dir, recursive = TRUE)
     writeLines(c(
       sprintf("# Nuisance-covariate control (Ratings): %s", comp_name),
       sprintf("Generated: %s", format(Sys.time(), "%Y-%m-%d %H:%M:%S")),
+      "",
+      "Status: PASSED",
+      sprintf("Acceptance diagnostics: %s", format_final_lmm_diagnostics(fit_diag)),
       "",
       sprintf("Model: %s", paste(deparse(f_ctrl), collapse = " ")),
       "",
@@ -2343,7 +2577,10 @@ writeLines(c(
   "full correlations (interaction random slopes were omitted because",
   "cell-level variance components rarely identify in single-trial EEG",
   "with typical N). Step 2 fitted a zero-correlation-parameter (ZCP)",
-  "model. Step 3 used buildmer LRT-based backward elimination at",
+  "model using separate sum-contrast columns for factor slopes, making",
+  "the ZCP variance terms genuinely diagonal. All contrast columns for",
+  "one factor were evaluated as one buildmer selection block. Step 3 used buildmer",
+  "LRT-based backward elimination at",
   "alpha = 0.20 (Matuschek et al., 2017). Step 4 tested whether adding",
   "correlation parameters improved fit. Step 5 ran rePCA dimensionality",
   "diagnostics to confirm that the final structure was data-supported.",

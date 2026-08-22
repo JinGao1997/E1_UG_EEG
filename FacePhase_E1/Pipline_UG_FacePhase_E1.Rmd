@@ -296,7 +296,8 @@ if (run_face_phase) {
 
     ica_method       = "fastica",
     ica_n_components = 0.99,
-    triggers         = c(101:115, 201:215),   # E1 face-onset codes (log stim_trigger)
+    triggers         = c(101:105, 111:115, 201:205, 211:215), # E1 face-onset codes (log stim_trigger)
+    epochs_on_missing = "raise",
     bad_channels     = "auto",
     highpass_freq    = 0.05,
     lowpass_freq     = 30.0,
